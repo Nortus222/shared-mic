@@ -35,6 +35,12 @@ def test_pairing_string_rejects_garbage():
         decode_pairing_string("not-a-valid-token")
 
 
+def test_pairing_string_rejects_wrong_length():
+    # Valid base32 string (AAAAAAAA = 5 bytes) but not 32 bytes
+    with pytest.raises(ValueError):
+        decode_pairing_string("AAAAAAAA")
+
+
 def test_proof_verifies_with_correct_token_and_nonce():
     token, nonce = generate_token(), generate_nonce()
     assert verify_proof(token, nonce, auth_proof(token, nonce))
