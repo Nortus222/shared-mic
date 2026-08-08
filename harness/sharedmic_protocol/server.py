@@ -10,6 +10,7 @@ Never logs audio payload — only counters.
 
 import queue
 import secrets
+import select
 import socket
 import threading
 import time
@@ -41,6 +42,7 @@ class MockWindowsServer:
         device_label: str = "Mock USB Mic",
         server_id: str = "mock-win",
         ssl_context=None,
+        hello_timeout: float = HELLO_TIMEOUT_SECONDS,
     ):
         self._token = token
         self._host = host
@@ -49,6 +51,7 @@ class MockWindowsServer:
         self._device_label = device_label
         self._server_id = server_id
         self._ssl_context = ssl_context
+        self._hello_timeout = hello_timeout
 
         self._listener: socket.socket | None = None
         self._accept_thread: threading.Thread | None = None
@@ -113,22 +116,37 @@ class MockWindowsServer:
                 conn, _ = self._listener.accept()
             except OSError:
                 return
+            # Track the connection immediately, before the TLS wrap or the
+            # thread spawn, so a concurrent stop() can never miss it and
+            # fall back to waiting out a join timeout for this connection.
+            with self._lock:
+                self._connections.append(conn)
             if self._ssl_context is not None:
                 try:
-                    conn = self._ssl_context.wrap_socket(conn, server_side=True)
+                    wrapped = self._ssl_context.wrap_socket(conn, server_side=True)
                 except OSError:
+                    with self._lock:
+                        if conn in self._connections:
+                            self._connections.remove(conn)
                     conn.close()
                     continue
+                # wrap_socket() returns a distinct object over the same fd;
+                # swap the tracked reference so stop() closes the object
+                # the session actually uses.
+                with self._lock:
+                    if conn in self._connections:
+                        self._connections.remove(conn)
+                    self._connections.append(wrapped)
+                conn = wrapped
             thread = threading.Thread(target=self._serve, args=(conn,), daemon=True)
             with self._lock:
                 self._connection_threads.append(thread)
-                self._connections.append(conn)
             thread.start()
 
     # -- per-connection -----------------------------------------------
 
     def _serve(self, conn: socket.socket) -> None:
-        session = _ServerSession(self, conn)
+        session = _ServerSession(self, conn, hello_timeout=self._hello_timeout)
         try:
             session.run()
         finally:
@@ -139,9 +157,16 @@ class MockWindowsServer:
 
 
 class _ServerSession:
-    def __init__(self, server: MockWindowsServer, conn: socket.socket):
+    def __init__(
+        self,
+        server: MockWindowsServer,
+        conn: socket.socket,
+        *,
+        hello_timeout: float = HELLO_TIMEOUT_SECONDS,
+    ):
         self._server = server
         self._conn = conn
+        self._hello_timeout = hello_timeout
         self._control_q: queue.Queue = queue.Queue()
         self._audio_q: queue.Queue = queue.Queue(maxsize=AUDIO_QUEUE_FRAMES)
         self._closed = threading.Event()
@@ -212,25 +237,35 @@ class _ServerSession:
             }
         )
 
-        # A finite recv() timeout is what lets the HELLO deadline (and the
-        # closed flag) actually get re-checked for a client that connects
-        # and then sends nothing — without this, recv() blocks forever and
-        # HELLO_TIMEOUT_SECONDS is dead code.
-        self._conn.settimeout(0.5)
-
         buf = b""
         authenticated = False
-        deadline = time.monotonic() + HELLO_TIMEOUT_SECONDS
+        deadline = time.monotonic() + self._hello_timeout
 
         while not self._closed.is_set():
             if not authenticated and time.monotonic() > deadline:
                 return
+            # Poll for readability with a short timeout instead of calling
+            # conn.settimeout(): the socket is shared with _writer_loop's
+            # sendall() on the same connection, and a settimeout() there
+            # would also bound writes, turning a transient send stall into
+            # a torn-down control channel (the opposite of what the
+            # drop-oldest audio queue exists to protect). select() lets the
+            # read side poll without touching the write side's blocking
+            # behavior at all.
+            try:
+                ready, _, _ = select.select([self._conn], [], [], 0.5)
+            except OSError:
+                return
+            if not ready:
+                continue  # re-check the deadline and the closed flag
             try:
                 chunk = self._conn.recv(65536)
             except TimeoutError:
-                # socket.timeout / TimeoutError is a subclass of OSError, so
-                # it must be caught here, before the broader OSError below,
-                # or every timeout would be treated as a dead connection.
+                # Kept even though settimeout() is no longer used here: if a
+                # timeout is ever reintroduced on this socket, TimeoutError
+                # (a subclass of OSError) must be handled before the
+                # broader OSError below, or every timeout would be treated
+                # as a dead connection.
                 continue
             except OSError:
                 return

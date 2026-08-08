@@ -6,7 +6,7 @@ import pytest
 from sharedmic_protocol.auth import auth_proof, decode_pairing_string, encode_pairing_string, generate_token
 from sharedmic_protocol.control import PROTOCOL_VERSION, decode_control, encode_control
 from sharedmic_protocol.framing import FRAME_TYPE_CONTROL, decode_frame, encode_frame
-from sharedmic_protocol.server import HELLO_TIMEOUT_SECONDS, MockWindowsServer
+from sharedmic_protocol.server import MockWindowsServer
 
 
 @pytest.fixture
@@ -106,19 +106,28 @@ def test_stop_closes_lingering_client_connections(server):
         sock.close()
 
 
-def test_server_closes_idle_connection_after_hello_timeout(server):
+def test_server_closes_idle_connection_after_hello_timeout(token):
     """A client that connects and never sends HELLO must eventually be dropped.
 
-    HELLO_TIMEOUT_SECONDS exists specifically to bound how long the server
-    waits for an unauthenticated client. Loose bounds here to tolerate a
-    busy machine: the connection must not hang forever, and it must not
-    close suspiciously early either.
+    The HELLO deadline exists specifically to bound how long the server
+    waits for an unauthenticated client. Uses an injected, short
+    `hello_timeout` instead of the real 5-second production default so this
+    test exercises the identical deadline-and-recheck logic without paying
+    a multi-second real sleep in the suite. Bounds are loose relative to
+    that short timeout to tolerate a busy machine: the connection must not
+    hang forever, and it must not close suspiciously early either.
     """
-    with socket.create_connection(("127.0.0.1", server.port), timeout=HELLO_TIMEOUT_SECONDS + 10) as sock:
-        _recv_control(sock)  # GREETING
-        start = time.monotonic()
-        data = sock.recv(4096)  # send nothing; wait for the server to give up
-        elapsed = time.monotonic() - start
-    assert data == b"", "server should have closed the connection, not sent more data"
-    assert elapsed < HELLO_TIMEOUT_SECONDS + 5.0, f"took {elapsed:.2f}s — looks like it never timed out"
-    assert elapsed > HELLO_TIMEOUT_SECONDS - 1.0, f"closed after only {elapsed:.2f}s — looks suspiciously early"
+    small_timeout = 0.3
+    srv = MockWindowsServer(token, hello_timeout=small_timeout)
+    srv.start()
+    try:
+        with socket.create_connection(("127.0.0.1", srv.port), timeout=small_timeout + 5.0) as sock:
+            _recv_control(sock)  # GREETING
+            start = time.monotonic()
+            data = sock.recv(4096)  # send nothing; wait for the server to give up
+            elapsed = time.monotonic() - start
+        assert data == b"", "server should have closed the connection, not sent more data"
+        assert elapsed < small_timeout + 2.0, f"took {elapsed:.2f}s — looks like it never timed out"
+        assert elapsed > small_timeout - 0.2, f"closed after only {elapsed:.2f}s — looks suspiciously early"
+    finally:
+        srv.stop()
