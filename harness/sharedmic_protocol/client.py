@@ -70,19 +70,33 @@ class MockMacClient:
 
     def _open_socket(self, timeout: float) -> None:
         raw = socket.create_connection((self._host, self._port), timeout=timeout)
-        # create_connection() calls settimeout(timeout) internally and never
-        # resets it, so the returned socket would otherwise carry that
-        # timeout for its whole lifetime — governing every later recv() in
-        # _reader_loop and every sendall() in _send() too. The connect
-        # timeout only needs to apply during connection establishment;
-        # reset to blocking immediately afterward so the socket goes back
-        # to being governed by _reader_loop's select() polling, same as
-        # server.py's per-connection sockets.
-        raw.settimeout(None)
         if self._ssl_context is None:
+            # No handshake follows; reset to blocking immediately so the
+            # connect-time timeout doesn't linger and govern this socket's
+            # whole lifetime — see the TLS branch below for why that
+            # matters.
+            raw.settimeout(None)
             self._sock = raw
             return
-        wrapped = self._ssl_context.wrap_socket(raw, server_hostname=self._host)
+        # create_connection() already leaves `timeout` set on `raw`; make
+        # that explicit so the TLS handshake itself is bounded — a stalled
+        # or silent peer must not be able to hang this call forever (Task
+        # 6's fix reset to blocking mode *before* wrap_socket(), which
+        # removed that bound). The instant wrap_socket() returns, whether
+        # it succeeds or raises, drop back to blocking mode: a timeout that
+        # persisted past the handshake would also govern _reader_loop's
+        # recv() and _send()'s sendall(), which is the exact defect that
+        # cost Tasks 5 and 6 a fix round each. Bounded only across
+        # wrap_socket(), never for the connection's lifetime.
+        raw.settimeout(timeout)
+        try:
+            wrapped = self._ssl_context.wrap_socket(raw, server_hostname=self._host)
+        except OSError:
+            # Covers TimeoutError too (it subclasses OSError); handling is
+            # identical either way, so one clause suffices.
+            raw.close()
+            raise
+        wrapped.settimeout(None)
         if self._expected_fingerprint is not None:
             actual = hashlib.sha256(wrapped.getpeercert(binary_form=True)).hexdigest()
             if actual != self._expected_fingerprint.lower().replace(":", ""):
@@ -107,7 +121,13 @@ class MockMacClient:
             # any concurrent send.
             try:
                 ready, _, _ = select.select([self._sock], [], [], 0.5)
-            except OSError:
+            except (OSError, ValueError):
+                # ValueError alongside OSError for the same reason as
+                # server.py's _ServerSession.run(): select() checks
+                # fileno() itself and raises ValueError (not OSError) when
+                # it is negative, which happens if close() runs on another
+                # thread in the window between the while-condition check
+                # above and this call.
                 break
             if not ready:
                 continue

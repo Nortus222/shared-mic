@@ -254,7 +254,19 @@ class _ServerSession:
             # behavior at all.
             try:
                 ready, _, _ = select.select([self._conn], [], [], 0.5)
-            except OSError:
+            except (OSError, ValueError):
+                # OSError: the fd was valid but the OS-level select() call
+                # failed (e.g. EBADF from a close mid-syscall on some
+                # platforms). ValueError: select() checks fileno() itself
+                # before the syscall and raises this (not OSError) when it
+                # is negative — which is exactly what happens if another
+                # thread (server.stop(), or a TLS peer whose fingerprint
+                # check failed and tore the connection down) closes
+                # self._conn in the window between the while-condition
+                # check above and this call. Found via test_tls.py's
+                # fingerprint-mismatch test, which closes the connection
+                # unusually early in the session lifecycle and made this
+                # race easy to hit.
                 return
             if not ready:
                 continue  # re-check the deadline and the closed flag
