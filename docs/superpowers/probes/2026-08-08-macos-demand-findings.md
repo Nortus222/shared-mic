@@ -21,16 +21,23 @@ privacy goal.
 2. **But do not gate detection on `kAudioProcessPropertyIsRunningInput`.**
    During this round of fixes, `--self-test` was extended to check a
    process's *second* activation (open BlackHole, close it, open it
-   again), and found that `IsRunningInput` reliably reports `true` only on
-   a process's **first** input-stream activation in its lifetime -- it
-   silently stays `false` on the second, third, ... activation, even
-   while the process is actively streaming from the device. This was
-   confirmed self-introspectively and cross-process, and is independent of
-   whether the property is read via full enumeration or via
-   `kAudioHardwarePropertyTranslatePIDToProcessObject`.
-   `kAudioProcessPropertyDevices` (device-list membership) and the
-   general, non-input-scoped `kAudioProcessPropertyIsRunning` were both
-   found to re-trigger correctly on every activation tested.
+   again), and found that on a process's **second and later** input-stream
+   activation, `IsRunningInput` reads `false` at the moment device-list
+   membership is first confirmed true -- i.e. the two properties disagree
+   at that instant, for the second activation onward, self-introspectively
+   and cross-process, and independent of whether the property is read via
+   full enumeration or via `kAudioHardwarePropertyTranslatePIDToProcessObject`.
+   (A stronger claim -- that `IsRunningInput` stays `false` for the
+   *entire* duration of the second-and-later activation, not just at the
+   single sampled instant the committed self-test checks -- was also
+   observed, repeatedly, using throwaway diagnostic scripts built during
+   investigation; those are not part of the committed source, so treat
+   that stronger version as investigation notes, not as something the
+   committed probe itself proves. See "What this does NOT prove" below for
+   the leading open hypothesis about *why*.) `kAudioProcessPropertyDevices`
+   (device-list membership) and the general, non-input-scoped
+   `kAudioProcessPropertyIsRunning` were both found to re-trigger correctly
+   on every activation tested.
 
    **This changes the design.** Any implementation that gates demand
    detection on `runningInput == true AND deviceList.contains(target)` --
@@ -255,12 +262,33 @@ principle be an artifact of a process reading its own audio state through
 some different, more-privileged path than it would use to read another
 process's state. Legs 3 and 4 rule that out: a spawned helper process
 (different PID, same executable, running independently) was correctly
-detected opening BlackHole (leg 3, 622ms via full-sweep — same
-order of magnitude as the self-introspection full-sweep figure in leg 1,
-consistent with the mechanism being the same regardless of whose PID is
-being read) and correctly detected on both of two separate activations
-(leg 4), with `kAudioProcessPropertyDevices` clearing correctly between
-them every time.
+detected opening BlackHole (leg 3) and correctly detected on both of two
+separate activations (leg 4), with `kAudioProcessPropertyDevices` clearing
+correctly between them every time.
+
+**Correction (this was wrong in the previous revision of this document):**
+leg 3's figure was 622ms, against leg 1's full-sweep figure of ~58ms.
+622 / 58 ≈ 10.7 — that is one order of magnitude *higher* than the
+self-introspection full-sweep figure, not "the same order of magnitude" as
+an earlier draft of this document claimed. That was a real error: a probe
+artifact stated as if it were a measured API property, the exact class of
+mistake already corrected once in fix round 1's Finding 2.
+
+The correct reading is that leg 3/4's ~500-1200ms figures are dominated by
+overhead that has nothing to do with Core Audio property propagation:
+`Process.run()` forking and exec'ing a fresh process, the Swift runtime
+loading in that new process, and then the full `AudioUnit` setup sequence
+(`AudioComponentInstanceNew`, two `EnableIO` calls, `CurrentDevice`,
+`SetInputCallback`, `AudioUnitInitialize`, `AudioOutputUnitStart`) all
+happening before the stream is even open, let alone detected. **The
+cross-process figures characterize "cold helper-process launch through
+first detected activation," not steady-state detection latency for an
+already-running application**, and must not be read as the latter. The
+targeted self-introspection figures from leg 1 (~5-6ms appear, ~3-4ms
+clear) remain the closest approximation this probe has to genuine Core
+Audio propagation latency, precisely because they don't pay any
+process-launch cost — the AudioUnit is opened directly in an
+already-running process.
 
 ### Default-input corroboration (new, per coordinator review)
 
@@ -304,13 +332,44 @@ state" case beyond what the deliberate negative-control test alone shows.
 
 - **`IsRunningInput`'s failure mode past the first activation is
   characterized on this machine, in this probe, but its root cause inside
-  Core Audio is not.** It could be an AUHAL-specific quirk (a HALOutput
-  unit reusing state from a torn-down predecessor), a general Core Audio
-  HAL behavior, or something specific to unsigned/ad hoc processes. This
-  probe did not have the tooling to inspect Core Audio's internals further
-  and did not try alternate input-unit configurations (e.g., using
-  `AudioQueue` instead of raw AUHAL, or a signed helper) to see whether the
-  defect is AUHAL-specific.
+  Core Audio is not. The leading unresolved hypothesis is instance reuse,
+  not process history, and it has NOT been tested.** Every activation in
+  this probe -- including every "repeat" activation in legs 1 and 4 --
+  calls `makeInputUnit()` and constructs a **brand-new**
+  `AudioComponentInstance` each time: dispose the old unit, create a new
+  one, `EnableIO`, `SetInputCallback`, `AudioUnitInitialize`, start. A real
+  client such as Dictation, Chrome, or anything built on `AVAudioEngine`
+  is far more likely to hold **one** engine/unit object for its whole
+  session and call stop/start (or record/pause) on that same instance
+  repeatedly, never disposing and recreating it between activations. So
+  the observed "sticky false" behavior may be an artifact of how the HAL
+  re-registers a *new* `AudioComponentInstance` for a process that already
+  has one on record, rather than a genuine "this process's Nth activation"
+  property. That distinction is load-bearing: if the defect is
+  instance-scoped, real long-lived apps that reuse one engine object might
+  re-trigger `IsRunningInput` correctly every time, and the flag would be
+  salvageable as a secondary signal; if it is process-scoped (as this
+  probe's synthetic dispose/recreate cycles exercise), it is not, for any
+  client shape.
+
+  **The measurement that would settle this was not run and should be the
+  first thing Phase 3 checks**, before relying on or ruling out
+  `IsRunningInput` for anything: build one `AudioUnit` instance, call
+  `AudioOutputUnitStart`/`AudioOutputUnitStop` on that *same* instance
+  twice (no `AudioComponentInstanceDispose`/recreate in between), and
+  observe whether `IsRunningInput` re-triggers `true` on the second
+  `Start`. This was deliberately not implemented in this fix round --
+  documenting the hypothesis precisely was judged worth more than a
+  rushed extra leg, and it does not change this probe's gating
+  recommendation either way: device-list membership works regardless of
+  which hypothesis turns out to be correct.
+
+  Beyond instance reuse, other unexplored explanations remain possible
+  too: a general Core Audio HAL behavior unrelated to AUHAL specifically,
+  or something specific to unsigned/ad hoc processes. This probe did not
+  have the tooling to inspect Core Audio's internals directly and did not
+  try alternate input-unit configurations (e.g. `AudioQueue` instead of
+  raw AUHAL, or a signed helper) to rule those out.
 - **TCC/permission behavior is unconfirmed, not "clean."** No prompt
   appeared or blocked any run, but this terminal's process may already
   hold microphone TCC approval from earlier, unrelated work on this
@@ -445,10 +504,15 @@ on `kAudioProcessPropertyDevices` (input-scope) membership, not on
    test machine has none; the automated self-test substituted a different
    real hardware input device and the negative result held for that
    substitution.
-4. The root cause of `IsRunningInput`'s failure to re-trigger (AUHAL
-   quirk vs. general Core Audio behavior vs. unsigned-process artifact)
-   is not identified, only its symptom and a reliable workaround
-   (device-list membership).
+4. The root cause of `IsRunningInput`'s failure to re-trigger is not
+   identified, only its symptom and a reliable workaround (device-list
+   membership). The leading unresolved hypothesis is **instance reuse**:
+   this probe always disposes and recreates a fresh `AudioComponentInstance`
+   between activations, while a real app is more likely to reuse one
+   instance across its whole session — see "What this does NOT prove"
+   above for the specific measurement (same-instance stop/restart) that
+   would settle this and should be Phase 3's first check before relying on
+   or ruling out `IsRunningInput` for anything.
 
 Recommendation for Phase 3: proceed with device-scoped detection as the
 primary mechanism, gated on `kAudioProcessPropertyDevices` membership —
