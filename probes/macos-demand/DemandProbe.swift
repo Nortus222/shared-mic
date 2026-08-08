@@ -6,8 +6,10 @@
 //        ./demand-probe --watch        poll twice a second until Ctrl-C
 //        ./demand-probe --list-devices full device inventory (id, uid, name)
 //        ./demand-probe --self-test    fully automated: opens input on BlackHole
-//                                       and on the built-in mic from *this*
-//                                       process and checks kAudioProcessPropertyDevices
+//                                       and on a second, different input device
+//                                       (built-in mic if present, else another
+//                                       real input device) from *this* process,
+//                                       and checks kAudioProcessPropertyDevices
 //                                       reports the right device for each.
 //
 // Never logs or persists captured audio: the self-test's input callback does
@@ -208,8 +210,6 @@ func silentInputCallback(inRefCon: UnsafeMutableRawPointer,
                           ioData: UnsafeMutablePointer<AudioBufferList>?) -> OSStatus {
     noErr
 }
-
-enum AUError: Error { case step(String, OSStatus) }
 
 /// Builds and initializes (but does not start) an input-enabled AUHAL bound
 /// to `device`. Returns nil on any failure, printing the failing step and
