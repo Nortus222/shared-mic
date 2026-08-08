@@ -79,7 +79,21 @@ def test_mismatched_fingerprint_is_a_hard_stop(cert):
     try:
         with pytest.raises(FingerprintMismatch):
             client.connect()
+        # audio_frames_received == 0 alone is a weak proxy: audio only
+        # flows after START, so it would still pass even if a full
+        # GREETING/HELLO/HELLO_ACK control-plane exchange had completed
+        # before the mismatch was noticed. Pin down that *no* application
+        # data was exchanged at all, from both ends:
+        #   - server.sessions_started / auth_failures both stay at 0
+        #     because the server never receives a HELLO to act on.
+        #   - client._reader stays None because MockMacClient.connect()
+        #     raises inside _open_socket(), before the reader thread that
+        #     would read GREETING/HELLO_ACK is ever created — so the
+        #     client-side control-plane loop never ran at all.
         assert client.audio_frames_received == 0
+        assert server.sessions_started == 0
+        assert server.auth_failures == 0
+        assert client._reader is None
     finally:
         client.close()
         server.stop()
