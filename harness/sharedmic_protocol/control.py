@@ -43,7 +43,18 @@ def _validate(msg: dict) -> dict:
 
 
 def encode_control(msg: dict) -> bytes:
-    return json.dumps(_validate(msg), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    """Encode a control message with canonical (sorted) key order.
+
+    Two implementations that build the same logical message with fields
+    in a different order must still produce byte-identical wire output —
+    otherwise conformance would depend on incidental code structure rather
+    than on the message's actual content. `sort_keys=True` makes the wire
+    bytes a pure function of the message, recursively through nested
+    objects such as `preferredFormat`.
+    """
+    return json.dumps(
+        _validate(msg), ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
 
 
 def decode_control(payload: bytes) -> dict:
