@@ -18,7 +18,6 @@ import time
 from .auth import auth_proof
 from .control import AUDIO_FORMAT, PROTOCOL_VERSION, decode_control, encode_control
 from .framing import (
-    FRAME_TYPE_AUDIO,
     FRAME_TYPE_CONTROL,
     ProtocolError,
     decode_audio_payload,
@@ -71,6 +70,15 @@ class MockMacClient:
 
     def _open_socket(self, timeout: float) -> None:
         raw = socket.create_connection((self._host, self._port), timeout=timeout)
+        # create_connection() calls settimeout(timeout) internally and never
+        # resets it, so the returned socket would otherwise carry that
+        # timeout for its whole lifetime — governing every later recv() in
+        # _reader_loop and every sendall() in _send() too. The connect
+        # timeout only needs to apply during connection establishment;
+        # reset to blocking immediately afterward so the socket goes back
+        # to being governed by _reader_loop's select() polling, same as
+        # server.py's per-connection sockets.
+        raw.settimeout(None)
         if self._ssl_context is None:
             self._sock = raw
             return
@@ -171,6 +179,13 @@ class MockMacClient:
     # -- protocol -----------------------------------------------------
 
     def connect(self, timeout: float = 5.0) -> dict:
+        """Complete GREETING/HELLO/HELLO_ACK and return the HELLO_ACK.
+
+        Raises TimeoutError if no reply arrives within `timeout`, or
+        ConnectionError if the reader thread observes the connection close
+        (e.g. a rejected auth proof) before that — callers should treat
+        both as "connect failed" rather than branching on the exact type.
+        """
         self._open_socket(timeout)
         self._reader = threading.Thread(target=self._reader_loop, daemon=True)
         self._reader.start()
@@ -226,12 +241,20 @@ class MockMacClient:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(f"received {len(frames)} of {count} audio frames before timeout")
+            # Same treatment as _await: poll in short slices and check
+            # _closed rather than blocking for the full remaining timeout,
+            # so a connection that drops mid-wait is reported promptly
+            # instead of burning out the whole deadline for frames that
+            # will never arrive. The empty()-before-raising guard still
+            # lets a frame queued just before closure be delivered.
+            if self._closed.is_set() and self._audio_in.empty():
+                raise ConnectionError(
+                    f"connection closed after {len(frames)} of {count} audio frames"
+                )
             try:
-                frames.append(self._audio_in.get(timeout=remaining))
+                frames.append(self._audio_in.get(timeout=min(remaining, 0.1)))
             except queue.Empty:
-                raise TimeoutError(
-                    f"received {len(frames)} of {count} audio frames before timeout"
-                ) from None
+                continue
         return frames
 
     def drain_audio(self) -> int:

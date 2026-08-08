@@ -1,3 +1,6 @@
+import threading
+import time
+
 import pytest
 
 from sharedmic_protocol.audio import FRAME_BYTES
@@ -72,3 +75,27 @@ def test_wrong_token_fails_to_connect(server):
             cli.connect()
     finally:
         cli.close()
+
+
+def test_wait_for_audio_frames_fails_fast_when_connection_drops(client, server):
+    client.connect()
+    client.start_session()
+
+    def sever():
+        time.sleep(0.1)
+        server.stop()
+
+    severing = threading.Thread(target=sever, daemon=True)
+    severing.start()
+    try:
+        start = time.monotonic()
+        # Ask for far more frames than could ever arrive before the
+        # severed connection is noticed, with a timeout generous enough
+        # that only a fail-fast path (not the timeout itself) could
+        # explain a quick failure.
+        with pytest.raises(Exception):
+            client.wait_for_audio_frames(10_000, timeout=5.0)
+        elapsed = time.monotonic() - start
+    finally:
+        severing.join(timeout=2)
+    assert elapsed < 2.0
