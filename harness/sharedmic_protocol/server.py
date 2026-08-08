@@ -53,6 +53,7 @@ class MockWindowsServer:
         self._listener: socket.socket | None = None
         self._accept_thread: threading.Thread | None = None
         self._connection_threads: list[threading.Thread] = []
+        self._connections: list[socket.socket] = []
         self._running = threading.Event()
         self._lock = threading.Lock()
 
@@ -80,6 +81,21 @@ class MockWindowsServer:
                 self._listener.close()
             except OSError:
                 pass
+        # Close every live per-connection socket so a thread parked in
+        # recv() (e.g. a client that connected but never sent HELLO, or
+        # a lingering test connection) is unblocked immediately instead
+        # of holding the join() below for its full timeout.
+        with self._lock:
+            connections = list(self._connections)
+        for conn in connections:
+            try:
+                conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                conn.close()
+            except OSError:
+                pass
         if self._accept_thread is not None:
             self._accept_thread.join(timeout=5)
         for thread in list(self._connection_threads):
@@ -104,7 +120,9 @@ class MockWindowsServer:
                     conn.close()
                     continue
             thread = threading.Thread(target=self._serve, args=(conn,), daemon=True)
-            self._connection_threads.append(thread)
+            with self._lock:
+                self._connection_threads.append(thread)
+                self._connections.append(conn)
             thread.start()
 
     # -- per-connection -----------------------------------------------
@@ -115,6 +133,9 @@ class MockWindowsServer:
             session.run()
         finally:
             session.close()
+            with self._lock:
+                if conn in self._connections:
+                    self._connections.remove(conn)
 
 
 class _ServerSession:
@@ -191,6 +212,12 @@ class _ServerSession:
             }
         )
 
+        # A finite recv() timeout is what lets the HELLO deadline (and the
+        # closed flag) actually get re-checked for a client that connects
+        # and then sends nothing — without this, recv() blocks forever and
+        # HELLO_TIMEOUT_SECONDS is dead code.
+        self._conn.settimeout(0.5)
+
         buf = b""
         authenticated = False
         deadline = time.monotonic() + HELLO_TIMEOUT_SECONDS
@@ -200,6 +227,11 @@ class _ServerSession:
                 return
             try:
                 chunk = self._conn.recv(65536)
+            except TimeoutError:
+                # socket.timeout / TimeoutError is a subclass of OSError, so
+                # it must be caught here, before the broader OSError below,
+                # or every timeout would be treated as a dead connection.
+                continue
             except OSError:
                 return
             if not chunk:
