@@ -1,0 +1,26 @@
+# Claude Code worktrees live inside the repo but are never committed
+.claude/worktrees/
+
+# macOS
+.DS_Store
+xcuserdata/
+*.xcuserstate
+DerivedData/
+
+# .NET
+bin/
+obj/
+*.user
+*.suo
+.vs/
+
+# Local configuration and anything that could hold a pairing secret
+*.local.json
+secrets/
+*.pfx
+*.p12
+
+# Never commit captured audio
+*.wav
+*.raw
+*.pcm
