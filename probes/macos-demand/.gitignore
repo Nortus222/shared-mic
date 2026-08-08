@@ -1,0 +1,5 @@
+# Compiled probe binary and build products -- source only is committed.
+demand-probe
+*.o
+*.swiftmodule
+*.dSYM/
