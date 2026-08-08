@@ -10,6 +10,20 @@ The reference implementation is the Python conformance harness at `harness/share
 It exists to make this document trustworthy, not to replace it — implement against this document,
 and use the harness and the vectors in `protocol/vectors/` to check your work.
 
+**Notation:** every normative requirement below is written as a `MUST`/`MUST NOT`, a byte layout,
+or a fixed value, and is additionally tagged with how much of that requirement the harness actually
+exercises today:
+
+- **[VERIFIED]** — asserted by a passing test in `harness/tests/`, as of this document's last
+  update alongside the harness.
+- **[CARRIED]** — required by this contract and sourced from
+  `docs/superpowers/specs/2026-08-08-shared-mic-design.md`, but not yet exercised by any harness
+  test. A Phase 1 implementation must still provide it in full; the tag says only that the harness
+  has not (yet) proven it, not that it is optional or uncertain.
+
+Untagged prose (byte layouts, field lists, worked examples) is definitional rather than a
+behavior to test, and is not tagged either way.
+
 ---
 
 ## 1. Scope and versioning
@@ -32,19 +46,28 @@ versioned independently of both.
 - **One TCP connection** carries both control messages and audio, multiplexed (see §9). There is
   no separate audio socket.
 - **Default port 47800.** Configurable on the Windows side; the listener binds to private
-  interfaces only and is never exposed to the public Internet.
+  interfaces only and is never exposed to the public Internet. **[CARRIED]** — the harness always
+  binds an OS-assigned ephemeral port (`port=0`) for test isolation and never exercises the fixed
+  default; a real Windows implementation must still default to 47800.
 - **TLS 1.3** wraps the connection immediately after the TCP handshake. Windows is the TLS server
   (it holds the certificate and private key generated at first run); macOS is the TLS client.
+  **[VERIFIED]** — `test_tls.py::test_session_works_over_tls_with_matching_pin`,
+  `test_tls.py::test_tls_handshake_is_bounded_not_infinite`.
 - **Trust is a pinned certificate fingerprint, not a certificate authority.** There is no CA
   anywhere in this design. During pairing, the Mac records the SHA-256 fingerprint of the server
   certificate's DER encoding, as a lowercase hex string. On every subsequent connection, after the
   TLS handshake completes, the Mac computes SHA-256 over the DER encoding of the certificate the
   server presented and compares it byte-for-byte (as lowercase hex) against the pinned value.
+  **[VERIFIED]** — `test_tls.py::test_fingerprint_is_hex_sha256`,
+  `test_tls.py::test_fingerprint_is_stable`, `test_tls.py::test_distinct_certs_have_distinct_fingerprints`.
 - **A fingerprint mismatch is a hard stop.** The Mac closes the connection immediately. There is no
   automatic retry and no silent re-pairing — re-establishing trust requires an explicit user
   pairing action. This is deliberate: a fingerprint mismatch is the one failure mode that can mean
   an active attacker, and any form of automatic recovery here would defeat the reason pinning
-  exists.
+  exists. **[VERIFIED]** — `test_tls.py::test_mismatched_fingerprint_is_a_hard_stop` (the harness
+  proves the connection is refused; it does not and cannot prove the *absence* of an automatic
+  retry policy in a future full agent, which is a UI/reconnect-logic property outside the harness's
+  reach).
 - Everything after the TLS handshake — every byte described in §3 onward — flows inside the
   encrypted TLS stream. Nothing in this protocol is ever sent in the clear.
 
@@ -295,27 +318,42 @@ Every new TCP connection, immediately after the TLS handshake completes and befo
 `STOP`, `PING`, or `STATUS` is sent or accepted, runs this exchange:
 
 1. **Windows sends `GREETING{serverId, nonce}`.** `nonce` is freshly random per connection (32
-   bytes, lowercase hex) — never reused across connections.
+   bytes, lowercase hex) — never reused across connections. **[VERIFIED]** —
+   `test_server.py::test_server_greets_with_a_nonce`, `test_server.py::test_server_issues_nonce_per_connection`.
 2. **The Mac replies `HELLO{clientId, mac}`**, where
    `mac = lowercase_hex(HMAC-SHA256(token, nonce))`. `token` is the 256-bit pairing secret
    established out-of-band during pairing (§7.1 of the design spec); `nonce` is the raw 32 bytes
    decoded from the `GREETING`'s hex `nonce` field (HMAC is computed over the raw bytes, not over
    the hex string). **The token itself never crosses the wire** — only this per-connection proof
    does, and the fresh nonce means a captured proof cannot be replayed against a future connection.
+   **[VERIFIED]** — `test_auth.py`'s `auth_proof`/`verify_proof` tests plus
+   `test_client.py::test_connect_completes_handshake` and
+   `test_server.py::test_server_accepts_valid_proof` for the end-to-end exchange.
 3. **Windows verifies `mac`** by computing the same HMAC over its own copy of `token` and the
    `nonce` it sent, and comparing in constant time. If it matches, Windows replies `HELLO_ACK`
    (§5) and the connection is authenticated. If it does not match, Windows closes the connection
-   without replying.
+   without replying. **[VERIFIED]** — `test_server.py::test_server_rejects_bad_proof_and_counts_it`,
+   `test_client.py::test_wrong_token_fails_to_connect`.
 
 **5-second deadline:** Windows gives the Mac 5 seconds from the moment the TLS handshake completes
 to deliver a valid `HELLO`. If no valid `HELLO` arrives within 5 seconds — no message, an
 unparseable message, a message that is not `HELLO`, or a `HELLO` whose `mac` fails verification —
 Windows closes the connection. There is no partial-credit state: a peer is either fully
-authenticated (has received/sent `HELLO_ACK`) or the connection is dead.
+authenticated (has received/sent `HELLO_ACK`) or the connection is dead. **[VERIFIED]** —
+`test_server.py::test_server_closes_idle_connection_after_hello_timeout` proves the "no message at
+all" case, against an injected short timeout so the suite doesn't pay the real 5 s in wall time.
 
 No `START`, `STOP`, `PING`, `STATUS`, or `AUDIO` frame is valid before authentication completes.
 Windows MUST reject (by closing the connection) any such message received before a verified
-`HELLO`.
+`HELLO`. **[VERIFIED]** — `test_server.py::test_server_rejects_non_hello_message_before_authentication`
+sends a pre-auth `PING` and asserts the connection closes. The implementation checks
+`msg["type"] != "HELLO"` for any decoded control message, so this one `PING` case exercises the
+same branch that would reject a pre-auth `START`/`STOP`/`STATUS` too — those three are not
+separately exercised. `AUDIO` is structurally different and stricter: any frame whose envelope
+`type` is not `CONTROL` is rejected unconditionally (not only pre-auth — the Mac never sends
+`AUDIO` at all in this protocol, so Windows treats receiving one from the client as a protocol
+violation at any point in the connection's lifetime). That broader rule is not exercised by any
+current test either.
 
 ---
 
@@ -362,13 +400,24 @@ is explicitly active, and an idle connection MUST carry zero audio bytes.
 
 ## 8. Timers
 
-| Timer | Value | Who runs it | Effect on expiry |
-|---|---|---|---|
-| `START` response | 2 s | Mac, per outstanding `START` | Treat as a failed/dead peer — do not wait indefinitely for `START_ACK`/`START_NACK` |
-| `STOP` response | 1 s | Mac, per outstanding `STOP` | Treat the session as ended locally regardless; do not block shutdown on a `STOP_ACK` that may never arrive |
-| `PING` interval | 15 s | Mac (sends `PING` to Windows) | Windows replies `PONG` immediately; Windows applies the same 15 s interval and dead-peer rule to *absent* `PING`s from the Mac |
-| Peer dead | 45 s without a `PONG` (three missed heartbeats) | Both sides, watching the heartbeat | Declare the connection dead; close it and begin reconnect (Mac) or accept a new connection (Windows) |
-| Pre-auth (`HELLO`) deadline | 5 s | Windows, per new connection | Close the connection; see §6 |
+| Timer | Value | Who runs it | Effect on expiry | Harness |
+|---|---|---|---|---|
+| `START` response | 2 s | Mac, per outstanding `START` | Treat as a failed/dead peer — do not wait indefinitely for `START_ACK`/`START_NACK` | **[CARRIED]** |
+| `STOP` response | 1 s | Mac, per outstanding `STOP` | Treat the session as ended locally regardless; do not block shutdown on a `STOP_ACK` that may never arrive | **[CARRIED]** |
+| `PING` interval | 15 s | Mac (sends `PING` to Windows) | Windows replies `PONG` immediately; Windows applies the same 15 s interval and dead-peer rule to *absent* `PING`s from the Mac | **[CARRIED]** |
+| Peer dead | 45 s without a `PONG` (three missed heartbeats) | Both sides, watching the heartbeat | Declare the connection dead; close it and begin reconnect (Mac) or accept a new connection (Windows) | **[CARRIED]** |
+| Pre-auth (`HELLO`) deadline | 5 s | Windows, per new connection | Close the connection; see §6 | **[VERIFIED]** |
+
+**[CARRIED]** detail: the harness's `MockMacClient.start_session()`/`stop_session()` accept the 2 s
+/ 1 s values as default *parameters* on their reply-wait helper, and `ping()` performs one
+manually-triggered request/reply — but nothing in the harness ever lets a `START`/`STOP`/`PING`
+actually go unanswered to prove the timeout fires, and there is no automatic 15 s heartbeat loop or
+45 s dead-peer reaper running anywhere in `server.py` or `client.py`. This is a deliberate scope
+line, not an oversight: an always-on timer loop is real-agent behavior, not test-double behavior,
+and the mock exists to let both platform agents be built against a peer that behaves correctly on
+the wire, not to itself be a complete implementation of every timer. **A Phase 1 (or later)
+implementation of this protocol MUST still implement the full heartbeat loop, dead-peer detection,
+and both response timeouts** — their absence from the harness is not license to skip them.
 
 The heartbeat is deliberately slow (15 s) — it exists to keep connection-alive UI state honest and
 NAT/firewall state fresh, not to detect a dead peer quickly. When it actually matters — a session
@@ -385,19 +434,30 @@ goes on the wire first when both are pending. The rule:
 - **Control messages are queued unboundedly and are always drained before any audio frame.**
   Control traffic is tiny and rare (JSON objects on the order of tens to low hundreds of bytes); an
   unbounded queue for it is safe. A `STOP_ACK` or a `STATUS` update must never be stuck behind a
-  backlog of audio.
+  backlog of audio. **[VERIFIED]** —
+  `test_server.py::test_control_preempts_a_full_audio_backlog_and_counts_the_drop` fills the
+  25-frame audio queue to capacity, queues a control message behind that backlog, and asserts the
+  control message's envelope is the first thing written to the wire — not one of the backlogged
+  audio frames.
 - **Audio is queued in a bounded ring of 25 frames (500 ms at 50 fps) that drops the oldest frame
   on overflow and never blocks.** If the audio queue is full when a new frame is produced, the
   oldest queued frame is discarded to make room — the sender never waits for the network to catch
   up, and audio production (WASAPI capture on Windows) must never be slowed or blocked by a slow or
-  stalled connection.
+  stalled connection. **[VERIFIED]** — the same test offers 30 frames into a 25-capacity queue and
+  asserts both that exactly 5 were dropped and that the queue's surviving contents are the *last*
+  25 offered (i.e. the oldest 5, not an arbitrary 5, were the ones evicted). The "never blocks"
+  half of this claim is structural (the implementation uses `queue.put_nowait`, which raises
+  instead of blocking, by construction) rather than independently timed by a test.
 
 Concretely: a writer loop should check the control queue first on every iteration; only when it is
 empty does the writer send from the audio queue. A stalled network can therefore delay or lose
 audio frames, but it can never delay a control message such as `STOP_ACK`.
 
 Dropped audio frames should be counted for diagnostics — silently dropping frames in a way that
-looks identical to healthy operation is a worse failure than the drop itself.
+looks identical to healthy operation is a worse failure than the drop itself. **[VERIFIED]** — the
+server exposes `audio_frames_dropped` alongside the existing `audio_frames_sent` counter,
+incremented exactly once per frame actually evicted (not once per overflow attempt), so a reader
+can reconcile frames offered vs. dropped vs. what the far end received.
 
 ---
 

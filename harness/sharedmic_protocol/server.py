@@ -62,6 +62,7 @@ class MockWindowsServer:
 
         self.port = 0
         self.audio_frames_sent = 0
+        self.audio_frames_dropped = 0
         self.sessions_started = 0
         self.auth_failures = 0
 
@@ -180,7 +181,15 @@ class _ServerSession:
         self._control_q.put(encode_frame(FRAME_TYPE_CONTROL, encode_control(msg)))
 
     def _offer_audio(self, frame: bytes) -> None:
-        """Bounded, drop-oldest. Audio must never block the writer."""
+        """Bounded, drop-oldest. Audio must never block the writer.
+
+        `audio_frames_dropped` is incremented exactly when an existing
+        queued frame is evicted to make room for this one — i.e. once per
+        frame actually dropped, not once per call. `audio_frames_sent`
+        (incremented by the caller, `_audio_loop`) already counts frames
+        *offered*; the difference between the two lets a reader reconcile
+        offered vs. dropped vs. what the far end actually received.
+        """
         try:
             self._audio_q.put_nowait(frame)
         except queue.Full:
@@ -188,6 +197,9 @@ class _ServerSession:
                 self._audio_q.get_nowait()
             except queue.Empty:
                 pass
+            else:
+                with self._server._lock:
+                    self._server.audio_frames_dropped += 1
             try:
                 self._audio_q.put_nowait(frame)
             except queue.Full:

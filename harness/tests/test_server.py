@@ -1,4 +1,6 @@
+import queue
 import socket
+import threading
 import time
 
 import pytest
@@ -6,7 +8,7 @@ import pytest
 from sharedmic_protocol.auth import auth_proof, decode_pairing_string, encode_pairing_string, generate_token
 from sharedmic_protocol.control import PROTOCOL_VERSION, decode_control, encode_control
 from sharedmic_protocol.framing import FRAME_TYPE_CONTROL, decode_frame, encode_frame
-from sharedmic_protocol.server import MockWindowsServer
+from sharedmic_protocol.server import AUDIO_QUEUE_FRAMES, MockWindowsServer, _ServerSession
 
 
 @pytest.fixture
@@ -131,3 +133,77 @@ def test_server_closes_idle_connection_after_hello_timeout(token):
         assert elapsed > small_timeout - 0.2, f"closed after only {elapsed:.2f}s — looks suspiciously early"
     finally:
         srv.stop()
+
+
+def test_server_rejects_non_hello_message_before_authentication(server):
+    """§6: no message type other than HELLO is valid before authentication.
+
+    PING is the representative case here, but the check in
+    _ServerSession.run() is `msg["type"] != "HELLO"`, not a per-type
+    allowlist, so this one negative case exercises the same branch that
+    would reject START/STOP/STATUS/AUDIO too.
+    """
+    with socket.create_connection(("127.0.0.1", server.port), timeout=5) as sock:
+        _recv_control(sock)  # GREETING
+        _send_control(sock, {"v": PROTOCOL_VERSION, "type": "PING", "seq": 1})
+        assert sock.recv(4096) == b"", "server should have closed the connection, not replied"
+    assert server.auth_failures == 1
+
+
+def test_control_preempts_a_full_audio_backlog_and_counts_the_drop(token):
+    """§9: control drains before audio, and overflow drops the oldest frame.
+
+    Naturally overflowing the 25-frame audio queue would mean waiting out
+    the real 50 fps production pacing in `_audio_loop` (500ms+ of real
+    sleep for no added confidence, since the pacing loop is not what's
+    under test). Instead this drives `_ServerSession` directly and fills
+    both queues *before* the writer thread is started, so there is no race
+    between "how much backlog exists" and "when the writer first looks" —
+    what's under test is the writer's per-iteration priority check
+    (control before audio, unconditionally), not timing. The audio filler
+    payloads are deliberately opaque junk: this test never decodes them,
+    only counts and identifies them by position, because a full audio
+    backlog sitting unread behind a just-sent control message is exactly
+    the scenario the bounded queue exists to survive.
+    """
+    srv = MockWindowsServer(token)
+    local, remote = socket.socketpair()
+    session = _ServerSession(srv, local)
+    try:
+        filler = [f"filler-{i}".encode() for i in range(AUDIO_QUEUE_FRAMES + 5)]
+        for chunk in filler:
+            session._offer_audio(chunk)
+        assert srv.audio_frames_dropped == 5, "5 offers past capacity should drop exactly 5 frames"
+
+        # The queue should hold exactly the last AUDIO_QUEUE_FRAMES chunks —
+        # the oldest 5 were the ones dropped, not an arbitrary 5.
+        survivors = []
+        while True:
+            try:
+                survivors.append(session._audio_q.get_nowait())
+            except queue.Empty:
+                break
+        assert survivors == filler[5:], "the oldest frames, not an arbitrary 5, must be the ones dropped"
+        for chunk in survivors:  # put the backlog back so it's there when the writer starts
+            session._audio_q.put_nowait(chunk)
+
+        session._send_control({"v": PROTOCOL_VERSION, "type": "PING", "seq": 7})
+
+        # Only now does the writer see a full audio backlog *and* a queued
+        # control message at once.
+        session._writer_thread = threading.Thread(target=session._writer_loop, daemon=True)
+        session._writer_thread.start()
+
+        remote.settimeout(2.0)
+        buf = b""
+        result = None
+        while result is None:
+            result = decode_frame(buf)
+            if result is None:
+                buf += remote.recv(65536)
+        frame_type, payload, _ = result
+        assert frame_type == FRAME_TYPE_CONTROL, "a queued control message must preempt a full audio backlog"
+        assert decode_control(payload) == {"v": PROTOCOL_VERSION, "type": "PING", "seq": 7}
+    finally:
+        session.close()
+        remote.close()
