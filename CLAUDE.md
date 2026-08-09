@@ -51,16 +51,20 @@ swiftc -O -o demand-probe DemandProbe.swift
 ```
 
 **Windows WASAPI latency probe (from `probes/windows-wasapi-latency/`).** Written for
-`net10.0-windows` and NAudio, both Windows-only. **Not yet built or run anywhere** — this repo has
-no Windows machine. Do not treat the commands below as verified; they are what the owner runs on
-the actual Windows host, from `probes/windows-wasapi-latency/README.md` and
-`docs/superpowers/probes/2026-08-08-windows-wasapi-findings.md`:
+`net10.0-windows` and NAudio, both Windows-only, so it cannot be built on this Mac. The owner has
+built and run it on the actual Windows host (Samson Meteorite Mic, NAudio 2.2.1, 0 warnings /
+0 errors); see `docs/superpowers/probes/2026-08-08-windows-wasapi-findings.md` for the results and
+`probes/windows-wasapi-latency/README.md` for the procedure:
 
 ```powershell
 cd probes\windows-wasapi-latency\WasapiLatencyProbe
-dotnet build
+dotnet build --no-incremental
 dotnet run --project WasapiLatencyProbe -- 20
 ```
+
+The `.csproj` is XML: **never put a doubled hyphen inside an `<!-- -->` comment.** It is illegal XML
+and fails the build with `MSB4025`. Two slipped through review here precisely because nobody in this
+repo could compile the file.
 
 ## Design constraints that are not negotiable
 

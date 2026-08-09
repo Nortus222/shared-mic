@@ -510,11 +510,40 @@ library packaging, and an entire class of debugging.
 | Input demand appears → `Devices` membership confirmed | ~5 ms | **Measured** — Task 10 macOS probe, targeted lookup via `kAudioHardwarePropertyTranslatePIDToProcessObject`, self-introspection on the target Mac (macOS 26.6.1) |
 | Demand detected → `START` sent (warm TLS connection) | 1–5 ms | Estimate |
 | LAN transit | 2–15 ms | Estimate |
-| WASAPI shared open and start | 20–80 ms | Estimate — **unverified**, see below |
+| WASAPI shared open and start | **78.5–93.4 ms** (p50–p95); **114.1 ms cold** | **Measured** — Windows probe, 20 cycles, **Samson Meteorite Mic** on the owner's Windows host, `net10.0-windows` / NAudio 2.2.1. See `docs/superpowers/probes/2026-08-08-windows-wasapi-findings.md` |
 | First 20 ms frame captured | 20 ms | Fixed by frame duration |
 | Transit to Mac | 2–10 ms | Estimate |
 | Jitter buffer prefill | 60 ms | Estimate — set by measurement in Phase 2 |
-| **Total** | **~109–196 ms** | |
+| **Total, typical** | **~168–208 ms** | p50 open at the low corner, p95 open at the high corner |
+| **Total, cold start** | **~204–229 ms** | 114.1 ms cold open at both corners |
+
+The totals are recomputed from the rows above, not carried over from the previous revision:
+
+- **Typical, low corner** (every stage at its low end, p50 open):
+  5 + 1 + 2 + 78.5 + 20 + 2 + 60 = **168.5 ms**
+- **Typical, high corner** (every stage at its high end, p95 open):
+  5 + 5 + 15 + 93.4 + 20 + 10 + 60 = **208.4 ms**
+- **Cold start, low corner:** 5 + 1 + 2 + 114.1 + 20 + 2 + 60 = **204.1 ms**
+- **Cold start, high corner:** 5 + 5 + 15 + 114.1 + 20 + 10 + 60 = **229.1 ms**
+
+(The demand-detection row is quoted as ~5 ms; an earlier revision's totals treated it as a 4–6 ms
+band, which is why those totals ended in 9 and 6. The ±1 ms is measurement noise and does not
+change any conclusion below.)
+
+**Against the 300 ms p95 target: it still holds.** The realistic worst case in this table is the
+cold-start high corner at **229.1 ms**, leaving **~71 ms of headroom** (24% of the budget). The
+typical high corner is **208.4 ms**, leaving **~92 ms** (31%). Neither figure breaches the target.
+But the margin is materially thinner than the previous, unmeasured budget implied: the old total
+topped out at ~196 ms, and the cold case is now **33 ms worse** than that. The jitter-buffer
+prefill (60 ms, still an estimate) and LAN transit are now the only remaining knobs of comparable
+size, and the prefill figure is set by measurement in Phase 2 — if that measurement pushes prefill
+toward the 120 ms top of its adaptive range, the cold-start case would reach ~289 ms and the
+headroom would be effectively gone. That interaction is a Phase 2 watch item, not a Phase 0 one.
+
+**The cold-start case is not an edge case here; it is the design's normal case.** Capture is closed
+whenever macOS has no input demand, so the first activation after any idle period pays the cold
+open. The probe measured cold at 114.1 ms and, notably, that was also the *maximum* of its twenty
+baseline cycles — no warm cycle was slower than the cold one.
 
 The demand-detection figure is the targeted-lookup measurement from
 `docs/superpowers/probes/2026-08-08-macos-demand-findings.md` (leg 1: **5 ms** to detect appearance,
@@ -539,22 +568,57 @@ section quoted 4–6 ms, ~40–60 ms and 575–1188 ms from a different run, whi
 within measurement noise but does not match anything a reader can find in the repository. Quote the
 committed run; if you re-measure, replace the figures and say which run they come from.
 
-The WASAPI shared-mode open figure (20–80 ms) is still the original, unmeasured planning estimate.
-The Windows probe that would measure it
-(`probes/windows-wasapi-latency/`, see
-`docs/superpowers/probes/2026-08-08-windows-wasapi-findings.md`) has been written but **has never
-been compiled or run** — no real figure exists yet. Treat this row, and therefore the total, as
-provisional until the owner runs that probe on the actual Windows host.
+The WASAPI shared-mode open figure is now **measured**, replacing the original 20–80 ms planning
+estimate. The owner built and ran `probes/windows-wasapi-latency/` on the real Windows host: 20
+cycles against a **Samson Meteorite Mic**, built with `dotnet build --no-incremental` (0 warnings,
+0 errors) targeting `net10.0-windows` with **NAudio 2.2.1**. Baseline, with nothing else holding
+the microphone: 20/20 succeeded, 0 conflicts, cold 114.1 ms, min 76.8 ms, p50 78.5 ms, p95 93.4 ms,
+max 114.1 ms. Full detail, including what remains unrecorded, is in
+`docs/superpowers/probes/2026-08-08-windows-wasapi-findings.md`.
 
-This fits the 300 ms p95 target with headroom, provisionally. The single largest contributor to
-that headroom is the warm TLS connection — under the draft's two-connection design, a handshake
-would sit directly on this path.
+**The assumption was optimistic.** p50 (78.5 ms) landed at the very top of the assumed 20–80 ms
+band; p95 (93.4 ms) and cold (114.1 ms) fell outside it by 13.4 ms and 34.1 ms. Even the fastest of
+twenty opens (76.8 ms) was above the assumed midpoint. The assumed band's lower half never occurred.
+
+**Scope of that measurement, stated at its real width:** one microphone, one driver, one Windows
+machine, 20 cycles. It does not characterize other USB controllers, drivers, microphone models, or
+Windows builds, and 20 samples cannot say anything about a rare long tail. Phase 2 measures the real
+end-to-end figure with the actual agent; this row is the open stage only.
+
+The same probe run answered the co-access question, which was a functional go/no-go for the whole
+design: with **Windows Voice Typing (Win+H)** actively using the same microphone, the probe still
+opened it 20/20 times with **0 conflicts**, and Voice Typing kept working throughout. §6.1's
+shared-mode requirement is therefore evidenced rather than assumed, on this one combination.
+
+Worth knowing, and slightly counterintuitive: the concurrent run was **faster** than the baseline on
+every statistic (p50 62.6 vs 78.5 ms, p95 77.7 vs 93.4 ms, cold 89.0 vs 114.1 ms). When another
+client already holds the endpoint in shared mode, the Windows audio engine is already running, so
+opening an additional shared stream joins a live engine instead of spinning one up cold. **The
+practical consequence is the one that matters for this budget: the worst case for activation
+latency is an idle machine with nothing else using the microphone — which is exactly the state this
+product creates by design.** The table above is therefore built on the baseline figures, not the
+friendlier concurrent ones.
+
+The single largest contributor to the remaining headroom is the warm TLS connection — under the
+draft's two-connection design, a handshake would sit directly on this path.
 
 **Accepted limitation, stated plainly:** because capture is closed at idle by design, there is no
 pre-roll. Audio spoken before `START` is unrecoverable. No tuning removes this; it is the direct
 cost of the zero-idle-bytes requirement. The defenses are minimizing activation latency and the
 fact that applications normally open input before the user begins speaking. Acceptance is measured
 empirically (§9), not assumed.
+
+**That limitation is now tighter than this spec previously implied, and the criterion is not being
+softened to accommodate it.** The open stage costs 78.5–114.1 ms rather than the assumed 20–80 ms:
+about **29 ms more at p50** than the assumed band's midpoint, **13 ms more at p95** and **34 ms more
+cold** than its ceiling. That is that much additional unrecoverable audio at the front of every
+activation, and there is no pre-roll to absorb it. The §9 criterion (at least 95 of 100 activations
+losing no complete first word) stands exactly as written; it is simply harder to hit than the old
+budget suggested, and the
+probability of failing it is higher than it was when the budget was written. If Phase 2 measurement
+shows the criterion failing, the response is a design change — a small pre-roll would contradict the
+zero-idle-bytes requirement, so the realistic levers are reducing the jitter-buffer prefill or
+accepting a documented limitation — not relaxing the number.
 
 ### 6.4 macOS render
 
@@ -649,9 +713,20 @@ authentication is rate-limited to 5 attempts followed by a 30 s lockout — see
       selected as the system input (§3.4): opening System Settings → Sound, and separately opening
       Safari, produce **zero** `START` messages.
 - [ ] Windows applications can use the physical USB microphone while the Mac is receiving it.
+      *Strongly evidenced already, not yet closed:* the Phase 0 Windows probe opened the microphone
+      20/20 times with **0 conflicts** while **Windows Voice Typing** was actively using it, and
+      Voice Typing kept working throughout — on one microphone (Samson Meteorite), one driver, one
+      machine, one concurrent application. This criterion still has to be met end to end in Phase 2
+      by the real agent, and against applications other than Voice Typing.
 - [ ] Across 100 repeated activations of the primary application, **at least 95 lose no complete
-      first word**.
-- [ ] `START`-to-first-playable-frame latency is **below 300 ms at p95** on the home LAN.
+      first word**. **This got harder, and the number is not being relaxed.** The measured WASAPI
+      open (78.5 ms p50 / 114.1 ms cold, §6.3) is ~29 ms slower at p50 than the midpoint of the
+      estimate this criterion was written against, and 34 ms slower cold than its ceiling — with no
+      pre-roll by design, that is all lost audio. Budget extra Phase 2 time for it, and
+      treat a failure here as a design question, not as grounds to move the threshold.
+- [ ] `START`-to-first-playable-frame latency is **below 300 ms at p95** on the home LAN. The §6.3
+      budget now predicts ~208 ms typical and ~229 ms cold from measured and estimated stages, so
+      the expected headroom is ~70–92 ms rather than the ~100+ ms the pre-measurement budget implied.
 - [ ] Opening microphone input in ManyCam, Teams, or another non-BlackHole virtual device produces
       **zero** `START` messages.
 - [ ] *Secondary, untested as of Phase 0:* macOS Dictation, Chrome/Chromium, the ChatGPT desktop
@@ -679,6 +754,7 @@ authentication is rate-limited to 5 attempts followed by a 30 s lockout — see
 | Mac Dictation start/stop (secondary, untested) | Automatic START/STOP, or documented force-on fallback | Activation and stop latency | P1 |
 | ChatGPT / browser voice input (untested) | Automatic stream | Audio accepted | P1 |
 | Windows + Mac simultaneous capture | Both receive speech | No WASAPI conflict | P0 |
+| Windows + Mac simultaneous capture, **applications other than Voice Typing** (Teams, Zoom, browser `getUserMedia`, OBS) | Both receive speech | No WASAPI conflict | P0 — the Phase 0 probe covered Voice Typing only (§13 Q2) |
 | 10-minute idle | No PCM transport | Byte counter = 0 | P0 |
 | **ManyCam/Teams input opened** | **No START sent** | **False-start count = 0** | **P0** |
 | **Kill switch engaged, app requests input** | **No START sent** | **Byte counter = 0** | **P0** |
@@ -744,16 +820,26 @@ genuinely separate process, and repeat activations — done, and it also forced 
 (the primary application), the System Settings Sound extension and Safari/WebKit; that pass produced
 §3.4's device configuration, §5.1's measured false-positive analysis, and the requalification of the
 `IsRunningInput` finding. Dictation, Chrome/Chromium, ChatGPT desktop and Zoom/Teams remain
-untested. (b) measured WASAPI shared-mode open latency on the actual Windows host — the probe is
-written but has never been compiled or run on Windows hardware (see §13 Q2). One of the two major
-risks is retired before real code is written; the other awaits the owner running the Windows probe.
+untested. (b) measured WASAPI shared-mode open latency on the actual Windows host — **done**: the
+owner built and ran the probe against a Samson Meteorite Mic (`net10.0-windows`, NAudio 2.2.1), and
+it both produced a real open-latency figure (78.5 ms p50, 93.4 ms p95, 114.1 ms cold, forcing the
+§6.3 revision) and confirmed shared-mode co-access with Windows Voice Typing at 20/20 opens and 0
+conflicts (see §13 Q2). **Both major risks are retired before real code is written.** What the
+Windows probe left behind is bookkeeping rather than risk: the exact MMDevice endpoint ID string and
+the device's shared mix format were not captured from the probe's output, and Phase 1 needs the
+endpoint ID because it persists exactly that string (§6.1). Re-running the probe once and keeping
+the console output supplies both.
 
 **Phase 1 — Transport and security.** Single TLS channel, certificate generation, pairing, HMAC
 auth, framing, priority send queue, heartbeat, reconnect. Both ends. No audio yet.
 
 **Phase 2 — Audio path.** Windows capture and normalization, Mac render to BlackHole, manual
 START/STOP from the menu. Validate quality, measure latency, set the prefill figure, verify drift
-correction.
+correction. Two items are heavier here than the original plan assumed, both because of the measured
+WASAPI open (§6.3): the **first-word-clipping criterion** (§9, 95 of 100) now has 15–35 ms less
+slack than when it was written and needs real measurement time budgeted rather than a quick check,
+and **setting the prefill figure** is no longer only a jitter/underrun trade — it is also the main
+remaining lever on cold-start activation latency, so measure both effects before fixing it.
 
 **Phase 3 — Automatic demand.** Device-scoped observer, full state machine, kill switch, force-on
 hold, notification policy.
@@ -806,13 +892,35 @@ Resolved by Phase 0 probes:
    findings document for the exact steps and the remaining matrix.
 
 2. **What is the real WASAPI shared-mode open latency on this Windows host, cold and warm?**
-   **Still open.** The probe (`probes/windows-wasapi-latency/`) is written but has **never been
-   compiled or run** — this environment has no Windows machine. No latency figure exists; the
-   spec's 20–80 ms budget entry (§6.3) remains the original planning estimate, not a measurement.
-   See `docs/superpowers/probes/2026-08-08-windows-wasapi-findings.md`, which is explicitly marked
-   not-yet-filled-in. Whether WASAPI shared mode genuinely permits simultaneous Windows + Mac
-   capture is also untested — that probe's concurrency check is the go/no-go for it, and it has not
-   run either.
+   **Answered.** The owner built and ran `probes/windows-wasapi-latency/` on the real Windows host
+   against a **Samson Meteorite Mic** (`net10.0-windows`, NAudio 2.2.1, `dotnet build
+   --no-incremental`, 0 warnings / 0 errors). Baseline, 20 cycles, nothing else holding the
+   microphone: 20/20 succeeded, 0 conflicts, **cold 114.1 ms, min 76.8 ms, p50 78.5 ms, p95
+   93.4 ms, max 114.1 ms**. The spec's 20–80 ms assumption was optimistic: p50 landed at the top of
+   that band and p95 and cold fell outside it. §6.3 now carries the measured figure and totals
+   recomputed from it (~208 ms typical, ~229 ms cold), which still fits the 300 ms p95 target with
+   ~70–92 ms of headroom. See
+   `docs/superpowers/probes/2026-08-08-windows-wasapi-findings.md`.
+
+   **The co-access go/no-go passed.** With **Windows Voice Typing (Win+H)** actively using the same
+   microphone, the probe still opened it **20/20 times with 0 conflicts, 0 timeouts, 0 failures**,
+   and Voice Typing remained operational throughout. Simultaneous Windows + Mac use of the one
+   physical microphone — the premise of the whole design — is now evidenced rather than assumed. The
+   concurrent run was also *faster* than the baseline on every statistic (p50 62.6 ms, p95 77.7 ms,
+   cold 89.0 ms), because a shared-mode client that joins a running audio engine avoids engine
+   start-up cost; see §6.3.
+
+   **Scope this at its real width, and note what is still missing:**
+   - One microphone (Samson Meteorite), one driver, one Windows machine, one concurrent application
+     (Voice Typing), 20 cycles per run. This is **not** a general "WASAPI shared mode works" result.
+     An application that opens the endpoint in *exclusive* mode would still lock the agent out, and
+     nothing here tests that.
+   - 20 samples give a usable p50 and a rough p95; they say nothing about a rare long tail.
+   - The **exact MMDevice endpoint ID string** and the **device's shared mix format** were not
+     captured from the probe's output. Phase 1 persists precisely that endpoint ID (§6.1), so it
+     must be copy-pasted from a probe run, not retyped or approximated; the mix format determines
+     `PcmNormalizer`'s resample/downmix work. Both remain outstanding on the owner.
+   - The Windows version and SDK version were not recorded either.
 
 Resolved by Phase 2 measurement:
 

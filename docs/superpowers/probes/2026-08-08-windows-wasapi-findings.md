@@ -1,19 +1,24 @@
 # Windows WASAPI open-latency findings (Phase 0, spec open question 2)
 
-> **STATUS: NOT YET FILLED IN.**
-> This probe (`probes/windows-wasapi-latency/`) targets `net10.0-windows`
-> and NAudio, both Windows-only, and was written on a Mac. It has **never
-> been built or run**. Every value below is an empty, explicitly-marked
-> slot, not a placeholder number -- none of it should be read as a result
-> until the owner runs the probe on the Windows host and fills this
-> document in. See `probes/windows-wasapi-latency/README.md` for exact
-> build/run instructions and the "what to send back" list.
+> **STATUS: RUN AND RECORDED.** The owner built and ran this probe on the
+> real Windows host on 2026-08-08. Two runs of 20 cycles each: a baseline
+> with nothing else holding the microphone, and a concurrent-access run
+> with Windows Voice Typing actively using the same microphone. Both are
+> recorded below.
 >
-> **Outstanding values, all of them:** Windows version, microphone model,
-> exact MMDevice endpoint ID, device shared mix format, NAudio version and
-> actual capture type name, .NET target framework actually used, the
-> cold/p50/p95/max latency table, the concurrent-access result, and the
-> verdict on the spec's 20-80 ms assumption.
+> **Headline: shared-mode co-access is confirmed on this combination.**
+> 20/20 opens succeeded with **0 conflicts** while Voice Typing held the
+> device, and Voice Typing itself stayed operational throughout. This was
+> a functional go/no-go for the whole project; it passed. Scope it
+> honestly: **one microphone, one driver, one Windows machine, one
+> concurrent application, 20 cycles.**
+>
+> **Still outstanding, and only the owner can supply them:** the exact
+> MMDevice endpoint ID string, the device's shared mix format as printed
+> by the probe, the Windows version, the SDK version, and the verbatim
+> console output. See "Requires the owner" at the end. The endpoint ID in
+> particular is load-bearing — Phase 1 persists precisely that string, so
+> it must be copy-pasted, never retyped or approximated.
 
 **Probe:** `probes/windows-wasapi-latency/WasapiLatencyProbe/` (throwaway;
 see its README)
@@ -21,74 +26,146 @@ see its README)
 **Question answered:** how long does WASAPI shared-mode capture actually
 take to open on real Windows hardware, and does shared mode really allow
 this probe and another Windows application to use the microphone at the
-same time? The design spec's activation budget assumes 20-80 ms for the
+same time? The design spec's activation budget assumed 20-80 ms for the
 open stage, inside a 300 ms p95 target for "user starts dictation" ->
 "first audio captured." Because capture is deliberately closed while
 macOS has no input demand, this open cost sits directly on that path and
-is the largest single unknown in the budget.
+was the largest single unknown in the budget.
 
 ## Test machine
 
-- Windows version: **[NOT MEASURED -- fill in, e.g. `winver` or
+- Windows version: **[NOT RECORDED -- the owner ran this on the Windows
+  host but did not report the version string; fill in from `winver` or
   `Get-ComputerInfo`]**
-- Microphone model: **[NOT MEASURED -- exact make/model]**
-- USB controller / port used, if known: **[NOT MEASURED, optional]**
+- Microphone model: **Samson Meteorite Mic** (USB condenser)
+- USB controller / port used, if known: **[NOT RECORDED, optional]**
 
 ## Toolchain actually used
 
-- .NET target framework actually built: **[NOT MEASURED -- `net10.0-windows`
-  unless retargeted per the README; record which]**
-- `dotnet --version` of the SDK that built it: **[NOT MEASURED]**
-- NAudio version actually restored: **[NOT MEASURED -- pinned to 2.2.1 in
-  the committed `.csproj`; record what actually resolved]**
-- Actual capture type name used: **[NOT MEASURED -- `NAudio.Wave.WasapiCapture`
-  as written, unless the installed NAudio major version renamed it; the
-  probe prints this at startup]**
+- .NET target framework actually built: **`net10.0-windows`** (as
+  committed; not retargeted)
+- Build command and result: **`dotnet build --no-incremental`, 0 warnings,
+  0 errors**
+- `dotnet --version` of the SDK that built it: **[NOT RECORDED -- fill in]**
+- NAudio version actually restored: **2.2.1** (the version pinned in the
+  committed `.csproj`; no substitution was needed)
+- Actual capture type name used: **`NAudio.Wave.WasapiCapture`**. This is
+  inferred, not read off the probe's startup line: `Program.cs` is written
+  against `WasapiCapture` and the build produced 0 errors, so that type
+  resolved in NAudio 2.2.1. The probe also prints the type name at
+  startup; that line is part of the missing verbatim output below.
 
 ## Device identity
 
 - Exact MMDevice endpoint ID (copy-paste from probe output, do not
-  retype): **[NOT MEASURED]**
-- Device friendly name as printed by the probe: **[NOT MEASURED]**
+  retype): **[NOT RECORDED -- REQUIRED BEFORE PHASE 1.** Phase 1's
+  `DeviceManager` persists exactly this string (spec §6.1), so an
+  approximation or a retyped GUID is worse than nothing.**]**
+- Device friendly name as printed by the probe: **[NOT RECORDED.** The
+  hardware is a Samson Meteorite Mic; the exact endpoint friendly name
+  string the probe printed was not captured. Note that the design
+  resolves devices by endpoint ID, never by friendly name, so this one is
+  informational rather than load-bearing.**]**
 
 ## Shared mix format
 
 As printed by the probe (sample rate / bit depth / channels / encoding):
 
-**[NOT MEASURED]**
+**[NOT RECORDED -- REQUIRED.** `PcmNormalizer` (spec §6.1) converts from
+this format to 48 kHz / mono / s16le, and whether it must resample and
+whether it must downmix both follow directly from it. Until this is
+recorded, the normalizer's actual workload on this hardware is unknown.**]**
 
 ## Latency results
 
-Attempted/succeeded/conflicts/timed out/failed counts and the
-cold/min/p50/p95/max table, exactly as printed by the probe's summary.
-Note: `conflicts` (not `failed`) is the shared-mode-conflict signal --
-see "Concurrent-access check" below.
+Two runs of 20 cycles each. `conflicts` (not `failed`) is the
+shared-mode-conflict signal -- see "Concurrent-access check" below.
+
+### Baseline (nothing else holding the microphone)
 
 | metric | value |
 |---|---|
-| attempted | **[NOT MEASURED]** |
-| succeeded | **[NOT MEASURED]** |
-| conflicts | **[NOT MEASURED]** |
-| timed out | **[NOT MEASURED]** |
-| failed | **[NOT MEASURED]** |
-| cold (run 1) | **[NOT MEASURED]** |
-| min | **[NOT MEASURED]** |
-| p50 | **[NOT MEASURED]** |
-| p95 | **[NOT MEASURED]** |
-| max | **[NOT MEASURED]** |
+| attempted | 20 |
+| succeeded | 20 |
+| conflicts | 0 |
+| timed out | 0 |
+| failed | 0 |
+| cold (run 1) | 114.1 ms |
+| min | 76.8 ms |
+| p50 | 78.5 ms |
+| p95 | 93.4 ms |
+| max | 114.1 ms |
 
-Full, unedited console output of the run (paste verbatim once available):
+Note that `max` equals `cold`: the slowest open of the twenty was the
+first one. No cycle after the first ever exceeded the cold figure.
+
+### Concurrent access (Windows Voice Typing actively using the same mic)
+
+| metric | value |
+|---|---|
+| attempted | 20 |
+| succeeded | 20 |
+| conflicts | 0 |
+| timed out | 0 |
+| failed | 0 |
+| cold (run 1) | 89.0 ms |
+| min | 61.2 ms |
+| p50 | 62.6 ms |
+| p95 | 77.7 ms |
+| max | 89.0 ms |
+
+Full, unedited console output of the run:
 
 ```
-[NOT MEASURED -- paste the full probe output here, unedited]
+[NOT RECORDED -- the owner reported the summary statistics but not the
+verbatim console output. The two summary tables above are what was
+reported, transcribed exactly. The verbatim output would additionally
+supply the endpoint ID, the friendly name, the mix format, and the
+NAudio/capture-type startup line -- see "Requires the owner".]
 ```
+
+### The concurrent run was *faster* than the baseline, on every statistic
+
+This is the most counterintuitive number in the document, so it gets an
+explanation rather than being left as a curiosity:
+
+| statistic | baseline | with Voice Typing | difference |
+|---|---|---|---|
+| cold (run 1) | 114.1 ms | 89.0 ms | **-25.1 ms** |
+| min | 76.8 ms | 61.2 ms | **-15.6 ms** |
+| p50 | 78.5 ms | 62.6 ms | **-15.9 ms** |
+| p95 | 93.4 ms | 77.7 ms | **-15.7 ms** |
+| max | 114.1 ms | 89.0 ms | **-25.1 ms** |
+
+The likely mechanism: when another client already holds the endpoint in
+shared mode, the Windows audio engine for that endpoint is already
+running -- the device is initialized, the engine's periodic processing
+thread is live, and the shared-mode mix graph exists. Opening an
+*additional* shared stream then joins a running engine instead of
+spinning one up cold. The baseline run, by contrast, paid engine
+start-up cost on essentially every cycle, because each cycle closes the
+device and the engine winds down again before the next one.
+
+This mechanism is a reasonable reading of the numbers, not something the
+probe instrumented. The probe measures wall-clock time from
+`StartRecording()` to the first non-empty `DataAvailable` callback; it
+does not observe the audio engine's internal state. What *is* measured is
+the 15-25 ms gap itself, consistently across all five statistics and in
+the same direction.
+
+**Practical consequence, and it matters for the design:** the worst case
+for activation latency is an **idle machine with nothing else using the
+microphone** -- and that is the *common* case for this product. This
+system exists precisely so that nothing holds the microphone at idle;
+capture is closed when macOS has no demand. So the budget must be built
+on the baseline figures (cold 114.1 ms, p95 93.4 ms), not the friendlier
+concurrent ones. The concurrent figures are the good case, and they are
+the case that happens only when a Windows application is already
+recording.
 
 ## Concurrent-access check (shared mode)
 
-Whether the probe still opened successfully while another Windows
-application (e.g. Voice Typing, Win+H) held the same microphone.
-
-**Read this before filling in "Result" below.** A genuine WASAPI
+**Read this before interpreting the counts.** A genuine WASAPI
 shared-mode conflict cannot produce a `FAILED` line in this probe --
 NAudio runs the actual device-open call on a background thread inside
 its own try/catch and reports a failure through `RecordingStopped`, not
@@ -100,40 +177,121 @@ probe's `conflicts` count / `CONFLICT` lines, and/or unexplained
 shared-mode conflict. See `probes/windows-wasapi-latency/README.md`
 ("Running the concurrency check" section) for the full explanation.
 
-- Other application used to hold the device: **[NOT MEASURED]**
+- Other application used to hold the device: **Windows Voice Typing
+  (Win+H)**, actively using the same Samson Meteorite Mic.
 - Baseline run's `conflicts`/`timed out`/`failed` counts (device not
-  held by anything else): **[NOT MEASURED]**
+  held by anything else): **0 / 0 / 0**, with 20/20 succeeded.
 - Concurrency run's `conflicts`/`timed out`/`failed` counts (device held
-  by the other app): **[NOT MEASURED]**
-- Result (pass: concurrency run's counts match the baseline, `conflicts`
-  stayed 0 / fail: `conflicts` > 0 or new `TIMED OUT`/`CONFLICT` activity
-  appeared only while the device was held): **[NOT MEASURED]**
-- If any `CONFLICT` line appeared, paste its exact text here and treat
-  this as an escalation, not something to work around:
-  **[NOT MEASURED]**
+  by the other app): **0 / 0 / 0**, with 20/20 succeeded.
+- Effect on the other application: **Voice Typing remained operational
+  throughout** the 20 cycles. It was not interrupted, muted, or evicted
+  by the probe repeatedly opening and closing the same endpoint.
+- **Result: PASS.** The concurrency run's counts match the baseline
+  exactly, `conflicts` stayed 0, and no new `TIMED OUT`/`CONFLICT`
+  activity appeared while the device was held.
+- `CONFLICT` lines observed: **none, in either run.**
 
 ## What this proves
 
-**[NOT YET DETERMINED -- fill in once the probe has been run.]**
+**WASAPI shared-mode co-access works on this combination.** On a Samson
+Meteorite Mic, with its driver, on the owner's Windows machine, with
+Windows Voice Typing as the concurrent client: the probe opened the
+endpoint 20 out of 20 times while Voice Typing was actively using it,
+with zero conflicts, zero timeouts and zero failures, and Voice Typing
+kept working the whole time.
+
+This retires the project's biggest functional risk. Simultaneous
+Windows + Mac use of the one physical microphone is the entire premise of
+the design (spec §2.1, §6.1); if Windows applications could not use the
+microphone while the Mac stream was active, the design was dead and the
+only alternatives were exclusive-mode ownership with manual switching, or
+abandoning the approach. That question is now answered in the
+affirmative, empirically, on real hardware.
+
+**Say it at this scope and no wider.** This is not "WASAPI shared mode
+works." It is: *shared-mode co-access worked on this microphone, this
+driver, this machine, and this one concurrent application, over 20
+cycles.* A different microphone, a driver that forces exclusive mode, or
+an application that requests exclusive mode could still conflict. The
+spec's acceptance criterion "Windows applications can use the physical
+USB microphone while the Mac is receiving it" (§9) is now strongly
+evidenced for this setup, and it remains the criterion to verify end to
+end in Phase 2 with the real agent rather than this probe.
+
+**And the timing question is answered too:** the open stage costs
+**p50 78.5 ms / p95 93.4 ms / cold 114.1 ms** on an idle machine. See the
+verdict below and spec §6.3 for the revised budget.
 
 ## What this does NOT prove / remains unverified
 
-- Only ever tested on whatever single machine/microphone the owner runs
-  this on first -- does not characterize latency across different USB
-  controllers, drivers, or Windows builds.
-- Cold-open-to-first-buffer latency only; does not include network
-  transit, remote capture packaging, or client-side prefill. The probe's
-  own "headroom" line adds an unverified ~100 ms placeholder for that on
-  top of the measured p95 -- that 100 ms is not itself measured.
-- The concurrency check exercises one other application (whichever the
-  owner picks, e.g. Voice Typing) opening the device at the same time as
-  this probe; it does not exhaustively test every application that might
-  hold the microphone.
+- **One machine, one microphone, one driver.** Everything here was
+  measured on a single Windows host with a single Samson Meteorite Mic.
+  It does not characterize latency or co-access across different USB
+  controllers, drivers, microphone models, or Windows builds. A second
+  machine could differ in either direction.
+- **One concurrent application.** The co-access result covers Windows
+  Voice Typing only. Teams, Zoom, Discord, OBS, browser `getUserMedia`,
+  and anything that requests exclusive mode are all untested. An
+  application that opens the endpoint in *exclusive* mode would still
+  lock this probe (and the shipping agent) out; nothing here says
+  otherwise.
+- **20 cycles per run** is enough to see a p50 and a rough p95 and to
+  make a 0-conflict result meaningful; it is not enough to characterize a
+  tail. A 1-in-100 stall would very likely not appear in 20 samples.
+  There is no evidence here about rare long opens.
+- **Cold-open-to-first-buffer latency only.** This does not include
+  network transit, remote capture packaging, or client-side prefill. The
+  probe's own "headroom" line adds an unverified ~100 ms placeholder for
+  that on top of the measured p95; that 100 ms is not itself measured.
+  The real end-to-end activation figure is a Phase 2 measurement.
+- **The engine-already-running explanation** for why the concurrent run
+  was faster is an interpretation of the measured gap, not an
+  instrumented finding.
+- **The probe is not the agent.** It uses NAudio's `WasapiCapture` with
+  its default shared-mode initialization. The Phase 2 Windows agent may
+  configure the client differently (buffer duration, event-driven vs
+  polled), and that can move the open cost.
 
 ## Verdict on the spec's 20-80 ms assumption
 
-**[NOT YET DETERMINED -- fill in once p95 is measured.]**
+**The assumption was too optimistic and has been replaced.**
 
-If p95 substantially exceeds 80 ms, say so plainly here and flag that the
-activation budget in the spec needs revising before Phase 2 -- that is a
-useful, reportable probe result, not a failure of the probe.
+- p50 **78.5 ms** sits at the very top of the assumed 20-80 ms band.
+- p95 **93.4 ms** is **13.4 ms above** the assumed ceiling.
+- cold **114.1 ms** is **34.1 ms above** the assumed ceiling -- and cold
+  is the realistic first activation for this product, which closes
+  capture at idle by design.
+- min **76.8 ms** is above the assumed *midpoint*; nothing in 20 baseline
+  cycles ever came close to the 20 ms bottom of the assumed band.
+
+In other words the assumed band's lower half never happened, and the
+real distribution starts roughly where the assumption ended.
+
+Spec §6.3 has been updated: the WASAPI row is now **78.5-93.4 ms
+(measured, p50-p95)** with cold start called out separately at
+**114.1 ms**, and the totals recomputed from the actual rows. The 300 ms
+p95 target still holds -- see §6.3 for the arithmetic and the remaining
+headroom -- but the margin is smaller than the spec previously implied,
+and the first-word-clipping risk in §6.3/§9 is correspondingly tighter.
+The acceptance criterion (95 of 100 activations losing no complete first
+word) is unchanged and must not be softened; it is simply harder to hit
+than the old budget suggested.
+
+## Requires the owner
+
+These are the values that are still missing. None of them can be
+invented, and two of them block Phase 1 work:
+
+1. **The exact MMDevice endpoint ID string** for the Samson Meteorite Mic,
+   copy-pasted from the probe's device list (do not retype). Phase 1's
+   `DeviceManager` persists exactly this string.
+2. **The device's shared mix format** as printed by the probe (sample
+   rate / bit depth / channels / encoding). `PcmNormalizer`'s resample
+   and downmix behavior follows from it.
+3. The **Windows version** (`winver`) and **`dotnet --version`**, for the
+   record of what this was measured on.
+4. Ideally, the **verbatim console output** of both runs, which supplies
+   1-3 and the friendly name and capture-type startup line in one paste.
+
+Re-running the probe once and pasting the whole output produces all of
+these; no re-measurement of the latency figures is needed.

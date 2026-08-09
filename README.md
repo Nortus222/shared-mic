@@ -41,8 +41,13 @@ What Phase 0 delivered, and where to start reading:
   ruled out `kAudioProcessPropertyIsRunningInput` as a demand gate in favour of device-list
   membership, and the owner's follow-up pass over real applications established that BlackHole need
   not be the Mac's system input device. The Windows WASAPI latency probe
-  ([findings](docs/superpowers/probes/2026-08-08-windows-wasapi-findings.md)) is written but has not
-  been run — this repository has no Windows machine.
+  ([findings](docs/superpowers/probes/2026-08-08-windows-wasapi-findings.md)) has now been run by the
+  owner on the real Windows host, and changed the design too: it confirmed that Windows applications
+  can keep using the microphone while the probe holds it — 20/20 opens with **zero conflicts** while
+  Windows Voice Typing was actively using the same mic — and it measured the WASAPI open at
+  **78.5 ms p50 / 93.4 ms p95 / 114.1 ms cold**, above the spec's assumed 20–80 ms, which forced the
+  activation budget in §6.3 to be recomputed. That is one microphone (Samson Meteorite), one driver,
+  one machine, one concurrent application, 20 cycles per run — not a general claim about WASAPI.
 
 ## Requirements
 

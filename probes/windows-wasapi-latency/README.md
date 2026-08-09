@@ -2,24 +2,42 @@
 
 Throwaway probe for Phase 0 / spec open question 2: how long does WASAPI
 **shared-mode** capture actually take to open on real Windows hardware?
-The design spec's activation budget assumes 20-80 ms for this stage,
+The design spec's activation budget assumed 20-80 ms for this stage,
 inside a 300 ms p95 target for "user starts dictation" -> "first audio
 captured". Because capture is deliberately closed while macOS has no
 input demand (the zero-idle-bytes requirement), this open cost sits
-directly on that path.
+directly on that path. The measured answer turned out to be higher than
+that assumption, and spec §6.3 has been revised accordingly. (The probe's
+own console output still prints "spec assumes 20-80 ms" against the old
+figure; that line is a leftover of the run, not the current budget.)
 
 It also checks a functional goal of the whole project: that WASAPI
 **shared** mode really does let this probe and another Windows
-application use the microphone at the same time.
+application use the microphone at the same time. It does, on the one
+combination tested.
 
 This directory is not built by CI and is not part of the shipping
 product. The durable output is
 `docs/superpowers/probes/2026-08-08-windows-wasapi-findings.md`.
 
-**This probe was written on a Mac and has never been built or run.** It
-targets `net10.0-windows` and NAudio, both Windows-only. It must be built
-and run on the Windows host, by the owner. Read the whole file before
-running it.
+**This probe has been built and run.** It was written on a Mac, but the
+owner has since built it on the real Windows host with `dotnet build
+--no-incremental` (0 warnings, 0 errors) targeting `net10.0-windows` with
+NAudio 2.2.1, and run it twice against a **Samson Meteorite Mic**:
+baseline 20/20 opens, 0 conflicts, p50 78.5 ms / p95 93.4 ms / cold
+114.1 ms; and a concurrent run with **Windows Voice Typing** holding the
+same microphone, also 20/20 with 0 conflicts. Results are in the findings
+doc; the co-access check **passed** on that combination.
+
+Two values the findings doc still needs were not captured from that run:
+the **exact MMDevice endpoint ID string** and the **device's shared mix
+format**. Both are printed by the probe. If you re-run it, keep the whole
+console output.
+
+Note on building it: a doubled hyphen inside an XML comment is illegal
+and fails the build with `MSB4025`. The committed `.csproj` originally
+had two, which is why the owner's first build failed; it is fixed, but
+don't reintroduce one when editing the comments.
 
 ## Prerequisites
 
@@ -176,9 +194,16 @@ needs -- fill these into
 
 ## Known limitations
 
-- Only one physical machine's result will be captured here initially;
-  this does not characterize latency across different USB
-  controllers/drivers/Windows builds.
+- Only one physical machine's result has been captured (a Samson
+  Meteorite Mic on the owner's Windows host); this does not characterize
+  latency or co-access across different USB controllers, drivers,
+  microphone models, or Windows builds.
+- The co-access check has been run against exactly one concurrent
+  application, Windows Voice Typing. Nothing here says how a client that
+  requests *exclusive* mode would behave.
+- 20 cycles per run is enough for a p50 and a rough p95 and enough to
+  make a zero-conflict result meaningful; it says nothing about a rare
+  long tail.
 - The probe excludes timed-out runs from the min/p50/p95/max
   calculation (they're reported separately as a count) -- a run that
   never produces a first buffer within 5 seconds isn't a latency sample,
