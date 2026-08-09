@@ -219,17 +219,51 @@ The full wire contract lives in `protocol/protocol-v1.md`, written in Phase 0.
 
 ### 5.1 Algorithm
 
-At startup, resolve BlackHole by UID and cache its `AudioObjectID`. Then count processes where
-**both** conditions hold:
+At startup, resolve BlackHole by UID and cache its `AudioObjectID`. Then count processes where:
 
-- `kAudioProcessPropertyIsRunningInput` is true, **and**
 - `kAudioProcessPropertyDevices` with scope `kAudioObjectPropertyScopeInput` contains BlackHole's
-  object ID
+  object ID.
 
 Our own PID is always skipped. Register listeners on `kAudioHardwarePropertyProcessObjectList`, and
-per process on `IsRunningInput` and `Devices`, adding and removing per-process listeners as the
-list changes. Where listener registration fails for a property, poll only that small process set at
-100 ms.
+per process on `Devices`, adding and removing per-process listeners as the list changes. Where
+listener registration fails for a property, look up that specific process with
+`kAudioHardwarePropertyTranslatePIDToProcessObject` and poll only that one process at 100 ms. A
+targeted, single-process lookup is roughly an order of magnitude cheaper than enumerating the full
+process list (§6.3), so the fallback must target the specific process rather than sweep everything.
+
+**`kAudioProcessPropertyIsRunningInput` is not part of the gate, and must not become one.** An
+earlier version of this section (and the draft before it) required `IsRunningInput` as a second,
+mandatory conjunct alongside `Devices`. Task 10's macOS probe
+(`docs/superpowers/probes/2026-08-08-macos-demand-findings.md`), run on the actual target Mac
+(macOS 26.6.1), found that `IsRunningInput` does **not** reliably re-trigger past a process's
+*first* input activation: on a process's second and later activations, it read `false` at the exact
+instant `Devices` membership was independently confirmed `true` — self-introspectively, for a
+genuinely separate helper process, and via both the full-sweep and targeted-lookup paths — and in
+the observed case it stayed `false` through 1188 ms of 10 ms-interval polling, far too long to be
+propagation lag. `Devices` membership and the general, non-input-scoped `kAudioProcessPropertyIsRunning`
+both re-triggered correctly on every activation tested. Since real applications (Dictation, a
+browser tab, Chrome, anything on `AVAudioEngine`) are not restarted between recording sessions,
+gating on `IsRunningInput AND Devices` as originally specified would detect an application's first
+use of the microphone and then silently miss every subsequent one for that process's entire
+lifetime — the user would be talking into a dead microphone with no error surfaced anywhere. Demand
+is therefore gated on `Devices` membership alone. `IsRunningInput` may still be read and shown as a
+supplementary or diagnostic signal — it is logged alongside `Devices` membership in the probe for
+exactly this reason — but it must never be a required conjunct for starting or stopping a session.
+
+The root cause is unidentified, and the flag may still be salvageable as a secondary signal later.
+Every activation in the probe constructed a **brand-new** `AudioComponentInstance` per cycle
+(dispose the old unit, create and configure a new one), while a real client such as Dictation,
+Chrome, or anything built on `AVAudioEngine` is far more likely to hold **one** engine/unit instance
+for its whole session and call start/stop on that same instance repeatedly. The sticky-false
+behavior may therefore be HAL-client re-registration scoped to a *new instance*, not a genuine
+process-level "Nth activation" property — in which case real long-lived apps might re-trigger
+`IsRunningInput` correctly every time, and it would be salvageable after all. This distinction was
+not tested. **The first thing Phase 3 should check, before relying on or ruling out
+`IsRunningInput` for anything, is the measurement the probe specifies but did not run: build one
+`AudioUnit` instance, call `AudioOutputUnitStart`/`AudioOutputUnitStop` on that same instance twice
+with no dispose-and-recreate in between, and observe whether `IsRunningInput` re-triggers `true` on
+the second start.** Device-list membership works as the gate regardless of how that measurement
+turns out.
 
 The `Devices` predicate is the entire point. The target Mac has BlackHole, ManyCam, Microsoft Teams
 Audio, Parallels Access Sound, and Squirrels Audio installed. Under process-level detection alone,
@@ -343,19 +377,36 @@ library packaging, and an entire class of debugging.
 
 ### 6.3 Activation latency budget
 
-| Stage | Typical |
-|---|---|
-| Demand detected → `START` sent (warm TLS connection) | 1–5 ms |
-| LAN transit | 2–15 ms |
-| WASAPI shared open and start | 20–80 ms |
-| First 20 ms frame captured | 20 ms |
-| Transit to Mac | 2–10 ms |
-| Jitter buffer prefill | 60 ms |
-| **Total** | **~105–190 ms** |
+| Stage | Typical | Source |
+|---|---|---|
+| Input demand appears → `Devices` membership confirmed | 4–6 ms | **Measured** — Task 10 macOS probe, targeted lookup via `kAudioHardwarePropertyTranslatePIDToProcessObject`, self-introspection on the target Mac (macOS 26.6.1) |
+| Demand detected → `START` sent (warm TLS connection) | 1–5 ms | Estimate |
+| LAN transit | 2–15 ms | Estimate |
+| WASAPI shared open and start | 20–80 ms | Estimate — **unverified**, see below |
+| First 20 ms frame captured | 20 ms | Fixed by frame duration |
+| Transit to Mac | 2–10 ms | Estimate |
+| Jitter buffer prefill | 60 ms | Estimate — set by measurement in Phase 2 |
+| **Total** | **~109–196 ms** | |
 
-This fits the 300 ms p95 target with headroom. The single largest contributor to that headroom is
-the warm TLS connection — under the draft's two-connection design, a handshake would sit directly
-on this path.
+The demand-detection figure is the targeted-lookup measurement from
+`docs/superpowers/probes/2026-08-08-macos-demand-findings.md` (leg 1: 5 ms to detect appearance,
+3 ms to detect clearing). Two other numbers from that probe are deliberately **not** used here: the
+full-sweep figure (~40–60 ms, enumerating all ~40 process objects on the test machine) is roughly
+90% enumeration overhead rather than Core Audio propagation, and the cross-process figures
+(575–1188 ms) are dominated by helper-process spawn and `AudioUnit` setup, not steady-state
+detection latency for an already-running application. Neither characterizes what a running demand
+observer actually experiences once its listeners are registered.
+
+The WASAPI shared-mode open figure (20–80 ms) is still the original, unmeasured planning estimate.
+The Windows probe that would measure it
+(`probes/windows-wasapi-latency/`, see
+`docs/superpowers/probes/2026-08-08-windows-wasapi-findings.md`) has been written but **has never
+been compiled or run** — no real figure exists yet. Treat this row, and therefore the total, as
+provisional until the owner runs that probe on the actual Windows host.
+
+This fits the 300 ms p95 target with headroom, provisionally. The single largest contributor to
+that headroom is the warm TLS connection — under the draft's two-connection design, a handshake
+would sit directly on this path.
 
 **Accepted limitation, stated plainly:** because capture is closed at idle by design, there is no
 pre-roll. Audio spoken before `START` is unrecoverable. No tuning removes this; it is the direct
@@ -520,10 +571,13 @@ verify at a glance rather than take on trust.
 ## 12. Phased plan
 
 **Phase 0 — Protocol and probes.** Write `protocol/protocol-v1.md` and the conformance harness.
-Build two throwaway probes: (a) device-scoped demand detection on macOS 26.6.1, confirming
-`kAudioProcessPropertyDevices` reports BlackHole for Dictation, Chrome, and ChatGPT; (b) measured
-WASAPI shared-mode open latency on the actual Windows host. Both major risks retired before real
-code is written.
+Build two throwaway probes: (a) device-scoped demand detection on macOS 26.6.1, verifying that
+`kAudioProcessPropertyDevices` correctly scopes demand to BlackHole for self-introspection, a
+genuinely separate process, and repeat activations — done, and it also forced a correction to §5.1
+(see §13 Q1); the per-application matrix for Dictation, Chrome, ChatGPT, and Zoom/Teams still needs
+the owner; (b) measured WASAPI shared-mode open latency on the actual Windows host — the probe is
+written but has never been compiled or run on Windows hardware (see §13 Q2). One of the two major
+risks is retired before real code is written; the other awaits the owner running the Windows probe.
 
 **Phase 1 — Transport and security.** Single TLS channel, certificate generation, pairing, HMAC
 auth, framing, priority send queue, heartbeat, reconnect. Both ends. No audio yet.
@@ -544,11 +598,36 @@ mDNS/Bonjour discovery, diagnostics view, level meter.
 
 Resolved by Phase 0 probes:
 
-1. Does `kAudioProcessPropertyDevices` (input scope) reliably report BlackHole for every target
-   application — macOS Dictation, ChatGPT, Chrome, Zoom, Teams? If some application does not report
-   it, the force-on hold is the fallback for that application, and the gap is documented rather
-   than worked around.
-2. What is the real WASAPI shared-mode open latency on this Windows host, cold and warm?
+1. **Does device-scoped demand detection work at all — can macOS reliably attribute "someone is
+   recording" to the one specific device (BlackHole) rather than only a coarse "some process
+   somewhere is using some microphone"?** Yes.
+   `docs/superpowers/probes/2026-08-08-macos-demand-findings.md` verified
+   `kAudioProcessPropertyDevices` (input scope) correctly reports which device a process has open —
+   for self-introspection, for a genuinely separate helper process observed through the normal
+   PID-skipping path (not the process's own view of itself), and across repeat activations by the
+   same process — with a negative control that correctly did *not* report BlackHole. Corroborating
+   detail worth keeping: the system default input device was BlackHole for the entire negative-control
+   leg, so a coarse "system default" signal would have made that leg fail by reporting BlackHole
+   anyway; it didn't, which is independent evidence the property is genuinely per-stream-scoped. The
+   same probe found that `kAudioProcessPropertyIsRunningInput` must **not** be part of the gate —
+   see §5.1 for the correction this forced in the design itself.
+
+   **Still open, and not to be treated as settled:** whether the specific target applications —
+   macOS Dictation, ChatGPT, Chrome, Zoom, Teams — go through Core Audio in a way that populates
+   `Devices` the same way, including on a **second** recording session per app (now specifically
+   important given the `IsRunningInput` finding), has not been measured. That per-application matrix
+   needs the owner and has not been run; see "Requires the owner" in the findings document. If some
+   application does not report reliably, the force-on hold is the fallback for that application, and
+   the gap is documented rather than worked around.
+
+2. **What is the real WASAPI shared-mode open latency on this Windows host, cold and warm?**
+   **Still open.** The probe (`probes/windows-wasapi-latency/`) is written but has **never been
+   compiled or run** — this environment has no Windows machine. No latency figure exists; the
+   spec's 20–80 ms budget entry (§6.3) remains the original planning estimate, not a measurement.
+   See `docs/superpowers/probes/2026-08-08-windows-wasapi-findings.md`, which is explicitly marked
+   not-yet-filled-in. Whether WASAPI shared mode genuinely permits simultaneous Windows + Mac
+   capture is also untested — that probe's concurrency check is the go/no-go for it, and it has not
+   run either.
 
 Resolved by Phase 2 measurement:
 
