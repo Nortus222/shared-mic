@@ -22,7 +22,18 @@ exercises today:
   has not (yet) proven it, not that it is optional or uncertain.
 
 Untagged prose (byte layouts, field lists, worked examples) is definitional rather than a
-behavior to test, and is not tagged either way.
+behavior to test, and is not tagged either way. Every section from §1 to §11 carries tags on its
+normative requirements; if you find an untagged `MUST` in one of them, that is a documentation bug,
+not a requirement you may skip.
+
+Two tagging conventions worth knowing before you read on, because several requirements need both
+halves and it would otherwise look like the tags disagree with each other:
+
+- **A codec-level rule and its connection-level consequence are tagged separately.** "Reject a
+  malformed frame" and "close the connection when you reject one" are different claims and the
+  harness proves them to different depths. Where they differ, both tags appear.
+- **A `[VERIFIED]` tag names the tests.** If it does not name a test, treat it as a documentation
+  bug and check `harness/tests/` yourself before relying on it.
 
 ---
 
@@ -33,6 +44,13 @@ carries a `"v"` field. A peer that receives a control message with `"v"` other t
 the connection. There is no negotiation: version 1 is the only version either agent needs to speak,
 and a version mismatch is treated as a hard protocol violation, not something to downgrade or
 retry.
+
+**[VERIFIED]** — `test_control.py::test_rejects_wrong_protocol_version` proves the decoder rejects a
+control message whose `"v"` is not `1` (it raises `ProtocolError` rather than returning a message).
+**[CARRIED]** for the *close* half: both mocks do close on that rejection (`server.py`'s `run()`
+returns, which runs `_serve`'s `finally`; `client.py`'s `_reader_loop` calls `_abort()`), but no test
+sends a wrong-version message over a live connection and asserts the socket goes away. A Phase 1
+implementation must still close.
 
 Changing anything in this document — a field name, a byte layout, a timer value — is a protocol
 version change. It requires updating this document, both platform implementations, and the golden
@@ -96,6 +114,23 @@ malicious `length` field's ability to make a receiver allocate or wait for an un
 data; no legitimate message (the largest is one audio frame at 1,932 bytes, §4) comes remotely
 close to it.
 
+**[VERIFIED]** for the *detection* half of both rules —
+`test_framing.py::test_decode_rejects_unknown_frame_type` and
+`test_framing.py::test_decode_rejects_oversized_payload` prove the decoder raises rather than
+returning a frame, and the encoder refuses to produce either shape.
+**[CARRIED]** for the *close* half of both: no test drives a bad `type` byte or an oversized
+`length` down a live socket and asserts the connection is torn down. Both mocks do implement it —
+`server.py` returns out of `run()` (its `finally` closes), and `client.py`'s `_reader_loop` calls
+`_abort()`, which shuts down and closes the socket rather than merely stopping the read loop — but
+that is implementation, not proof. A Phase 1 implementation must close, not skip the frame and
+resynchronize.
+
+**Incremental decoding is [VERIFIED]** — `test_framing.py::test_decode_returns_none_when_header_incomplete`,
+`test_decode_returns_none_when_payload_incomplete`, and
+`test_decode_reports_consumed_so_stream_can_hold_two_frames` prove that a partial buffer yields "not
+yet" rather than a wrong answer, and that a buffer holding two concatenated envelopes decodes to two
+frames with the correct byte counts.
+
 There is no inner length field anywhere in this protocol. Earlier drafts included one on the audio
 payload; it was removed because two length fields that can disagree is a defect waiting to be
 written. The envelope's `length` is authoritative for both message types.
@@ -135,8 +170,28 @@ bytes   pcm                  // 1,920 bytes of s16le PCM — see byte order note
 The audio payload header is **12 bytes** (4-byte `sequence` + 8-byte `captureTimestampUs`), both
 **big-endian**, immediately followed by exactly **1,920 bytes** of PCM. There is no length field
 inside the audio payload — the envelope's `length` (§3) already tells the receiver exactly how many
-bytes belong to this frame (`12 + 1920 = 1932` for a full frame), and the header fields have fixed
-width, so nothing else is needed.
+bytes belong to this frame, and the header fields have fixed width, so nothing else is needed.
+
+**Short audio payloads are not legal. There is no partial frame in this protocol.** An `AUDIO`
+envelope's `length` MUST be exactly `12 + 1920 = 1932`. A sender MUST NOT emit a partially filled
+frame — not at session start, not at session end while draining, and not to flush a capture buffer
+that happened to hold fewer than 960 samples. A capture path that has less than a full 20 ms of
+audio waits for the rest or drops it; it never sends a short one. A receiver MUST treat an `AUDIO`
+payload whose length is anything other than 1,932 bytes as a protocol violation and close the
+connection (§3). This is stated explicitly because `12 + 1920` alone reads like an example rather
+than a constraint, and a Windows implementation flushing a residual capture buffer at `STOP` is the
+obvious way to violate it by accident.
+
+**[VERIFIED]** for the sender rule and the layout —
+`test_framing.py::test_audio_payload_header_is_twelve_bytes` and `test_audio_payload_round_trip`
+pin the header size and byte order; `test_loopback.py::test_audio_frames_are_exactly_one_frame_each`
+and `test_client.py::test_client_receives_full_size_audio_frames` assert every frame that crosses a
+live connection carries exactly 1,920 PCM bytes; `test_vectors.py::test_audio_vectors_encode_to_expected_bytes`
+byte-matches complete 1,937-byte envelopes.
+**[CARRIED]** for the receiver rule: the reference decoder does *not* enforce it —
+`decode_audio_payload` accepts any payload of at least 12 bytes (only
+`test_audio_payload_rejects_short_header` is exercised, i.e. shorter than the header itself) and
+returns whatever PCM follows. A Phase 1 receiver must be stricter than the harness here.
 
 Audio format, fixed for protocol version 1 — no negotiation of any of these values is possible; a
 peer that cannot honor them must reject the session (`START_NACK`, §7) rather than send nonconforming
@@ -165,12 +220,29 @@ byte-for-byte wrong) output. Verify this against `protocol/vectors/audio-frames.
 trusting a capture or render path — a reversed-endianness bug in PCM sounds like heavy static, not
 like a crash.
 
+**[VERIFIED]** — `test_audio.py::test_frame_is_little_endian_signed_16_bit` asserts the sample byte
+order directly, and `test_audio.py::test_constants_match_spec` pins every row of the format table
+above. The envelope-level consequence is byte-matched by
+`test_vectors.py::test_audio_vectors_encode_to_expected_bytes`.
+
 `captureTimestampUs` is relative to session start (the first frame of a session is timestamp `0`,
 and each subsequent frame's timestamp increases by `20000`, i.e. 20 ms in microseconds, matching
 the 20 ms frame duration) — it is not wall-clock time and not relative to any epoch. `sequence`
 resets to `0` at the start of each session (each `START_ACK`, §7) and increments by exactly 1 per
 frame; a receiver uses it to detect dropped or reordered frames within a session, not across
 sessions.
+
+**[VERIFIED]** for the advancement rules — `test_loopback.py::test_timestamps_advance_by_frame_duration`
+asserts every consecutive timestamp delta in a live session is exactly `20000`, and
+`test_audio_sequence_has_no_gaps` asserts 25 consecutive frames carry consecutive sequence numbers
+with `client.sequence_gaps == 0`.
+**[CARRIED]** for the *reset to `0`* rule specifically. This is a real gap and worth naming: the
+loopback tests deliberately assert the sequence run is consecutive *relative to its own first
+value* (`sequences == list(range(sequences[0], sequences[0] + 25))`), not that it begins at `0`, and
+`test_session_can_be_restarted` does not read the second session's first sequence number at all.
+The reference server does start each session's counter at `0`, and the golden vectors pin frames
+`0`/`1`/`49`, but no test would fail if a session's counter continued from the previous session's.
+Implement the reset; do not infer it is covered.
 
 ---
 
@@ -189,6 +261,15 @@ Beyond `"v"` and `"type"`, each type has its own required fields, listed below. 
 missing a required field for its type is a protocol violation. All JSON examples below are copied
 verbatim from `protocol/vectors/control-messages.json` (with the `"message"` object shown; the
 `"hex"` field there is the exact matching wire encoding).
+
+**[VERIFIED]** — `test_control.py::test_rejects_missing_required_field`,
+`test_rejects_unknown_message_type`, `test_rejects_non_object_json`, and `test_rejects_malformed_json`
+prove each rejection path, on both encode and decode (the reference implementation validates in both
+directions, so a harness bug surfaces loudly instead of as bytes the far end has to guess about).
+`test_encodes_as_utf8_without_ascii_escaping` pins the canonical, separator-free, sorted-key UTF-8
+encoding, and `test_vectors.py::test_control_vectors_decode_to_expected_message` /
+`test_control_vectors_encode_to_expected_bytes` exercise the field lists below for all eleven types
+against the committed vectors.
 
 ### GREETING
 
@@ -289,11 +370,31 @@ Direction: Windows → Mac. Unsolicited notification of a state change (e.g. the
 unplugged or replugged) — not a reply to any specific request.
 
 Required fields: `micPresent` (boolean), `active` (boolean, whether a session is currently
-streaming), `deviceLabel` (string).
+streaming), `deviceLabel` (string). **These three fields are the whole message — there is no
+`errors` field**, which an earlier version of the design spec's §4.4 summary table implied and which
+never existed in the vectors, the codec, or this section. Failure detail is
+carried by `START_NACK{reason}` (§5) for a rejected activation, and by the connection closing for a
+protocol violation; `STATUS` reports state, not errors.
 
 ```json
 {"v":1,"type":"STATUS","micPresent":false,"active":false,"deviceLabel":"USB Microphone"}
 ```
+
+Because `STATUS` answers no request, a receiver MUST NOT route it through whatever queue it uses to
+match replies to outstanding requests — it will arrive interleaved with, or in the middle of, a
+`START`/`STOP`/`PING` exchange, and an implementation that discards unmatched messages while
+awaiting a reply will silently lose it. Two `STATUS` transitions matter operationally (design spec
+§8): mic unplugged while idle (stay connected, block activation) and mic unplugged mid-session
+(Windows stops capture first, so `active` is already `false` when the Mac reads the message; the Mac
+enters `DEGRADED` and notifies).
+
+**[VERIFIED]** — `test_loopback.py::test_mic_unplug_while_idle_sends_status`,
+`test_mic_unplug_mid_session_stops_capture_and_sends_status` (which also asserts audio actually
+stops after the `STATUS`), `test_mic_replug_sends_status_and_allows_a_new_session`, and
+`test_status_is_not_mistaken_for_a_reply`, which asserts that two `STATUS` messages arriving around
+a `PING` and a `START` are both delivered and counted rather than swallowed by the reply path.
+`MockWindowsServer.set_mic_present()` is the trigger; `MockMacClient.wait_for_status()` /
+`drain_status()` / `status_messages_received` are the client-side accessors to build against.
 
 ### PING / PONG
 
@@ -309,6 +410,12 @@ answers.
 ```json
 {"v":1,"type":"PONG","seq":1}
 ```
+
+**[VERIFIED]** — `test_client.py::test_ping_gets_pong` drives a real `PING`/`PONG` over a live
+connection through `MockMacClient.ping()`, which raises `ProtocolError` if the returned `seq` does
+not equal the one it sent; a server echoing a constant or an incremented `seq` fails that test.
+Exercised for one exchange (`seq = 1`) only — no test sends several `PING`s and checks each `PONG`
+is matched to the right one.
 
 ---
 
@@ -373,6 +480,19 @@ current test either.
   mismatch; `STOP` always means "make sure no session is active" for the current connection, not
   "end specifically this session ID".
 
+**[VERIFIED]** — `test_loopback.py::test_duplicate_start_is_idempotent` sends a second `START` with
+no intervening `STOP` and asserts both `START_ACK`s carry the *same* `sessionId` and that
+`server.sessions_started == 1`, so no second session was created. `test_duplicate_stop_succeeds`
+sends `STOP` twice and requires a `STOP_ACK` for each; `test_stop_without_start_succeeds` sends
+`STOP` on a connection that never started a session and requires a `STOP_ACK`.
+`test_session_can_be_restarted` proves a `START` after a `STOP` opens a genuinely new session
+(`sessions_started == 2`) and that audio resumes.
+Two narrower claims in the prose above are **[CARRIED]**: that a duplicate `START` does not reset
+the audio `sequence` counter is *implied* by `sessions_started == 1` (no second capture loop is
+created) but is not observed on the wire; and the "stale `sessionId`" half of the `STOP` rule is
+exercised only for the empty-string case (`MockMacClient.stop_session()` sends `""` when it holds no
+session), never with a stale identifier from a previous session.
+
 Normal flow:
 
 ```
@@ -395,6 +515,21 @@ No `AUDIO` frame may be sent outside an active session — i.e. never before the
 `START_ACK`, and never after the corresponding `STOP_ACK` has been sent. This is the protocol-level
 expression of the project's core privacy requirement: audio crosses the wire only while a session
 is explicitly active, and an idle connection MUST carry zero audio bytes.
+
+**[VERIFIED] — this is the single best-tested requirement in this document, and it is asserted from
+both ends of the wire independently.** `test_loopback.py::test_no_audio_before_start` holds an
+authenticated connection open, sleeps, exchanges a `PING`/`PONG`, and then asserts *both*
+`client.audio_frames_received == 0` (the Mac saw nothing) and `server.audio_frames_sent == 0` (the
+Windows side produced nothing — so this is zero capture, not merely zero transmission).
+`test_audio_flows_only_between_start_and_stop` starts a session, takes 10 frames, stops it, lets the
+socket settle, and asserts the received count does not move again.
+`test_mic_unplug_mid_session_stops_capture_and_sends_status` asserts the same silence after capture
+is lost mid-session rather than stopped by request. `test_full_lifecycle_leaves_no_sequence_gaps`
+runs three full start/stop cycles and asserts no sequence gaps across any of them.
+One residual, deliberately tolerated: a frame already inside `sendall()` when `STOP_ACK` was queued
+can still land immediately after it, so the tests assert "audio stopped" after a short settle rather
+than "audio stopped on the exact byte". The invariant that matters — an *idle* connection carries
+zero audio — is asserted without tolerance.
 
 ---
 
@@ -454,10 +589,29 @@ empty does the writer send from the audio queue. A stalled network can therefore
 audio frames, but it can never delay a control message such as `STOP_ACK`.
 
 Dropped audio frames should be counted for diagnostics — silently dropping frames in a way that
-looks identical to healthy operation is a worse failure than the drop itself. **[VERIFIED]** — the
-server exposes `audio_frames_dropped` alongside the existing `audio_frames_sent` counter,
-incremented exactly once per frame actually evicted (not once per overflow attempt), so a reader
-can reconcile frames offered vs. dropped vs. what the far end received.
+looks identical to healthy operation is a worse failure than the drop itself.
+
+A frame that never reaches the far end leaves the sender for one of two reasons, and they MUST be
+counted separately:
+
+- **evicted on overflow** — the network could not keep up. This is a symptom worth alarming on.
+- **discarded at session teardown** — the queue still held frames when `STOP` (or a mic loss, §5's
+  `STATUS`) ended the session. This is intended behavior and alarming on it would be noise.
+
+Folding the two into one counter makes the number that matters unreadable. Keeping them apart is
+also what makes the arithmetic close: **offered = received + evicted + discarded**, plus at most one
+frame still inside `sendall()` at the moment the counters are read.
+
+**[VERIFIED]** — the server exposes `audio_frames_dropped` (overflow evictions, incremented exactly
+once per frame actually evicted, not once per overflow attempt) and `audio_frames_discarded`
+(teardown discards) alongside `audio_frames_sent` (frames offered).
+`test_server.py::test_control_preempts_a_full_audio_backlog_and_counts_the_drop` pins the eviction
+count at exactly 5 for 30 frames offered into a 25-slot queue, and
+`test_loopback.py::test_frame_counters_reconcile_across_a_session` asserts the identity above holds
+across a real start/stop cycle to within the one in-flight frame. Before `audio_frames_discarded`
+existed, the `STOP` handler drained up to 25 counted-as-offered frames that then vanished from the
+arithmetic entirely, and this paragraph claimed a reconciliation a reader could not actually
+perform.
 
 ---
 
@@ -475,6 +629,13 @@ committed alongside this document:
 
 Each vector case has: the logical message or frame parameters, and `"hex"` — the exact expected
 wire bytes, as lowercase hex, of the complete envelope (§3) for that message.
+
+**[VERIFIED]** — `tests/test_vectors.py` runs all three conformance rules below against the
+committed fixtures on every test run: `test_vector_files_exist` (1 case),
+`test_control_vectors_encode_to_expected_bytes` and `test_control_vectors_decode_to_expected_message`
+(11 cases each, one per control type), and `test_audio_vectors_encode_to_expected_bytes` (3 cases) —
+26 test cases over 14 vectors. The reference implementation is therefore held to this section's
+`MUST`s continuously; the vectors cannot drift from it unnoticed.
 
 **Conformance rule for audio frames: compare bytes.** An implementation's `encode_frame(2,
 encode_audio_payload(sequence, timestampUs, pcm))` for a vector's `sequence`/`timestampUs`/`pcmHex`
@@ -534,3 +695,140 @@ purely as an input fixture, not as a value either agent is expected to reproduce
 committed `protocol/vectors/audio-frames.json` as the source of truth once committed; regenerating
 it is a deliberate, reviewed act (e.g. changing the frame indices sampled or the audio format),
 not something to do routinely or as a side effect of an unrelated change.
+
+---
+
+## 11. Pairing and trust establishment
+
+§2 and §6 describe how an *already paired* pair of agents connects: the Mac checks a pinned
+fingerprint, then proves possession of a shared token. This section specifies where those two
+values come from, because both cross a human rather than the wire — the Windows tray *displays* a
+pairing string and the Mac *parses* what the user typed — and a format disagreement here fails at
+first user contact, before a single byte of §3 is ever exchanged.
+
+### 11.1 The pairing token
+
+The pairing token is **32 bytes (256 bits) from a cryptographically secure random source**,
+generated by Windows at first run and never regenerated except by an explicit re-pair. It is the
+HMAC key in §6 step 2. It never crosses the wire in any form. **[VERIFIED]** —
+`test_auth.py::test_token_is_256_bits`, `test_tokens_are_not_repeated`.
+
+### 11.2 The pairing string
+
+The token is shown to the user, and typed by the user, as a **pairing string**. Its encoding is
+fully specified here; do not infer it from either implementation.
+
+**Encoding (Windows → screen):**
+
+1. **Base32**, RFC 4648 alphabet (`A`–`Z` then `2`–`7`), applied to the 32 raw token bytes.
+2. **Uppercase.** The RFC 4648 alphabet is uppercase; do not lowercase it for display.
+3. **Unpadded.** 32 bytes encode to 52 base32 characters plus 4 `=` padding characters; strip the
+   padding. The displayed string contains no `=`.
+4. **Hyphen-grouped in runs of 8 characters**, left to right, with a single `-` (U+002D) between
+   groups. 52 characters therefore produce six full groups of 8 and a final group of 4.
+
+A pairing string is consequently always **58 characters**: 52 base32 characters + 6 hyphens. Worked
+example, for the token `000102...1f` (bytes 0 through 31 in order):
+
+```
+token (hex): 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+pairing string: AAAQEAYE-AUDAOCAJ-BIFQYDIO-B4IBCEQT-CQKRMFYY-DENBWHA5-DYPQ
+```
+
+**Decoding (user's keystrokes → Mac):** the decoder is deliberately tolerant, because a human is
+retyping 52 characters off a screen.
+
+1. **Uppercase the input first.** A user typing lowercase must succeed.
+2. **Delete every character that is not in the RFC 4648 base32 alphabet** (i.e. keep only `A`–`Z`
+   and `2`–`7`; the regex is `[^A-Z2-7]` → remove). This is what makes hyphens, spaces, tabs, and
+   stray punctuation harmless, and it means the grouping in step 4 above is presentation only — the
+   Mac MUST accept the string with the hyphens removed, replaced by spaces, or regrouped.
+3. **Re-pad** with `=` to the next multiple of 8 characters, then base32-decode.
+4. **Validate the length: the result MUST be exactly 32 bytes.** Reject anything else. This is the
+   check that turns a truncated or over-long paste into an immediate, explicable error instead of a
+   token that authenticates against nothing and produces an opaque `HELLO` failure on every
+   subsequent connection.
+5. Reject with a user-visible error if base32 decoding fails.
+
+**Do not add confusable-character mapping.** It is tempting to map `0`→`O` and `1`→`I`/`L`, and this
+specification deliberately does not: step 2 *deletes* characters outside the alphabet, so a typed
+`0` or `1` is silently dropped rather than corrected, and the step 4 length check then rejects the
+result. An implementation that adds its own mapping would accept strings the other implementation
+rejects, which is exactly the interoperability failure this section exists to prevent. If confusable
+handling is ever wanted, it is a protocol version change (§1) and must land on both platforms
+together.
+
+**[VERIFIED]** — `test_auth.py::test_pairing_string_round_trip` (encode → decode is the identity on
+a random token), `test_pairing_string_tolerates_human_transcription` (lowercased, hyphens replaced
+by spaces, still decodes to the same token), `test_pairing_string_rejects_garbage`,
+`test_pairing_string_rejects_wrong_length` (valid base32 that decodes to 5 bytes, rejected), and
+`test_server.py::test_pairing_string_is_what_the_user_would_type` (the string is built from the same
+token the server actually authenticates against).
+**[CARRIED]:** the 58-character/grouping shape and the worked example above are asserted only
+implicitly, via the round-trip — no test pins the group size or the total length. They are still
+normative: an implementation that groups in 4s produces a string a user will mis-transcribe against
+a screen showing 8s, even though both decode.
+
+### 11.3 The device certificate
+
+Windows generates one self-signed certificate at first run, holds the private key locally (DPAPI-
+protected on a real Windows agent), and serves it on every connection (§2). The certificate profile
+is load-bearing for a client implementer, so it is specified rather than left to whatever a TLS
+library defaults to:
+
+| Property | Value |
+|---|---|
+| Key type | EC P-256 (`secp256r1` / `prime256v1`) |
+| Signature | ECDSA with SHA-256, self-signed (issuer == subject) |
+| Subject | `CN = <common name>` (the reference implementation uses `shared-mic`) |
+| Subject Alternative Name | **Required.** One `dNSName` entry, byte-identical to the subject CN |
+| Validity | 3,650 days (10 years), starting 5 minutes in the past to absorb clock skew |
+| Chain | None. There is no CA and no intermediate; the chain is one certificate long |
+
+**The SAN is not decorative and MUST be present.** The client disables both CA verification and
+hostname verification (§2 — the pin is the check), but several TLS stacks a Swift client is likely
+to use, including Network.framework and `URLSession`, evaluate the certificate *before* handing it
+to a custom trust callback, and some reject a certificate with no SAN at that earlier stage — so a
+SAN-less certificate can fail before the pinning hook ever runs, producing a failure that looks like
+a network error rather than a certificate problem. Emit the SAN even though nothing in this protocol
+matches a hostname against it.
+
+**A macOS implementer must explicitly opt out of both CA and hostname validation.** This does not
+happen by default in any of these stacks and is not something to discover at integration time: the
+client's only certificate check is the SHA-256-of-DER pin from §2. Getting this wrong in the safe
+direction (leaving CA validation on) fails every connection against a self-signed certificate;
+getting it wrong in the unsafe direction (disabling validation *without* implementing the pin) is a
+silent downgrade to no authentication at all, and is the single worst mistake available in this
+protocol.
+
+**[CARRIED]** — the harness generates certificates to exactly this profile
+(`harness/sharedmic_protocol/tls.py`), and `test_tls.py::test_session_works_over_tls_with_matching_pin`
+proves a certificate of this shape completes a TLS 1.3 handshake and pins successfully end to end.
+But no test asserts the *curve*, the *SAN's presence*, or the *validity window* individually, and
+none could show that a Swift client on a different TLS stack accepts it — that is exactly the
+interoperability risk this table exists to reduce, and it stays unproven until Phase 1 runs a real
+Swift client against a real Windows agent.
+
+### 11.4 Authentication rate limiting
+
+**Failed authentication MUST be rate-limited: after 5 consecutive failed attempts, the Windows
+agent MUST refuse further attempts for 30 seconds.** A "failed attempt" is any connection that
+reaches §6 and does not produce a verified `HELLO` — a wrong `mac`, a malformed or non-`HELLO`
+message, or the 5-second pre-auth deadline expiring. The lockout is counted per Windows agent, not
+per source address; an attacker choosing source ports freely must not be able to reset it.
+
+Without this, §6 is an unthrottled HMAC verification oracle reachable by anything that can open a
+TCP connection to the listener, and the 256-bit token's strength is doing all the work against an
+attacker who can guess at line rate. The listener is bound to private interfaces only (§2), which
+narrows exposure but does not remove it — a compromised device on the same LAN is precisely the
+threat model pinning and HMAC exist for. Both UIs should surface the lockout (design spec §8,
+"Authentication failure: connection refused, rate-limited, surfaced in both UIs") rather than
+failing silently, or the user's experience of a mistyped pairing string is an agent that simply
+stops working for 30 seconds.
+
+**[CARRIED]** — nothing in the harness implements or exercises this.
+`MockWindowsServer` counts failures in `auth_failures` (asserted by
+`test_server.py::test_server_rejects_bad_proof_and_counts_it`) and closes the connection on each
+one, but it never locks out, and no test drives six failed attempts. A Phase 1 Windows
+implementation MUST implement the limit in full; the harness's willingness to accept unlimited
+attempts is a test-double convenience, not the contract.
