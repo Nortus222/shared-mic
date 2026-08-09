@@ -1,8 +1,14 @@
 """Mock Mac agent.
 
-Speaks the full protocol so the Windows agent can be developed and tested
-without a Mac present. Tracks audio sequence continuity, which is the
-cheapest way to catch framing bugs.
+Speaks the client side of every message type in protocol-v1.md so the
+Windows agent can be developed and tested without a Mac present. Tracks
+audio sequence continuity, which is the cheapest way to catch framing
+bugs, and surfaces unsolicited STATUS on its own queue.
+
+It is a test double, not a complete Mac agent: no heartbeat, reconnect,
+or response-timeout timers run, and _await() discards control messages
+that are not the reply it is waiting for. See harness/README.md's "Known
+limitations" for the full list.
 
 Never logs audio payload — only counters.
 """
@@ -58,6 +64,7 @@ class MockMacClient:
         self._reader: threading.Thread | None = None
         self._closed = threading.Event()
         self._control_in: queue.Queue = queue.Queue()
+        self._status_in: queue.Queue = queue.Queue()
         self._audio_in: queue.Queue = queue.Queue()
         self._session_id: str | None = None
         self._next_expected_sequence: int | None = None
@@ -65,6 +72,7 @@ class MockMacClient:
 
         self.audio_frames_received = 0
         self.sequence_gaps = 0
+        self.status_messages_received = 0
 
     # -- transport ----------------------------------------------------
 
@@ -106,6 +114,29 @@ class MockMacClient:
                 )
         self._sock = wrapped
 
+    def _abort(self) -> None:
+        """Tear the connection down from inside the reader thread.
+
+        `protocol-v1.md` §3 requires the receiver to *close the connection*
+        on a protocol violation, not merely stop reading — a peer that
+        keeps a half-open socket alive after rejecting a frame leaves the
+        violating sender believing it still has a live session (the mock
+        server already closes, via `_serve`'s `finally`). `close()` cannot
+        be reused here because it joins the reader thread, which is the
+        thread calling this.
+        """
+        self._closed.set()
+        if self._sock is None:
+            return
+        try:
+            self._sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+
     def _reader_loop(self) -> None:
         buf = b""
         while not self._closed.is_set():
@@ -142,7 +173,7 @@ class MockMacClient:
                 try:
                     result = decode_frame(buf)
                 except ProtocolError:
-                    self._closed.set()
+                    self._abort()
                     return
                 if result is None:
                     break
@@ -150,10 +181,20 @@ class MockMacClient:
                 buf = buf[consumed:]
                 if frame_type == FRAME_TYPE_CONTROL:
                     try:
-                        self._control_in.put(decode_control(payload))
+                        msg = decode_control(payload)
                     except ProtocolError:
-                        self._closed.set()
+                        self._abort()
                         return
+                    # STATUS is unsolicited — it answers no request. It
+                    # therefore gets its own queue: _await() drops any
+                    # message that is not the reply it is waiting for, so
+                    # a STATUS routed through _control_in would vanish
+                    # silently and uncounted.
+                    if msg["type"] == "STATUS":
+                        self.status_messages_received += 1
+                        self._status_in.put(msg)
+                    else:
+                        self._control_in.put(msg)
                 else:
                     sequence, timestamp_us, pcm = decode_audio_payload(payload)
                     if (
@@ -253,6 +294,35 @@ class MockMacClient:
         pong = self._await("PONG", timeout)
         if pong["seq"] != self._ping_seq:
             raise ProtocolError(f"PONG seq {pong['seq']} does not match PING {self._ping_seq}")
+
+    def wait_for_status(self, timeout: float = 2.0) -> dict:
+        """Return the next unsolicited STATUS (§5), waiting up to `timeout`.
+
+        This is how the macOS agent's mic-unplug handling (design spec §8:
+        "USB mic unplugged while idle" and "mid-session") gets exercised
+        against the mock: drive `MockWindowsServer.set_mic_present()` and
+        assert on what arrives here.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("timed out waiting for STATUS")
+            if self._closed.is_set() and self._status_in.empty():
+                raise ConnectionError("connection closed while waiting for STATUS")
+            try:
+                return self._status_in.get(timeout=min(remaining, 0.1))
+            except queue.Empty:
+                continue
+
+    def drain_status(self) -> list[dict]:
+        """Every STATUS received and not yet consumed, oldest first."""
+        messages = []
+        while True:
+            try:
+                messages.append(self._status_in.get_nowait())
+            except queue.Empty:
+                return messages
 
     def wait_for_audio_frames(self, count: int, timeout: float = 5.0) -> list:
         deadline = time.monotonic() + timeout

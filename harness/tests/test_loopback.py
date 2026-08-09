@@ -109,6 +109,87 @@ def test_session_can_be_restarted(client, server):
     assert server.sessions_started == 2
 
 
+def test_frame_counters_reconcile_across_a_session(client, server):
+    """Offered = received + dropped + discarded, modulo one frame in flight.
+
+    The STOP handler throws away whatever is still queued; before those
+    frames were counted they simply vanished from the arithmetic, which is
+    what protocol-v1.md §9 claims a reader can do and could not.
+    """
+    client.start_session()
+    client.wait_for_audio_frames(5)
+    client.stop_session()
+    time.sleep(0.2)
+
+    unaccounted = (
+        server.audio_frames_sent
+        - client.audio_frames_received
+        - server.audio_frames_dropped
+        - server.audio_frames_discarded
+    )
+    assert 0 <= unaccounted <= 1, (
+        f"offered={server.audio_frames_sent} received={client.audio_frames_received} "
+        f"dropped={server.audio_frames_dropped} discarded={server.audio_frames_discarded}"
+    )
+
+
+def test_mic_unplug_while_idle_sends_status(client, server):
+    """Design spec §8, "USB mic unplugged while idle"."""
+    server.set_mic_present(False)
+    status = client.wait_for_status()
+    assert status["micPresent"] is False
+    assert status["active"] is False
+    assert status["deviceLabel"]
+    assert client.status_messages_received == 1
+
+
+def test_mic_unplug_mid_session_stops_capture_and_sends_status(client, server):
+    """Design spec §8, "USB mic unplugged mid-session" — the row that drives
+    the Mac into DEGRADED. Windows stops capture, then sends STATUS."""
+    client.start_session()
+    client.wait_for_audio_frames(3)
+
+    server.set_mic_present(False)
+    status = client.wait_for_status()
+    assert status["micPresent"] is False
+    assert status["active"] is False
+
+    # As with STOP, a frame already inside sendall() can land just after
+    # the STATUS. Let the socket settle, then assert audio has stopped.
+    time.sleep(0.2)
+    client.drain_audio()
+    settled = client.audio_frames_received
+    time.sleep(0.4)
+    assert client.audio_frames_received == settled, "audio continued after mic loss"
+
+
+def test_mic_replug_sends_status_and_allows_a_new_session(client, server):
+    server.set_mic_present(False)
+    client.wait_for_status()
+
+    server.set_mic_present(True)
+    replug = client.wait_for_status()
+    assert replug["micPresent"] is True
+    assert client.status_messages_received == 2
+
+    assert client.start_session()["type"] == "START_ACK"
+
+
+def test_status_is_not_mistaken_for_a_reply(client, server):
+    """An unsolicited STATUS must not be consumed by a pending request.
+
+    _await() discards messages it is not waiting for, so a STATUS routed
+    through the reply queue would both vanish and, worse, be silently
+    eaten mid-request. It has its own queue for exactly this reason.
+    """
+    server.set_mic_present(False)
+    server.set_mic_present(True)
+    client.ping()
+    client.start_session()
+    assert client.status_messages_received == 2
+    assert [s["micPresent"] for s in client.drain_status()] == [False, True]
+
+
 def test_full_lifecycle_leaves_no_sequence_gaps(client):
     for _ in range(3):
         client.start_session()

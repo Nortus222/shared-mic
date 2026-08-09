@@ -1,9 +1,15 @@
 """Mock Windows agent.
 
-Speaks the full protocol so the macOS agent can be developed and tested
-without a Windows machine present. Mirrors the session lifecycle from the
-spec, including START/STOP idempotency and the control-before-audio send
-priority.
+Speaks the server side of every message type in protocol-v1.md so the
+macOS agent can be developed and tested without a Windows machine
+present. Mirrors the session lifecycle from the spec, including
+START/STOP idempotency, unsolicited STATUS on mic hot-unplug/replug, and
+the control-before-audio send priority.
+
+It is a test double, not a complete Windows agent: no heartbeat or
+dead-peer timers run, and failed authentication is counted but not
+rate-limited. See harness/README.md's "Known limitations" for the full
+list and protocol-v1.md's [CARRIED] tags for what that leaves unproven.
 
 Never logs audio payload — only counters.
 """
@@ -57,12 +63,14 @@ class MockWindowsServer:
         self._accept_thread: threading.Thread | None = None
         self._connection_threads: list[threading.Thread] = []
         self._connections: list[socket.socket] = []
+        self._sessions: list["_ServerSession"] = []
         self._running = threading.Event()
         self._lock = threading.Lock()
 
         self.port = 0
         self.audio_frames_sent = 0
         self.audio_frames_dropped = 0
+        self.audio_frames_discarded = 0
         self.sessions_started = 0
         self.auth_failures = 0
 
@@ -106,8 +114,27 @@ class MockWindowsServer:
             thread.join(timeout=5)
 
     def set_mic_present(self, present: bool) -> None:
+        """Simulate a USB hot-unplug/replug and notify connected peers.
+
+        Design spec §8 gives this two distinct behaviors, and both are
+        modelled here so the macOS agent's `DEGRADED` path can actually be
+        developed against the mock:
+
+        - unplugged **while idle** — Windows sends `STATUS{micPresent:
+          false}`, the connection stays up, and activation is blocked
+          (`START` → `START_NACK{MIC_UNAVAILABLE}`, unchanged);
+        - unplugged **mid-session** — Windows stops capture *first*, then
+          sends `STATUS`, so `active` is already `false` by the time the
+          Mac reads it.
+
+        Only authenticated sessions are notified: §6 forbids `STATUS`
+        before `HELLO_ACK`.
+        """
         with self._lock:
             self._mic_present = present
+            sessions = list(self._sessions)
+        for session in sessions:
+            session.notify_mic_presence(present)
 
     # -- accept -------------------------------------------------------
 
@@ -148,6 +175,8 @@ class MockWindowsServer:
 
     def _serve(self, conn: socket.socket) -> None:
         session = _ServerSession(self, conn, hello_timeout=self._hello_timeout)
+        with self._lock:
+            self._sessions.append(session)
         try:
             session.run()
         finally:
@@ -155,6 +184,8 @@ class MockWindowsServer:
             with self._lock:
                 if conn in self._connections:
                     self._connections.remove(conn)
+                if session in self._sessions:
+                    self._sessions.remove(session)
 
 
 class _ServerSession:
@@ -174,6 +205,11 @@ class _ServerSession:
         self._session_id: str | None = None
         self._audio_thread: threading.Thread | None = None
         self._writer_thread: threading.Thread | None = None
+        # Read by notify_mic_presence() from the caller's thread, written
+        # by run() on this session's thread. A bool assignment is atomic
+        # under the GIL and the only consequence of reading a stale False
+        # is one skipped STATUS on a connection that just authenticated.
+        self._authenticated = False
 
     # -- send priority ------------------------------------------------
 
@@ -187,8 +223,10 @@ class _ServerSession:
         queued frame is evicted to make room for this one — i.e. once per
         frame actually dropped, not once per call. `audio_frames_sent`
         (incremented by the caller, `_audio_loop`) already counts frames
-        *offered*; the difference between the two lets a reader reconcile
-        offered vs. dropped vs. what the far end actually received.
+        *offered*. Together with `audio_frames_discarded` (frames still
+        queued when a session ends, see `_drain_audio_queue`) these let a
+        reader reconcile offered vs. dropped vs. discarded vs. what the
+        far end actually received; see protocol-v1.md §9.
         """
         try:
             self._audio_q.put_nowait(frame)
@@ -204,6 +242,29 @@ class _ServerSession:
                 self._audio_q.put_nowait(frame)
             except queue.Full:
                 pass
+
+    def _drain_audio_queue(self) -> None:
+        """Discard everything still queued when a session ends.
+
+        Counted in `audio_frames_discarded`, kept separate from
+        `audio_frames_dropped` on purpose: an overflow eviction is a
+        symptom (the network could not keep up), a teardown discard is
+        intended behavior. Folding them together would make the one
+        counter worth alarming on unreadable. Without this counter the
+        offered/dropped/received reconciliation in protocol-v1.md §9 does
+        not close, because these frames were counted as offered and then
+        silently vanished.
+        """
+        discarded = 0
+        while True:
+            try:
+                self._audio_q.get_nowait()
+            except queue.Empty:
+                break
+            discarded += 1
+        if discarded:
+            with self._server._lock:
+                self._server.audio_frames_discarded += discarded
 
     def _writer_loop(self) -> None:
         while not self._closed.is_set():
@@ -234,6 +295,41 @@ class _ServerSession:
             next_due += 1.0 / FRAMES_PER_SECOND
             time.sleep(max(0.0, next_due - time.monotonic()))
 
+    # -- unsolicited state change -------------------------------------
+
+    def notify_mic_presence(self, present: bool) -> None:
+        """Send `STATUS` for a mic hot-unplug/replug. See set_mic_present()."""
+        if not self._authenticated or self._closed.is_set():
+            return
+        if not present:
+            self._end_session_for_mic_loss()
+        self._send_control(
+            {
+                "v": PROTOCOL_VERSION,
+                "type": "STATUS",
+                "micPresent": present,
+                "active": self._session_id is not None,
+                "deviceLabel": self._server._device_label,
+            }
+        )
+
+    def _end_session_for_mic_loss(self) -> None:
+        """Stop capture when the mic disappears — no STOP_ACK, none was asked for.
+
+        Clearing `_session_id` is what stops `_audio_loop`: it re-checks
+        that value every 20 ms tick and returns when it no longer matches
+        the session it was started for. The thread is deliberately *not*
+        joined here — this runs on the caller's thread, not the session
+        thread — so, exactly as with `STOP`, one frame already produced or
+        already inside `sendall()` can still reach the far end just after
+        the `STATUS`. Draining the queue discards the rest.
+        """
+        if self._session_id is None:
+            return
+        self._session_id = None
+        self._audio_thread = None
+        self._drain_audio_queue()
+
     # -- protocol -----------------------------------------------------
 
     def run(self) -> None:
@@ -250,11 +346,10 @@ class _ServerSession:
         )
 
         buf = b""
-        authenticated = False
         deadline = time.monotonic() + self._hello_timeout
 
         while not self._closed.is_set():
-            if not authenticated and time.monotonic() > deadline:
+            if not self._authenticated and time.monotonic() > deadline:
                 return
             # Poll for readability with a short timeout instead of calling
             # conn.settimeout(): the socket is shared with _writer_loop's
@@ -313,12 +408,11 @@ class _ServerSession:
                 except ProtocolError:
                     return
 
-                if not authenticated:
+                if not self._authenticated:
                     if msg["type"] != "HELLO" or not verify_proof(self._server._token, nonce, msg["mac"]):
                         with self._server._lock:
                             self._server.auth_failures += 1
                         return
-                    authenticated = True
                     with self._server._lock:
                         mic_present = self._server._mic_present
                     self._send_control(
@@ -330,6 +424,11 @@ class _ServerSession:
                             "deviceLabel": self._server._device_label,
                         }
                     )
+                    # Flipped only after HELLO_ACK is on the control queue:
+                    # a concurrent set_mic_present() must not be able to
+                    # slip a STATUS ahead of it (§6 — nothing precedes
+                    # HELLO_ACK on an authenticated connection).
+                    self._authenticated = True
                     continue
 
                 self._handle(msg)
@@ -377,11 +476,7 @@ class _ServerSession:
             if self._audio_thread is not None:
                 self._audio_thread.join(timeout=2)
                 self._audio_thread = None
-            while True:
-                try:
-                    self._audio_q.get_nowait()
-                except queue.Empty:
-                    break
+            self._drain_audio_queue()
             self._send_control(
                 {
                     "v": PROTOCOL_VERSION,
