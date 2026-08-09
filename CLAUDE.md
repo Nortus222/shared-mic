@@ -37,7 +37,7 @@ than relying on `PATH` or activation:
 ```sh
 cd harness
 .venv/bin/python -m pip install -e '.[dev]'   # install (already done in .venv; cryptography builds from source and takes several minutes)
-.venv/bin/python -m pytest -v                 # run the conformance suite (96 tests)
+.venv/bin/python -m pytest -v                 # run the conformance suite (101 tests)
 .venv/bin/python tools/generate_vectors.py    # regenerate protocol/vectors/*.json — a deliberate act, see protocol-v1.md §10
 ```
 

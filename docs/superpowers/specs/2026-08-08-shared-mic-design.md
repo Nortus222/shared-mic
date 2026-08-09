@@ -205,7 +205,7 @@ The Mac reconnects with exponential backoff from **0.5 s to a 30 s cap**, jitter
 | `START_NACK` | Win → Mac | Reason (e.g. `MIC_UNAVAILABLE`) |
 | `STOP` | Mac → Win | End the active session |
 | `STOP_ACK` | Win → Mac | Session ended |
-| `STATUS` | Win → Mac | Mic presence, active state, device label, errors |
+| `STATUS` | Win → Mac | Mic presence, active state, device label |
 | `PING` / `PONG` | Both | Connection health |
 
 `START` and `STOP` are idempotent. A duplicate `START` while active returns the current session
@@ -237,10 +237,28 @@ mandatory conjunct alongside `Devices`. Task 10's macOS probe
 (`docs/superpowers/probes/2026-08-08-macos-demand-findings.md`), run on the actual target Mac
 (macOS 26.6.1), found that `IsRunningInput` does **not** reliably re-trigger past a process's
 *first* input activation: on a process's second and later activations, it read `false` at the exact
-instant `Devices` membership was independently confirmed `true` — self-introspectively, for a
-genuinely separate helper process, and via both the full-sweep and targeted-lookup paths — and in
-the observed case it stayed `false` through 1188 ms of 10 ms-interval polling, far too long to be
-propagation lag. `Devices` membership and the general, non-input-scoped `kAudioProcessPropertyIsRunning`
+instant `Devices` membership was independently confirmed `true` — reproducibly, on every
+second-and-later activation tested, self-introspectively, for a genuinely separate helper process,
+and via both the full-sweep and targeted-lookup paths.
+
+**That instant is the whole of what the committed probe establishes, and it is enough.** The probe
+polls at 10 ms intervals but records `IsRunningInput` only at the single instant device-list
+membership is confirmed; it does not record whether the flag was `false` for the rest of the
+activation. A stronger observation — that it stays `false` for the *entire* second-and-later
+activation — was made repeatedly during investigation, but with throwaway diagnostic scripts that
+are not part of the committed source; the findings document records it as investigation notes and
+this spec treats it the same way. Do **not** cite this section's cross-process cycle timings
+(§6.3's 543–1166 ms) as the duration of the disagreement either: those figures are dominated by
+helper fork/exec and `AudioUnit` setup, most of which elapses before the helper opens input at all
+— a window in which `IsRunningInput` is `false` trivially and proves nothing.
+
+None of that weakens the design conclusion, because the conclusion does not depend on the stronger
+claim. A gate of the form `IsRunningInput AND Devices` is evaluated at the moment demand is
+detected, and the moment demand is detected is exactly the instant the probe measures — the instant
+at which the two properties were found to disagree, every time, on every path tested. Gating on
+device-list membership alone is therefore well-evidenced by the committed probe on its own terms.
+
+`Devices` membership and the general, non-input-scoped `kAudioProcessPropertyIsRunning`
 both re-triggered correctly on every activation tested. Since real applications (Dictation, a
 browser tab, Chrome, anything on `AVAudioEngine`) are not restarted between recording sessions,
 gating on `IsRunningInput AND Devices` as originally specified would detect an application's first
@@ -379,7 +397,7 @@ library packaging, and an entire class of debugging.
 
 | Stage | Typical | Source |
 |---|---|---|
-| Input demand appears → `Devices` membership confirmed | 4–6 ms | **Measured** — Task 10 macOS probe, targeted lookup via `kAudioHardwarePropertyTranslatePIDToProcessObject`, self-introspection on the target Mac (macOS 26.6.1) |
+| Input demand appears → `Devices` membership confirmed | ~5 ms | **Measured** — Task 10 macOS probe, targeted lookup via `kAudioHardwarePropertyTranslatePIDToProcessObject`, self-introspection on the target Mac (macOS 26.6.1) |
 | Demand detected → `START` sent (warm TLS connection) | 1–5 ms | Estimate |
 | LAN transit | 2–15 ms | Estimate |
 | WASAPI shared open and start | 20–80 ms | Estimate — **unverified**, see below |
@@ -389,13 +407,20 @@ library packaging, and an entire class of debugging.
 | **Total** | **~109–196 ms** | |
 
 The demand-detection figure is the targeted-lookup measurement from
-`docs/superpowers/probes/2026-08-08-macos-demand-findings.md` (leg 1: 5 ms to detect appearance,
-3 ms to detect clearing). Two other numbers from that probe are deliberately **not** used here: the
-full-sweep figure (~40–60 ms, enumerating all ~40 process objects on the test machine) is roughly
-90% enumeration overhead rather than Core Audio propagation, and the cross-process figures
-(575–1188 ms) are dominated by helper-process spawn and `AudioUnit` setup, not steady-state
-detection latency for an already-running application. Neither characterizes what a running demand
-observer actually experiences once its listeners are registered.
+`docs/superpowers/probes/2026-08-08-macos-demand-findings.md` (leg 1: **5 ms** to detect appearance,
+**3 ms** to detect clearing). Two other numbers from that probe are deliberately **not** used here:
+the full-sweep figure (**58 ms** to detect appearance and 58 ms to detect clearing, enumerating all
+40 process objects on the test machine) is roughly 90% enumeration overhead rather than Core Audio
+propagation, and the cross-process figures (leg 4: **543 ms** and **1166 ms**) are dominated by
+helper-process spawn and `AudioUnit` setup, not steady-state detection latency for an
+already-running application. Neither characterizes what a running demand observer actually
+experiences once its listeners are registered.
+
+Every figure in this paragraph is quoted from the run committed in that findings document. These
+are wall-clock measurements on a live machine and they vary run to run — earlier drafts of this
+section quoted 4–6 ms, ~40–60 ms and 575–1188 ms from a different run, which is the same result to
+within measurement noise but does not match anything a reader can find in the repository. Quote the
+committed run; if you re-measure, replace the figures and say which run they come from.
 
 The WASAPI shared-mode open figure (20–80 ms) is still the original, unmeasured planning estimate.
 The Windows probe that would measure it
@@ -451,6 +476,10 @@ DPAPI-protected. The tray displays a pairing string encoding a random 256-bit to
 enters the host address and that string on the Mac once. At that moment the Mac pins the server
 certificate fingerprint and stores the token and fingerprint in the Keychain.
 
+The pairing string's exact encoding and the certificate's required profile — both of which two
+implementers would otherwise each invent differently — are specified in `protocol/protocol-v1.md`
+§11. Implement against that section, not against this paragraph.
+
 ### 7.2 Authentication
 
 On each connection:
@@ -460,7 +489,8 @@ On each connection:
 3. Windows verifies and replies `HELLO_ACK`.
 
 The token itself never crosses the wire, and the nonce makes the proof replay-resistant. Failed
-authentication is rate-limited to 5 attempts followed by a 30 s lockout.
+authentication is rate-limited to 5 attempts followed by a 30 s lockout — see
+`protocol/protocol-v1.md` §11.4 for what counts as an attempt and why the limit is not optional.
 
 ### 7.3 Rules
 
