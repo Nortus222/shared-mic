@@ -1,6 +1,9 @@
 # macOS demand-detection findings (Phase 0, spec open question 1)
 
-**Date:** 2026-08-08 (updated same day, fix round 1, after coordinator review)
+**Date:** 2026-08-08 (updated same day: fix round 1 after coordinator
+review, then again after the owner ran the real-application matrix by hand
+with `--watch` — see "Real applications, measured by the owner" below,
+which also narrows the scope of finding 2)
 **Probe:** `probes/macos-demand/DemandProbe.swift` (throwaway; see its README)
 **Question answered:** can macOS report per-process input device usage
 precisely enough to scope "someone is recording" detection to one specific
@@ -21,43 +24,57 @@ privacy goal.
 2. **But do not gate detection on `kAudioProcessPropertyIsRunningInput`.**
    During this round of fixes, `--self-test` was extended to check a
    process's *second* activation (open BlackHole, close it, open it
-   again), and found that on a process's **second and later** input-stream
-   activation, `IsRunningInput` reads `false` at the moment device-list
-   membership is first confirmed true -- i.e. the two properties disagree
-   at that instant, for the second activation onward, self-introspectively
-   and cross-process, and independent of whether the property is read via
-   full enumeration or via `kAudioHardwarePropertyTranslatePIDToProcessObject`.
+   again), and found that in the probe's synthetic activation cycles,
+   `IsRunningInput` reads `false` at the moment device-list membership is
+   first confirmed true -- i.e. the two properties disagree at that
+   instant, self-introspectively and cross-process, and independent of
+   whether the property is read via full enumeration or via
+   `kAudioHardwarePropertyTranslatePIDToProcessObject`.
    (A stronger claim -- that `IsRunningInput` stays `false` for the
-   *entire* duration of the second-and-later activation, not just at the
-   single sampled instant the committed self-test checks -- was also
+   *entire* duration of the second-and-later synthetic activation, not just
+   at the single sampled instant the committed self-test checks -- was also
    observed, repeatedly, using throwaway diagnostic scripts built during
    investigation; those are not part of the committed source, so treat
    that stronger version as investigation notes, not as something the
    committed probe itself proves. See "What this does NOT prove" below for
-   the leading open hypothesis about *why*.) `kAudioProcessPropertyDevices`
+   the leading hypothesis about *why*.) `kAudioProcessPropertyDevices`
    (device-list membership) and the general, non-input-scoped
    `kAudioProcessPropertyIsRunning` were both found to re-trigger correctly
    on every activation tested.
 
-   **This changes the design.** Any implementation that gates demand
-   detection on `runningInput == true AND deviceList.contains(target)` --
-   which is what this probe's own brief originally specified, and what
-   this probe originally shipped in the first review round -- will
-   silently miss the second and every subsequent time any given
-   application uses the microphone, because `IsRunningInput` won't be
-   `true` for that activation even though the app is genuinely recording.
-   Since real applications are not restarted between uses (Chrome,
-   Zoom/Teams, a Dictation-hosting process, etc. all stay running across
-   many separate recording sessions), this would have caused demand
-   detection to work once and then go dark for the rest of that
-   application's process lifetime, on every app, every time.
+   **How far that synthetic result reaches — narrowed by the owner's later
+   real-application pass.** Every activation this probe performs disposes
+   the previous `AudioComponentInstance` and constructs a brand-new one.
+   Raycast, a real and long-lived application (PID 759, started 2026-08-07
+   and confirmed by `ps` never to have restarted across any of the owner's
+   `--watch` sessions), read `runningInput = yes` on **every** activation
+   the owner observed, including the second, third and fourth activation of
+   that same process. **The synthetic result therefore does not generalise
+   to that application.** It stands as measured for the shape the probe
+   exercises — dispose-and-recreate per activation — and it is positive
+   evidence for the instance-reuse hypothesis recorded under "What this
+   does NOT prove" below, i.e. that the behaviour is scoped to fresh
+   `AudioComponentInstance`s rather than to a process's activation history.
+   No claim is made here about how the flag behaves in real applications
+   generally: one real application was observed, and it disagreed with the
+   synthetic result.
 
-   The probe has been corrected to gate everything -- `report()`,
-   `--watch`, and all `--self-test` legs -- on device-list membership
-   instead, and this is re-verified below (leg 4). **Phase 3 must not gate
-   demand detection on `IsRunningInput` alone; use
-   `kAudioProcessPropertyDevices` (input-scope) membership, optionally
-   corroborated by the general `kAudioProcessPropertyIsRunning`.**
+   **The design decision is unchanged, and it does not depend on the
+   synthetic result generalising.** Gate demand detection on device-list
+   membership. That predicate was correct for every process and every
+   device observed anywhere in this document — synthetic and real, first
+   activation and repeat, self-introspective and cross-process — and it is
+   correct whether or not `IsRunningInput` turns out to be reliable. Adding
+   `IsRunningInput` as a required conjunct buys nothing that device-list
+   membership does not already give, and would make the gate depend on a
+   flag whose behaviour is demonstrably not uniform across client shapes
+   (`false` in this probe's dispose-and-recreate cycles, `yes` in Raycast).
+   The probe gates everything -- `report()`, `--watch`, and all
+   `--self-test` legs -- on device-list membership, and this is re-verified
+   below (leg 4). **Phase 3 must gate demand detection on
+   `kAudioProcessPropertyDevices` (input-scope) membership. `IsRunningInput`
+   may be read and displayed as a diagnostic; it must not be a required
+   conjunct.**
 
 ## Test machine
 
@@ -327,13 +344,20 @@ state" case beyond what the deliberate negative-control test alone shows.
   to trust for what purpose).
 - No microphone-permission prompt blocked or delayed any `AudioOutputUnitStart`
   call across all runs and legs.
+- **On three real processes** (Raycast, the System Settings Sound
+  extension, and the Safari/WebKit GPU process), device-list membership
+  was likewise correct in every row the owner observed — including a
+  two-device list — and nothing lingered on BlackHole after use. See
+  "Real applications, measured by the owner" for exactly what was
+  observed and what was not.
 
 ## What this does NOT prove, and what remains unverified
 
-- **`IsRunningInput`'s failure mode past the first activation is
-  characterized on this machine, in this probe, but its root cause inside
-  Core Audio is not. The leading unresolved hypothesis is instance reuse,
-  not process history, and it has NOT been tested.** Every activation in
+- **`IsRunningInput`'s behaviour in this probe's synthetic cycles is
+  characterized on this machine, but its root cause inside Core Audio is
+  not. The leading hypothesis is instance reuse, not process history. It
+  now has one piece of positive evidence — Raycast — but the direct
+  measurement that would settle it has still NOT been run.** Every activation in
   this probe -- including every "repeat" activation in legs 1 and 4 --
   calls `makeInputUnit()` and constructs a **brand-new**
   `AudioComponentInstance` each time: dispose the old unit, create a new
@@ -352,8 +376,17 @@ state" case beyond what the deliberate negative-control test alone shows.
   probe's synthetic dispose/recreate cycles exercise), it is not, for any
   client shape.
 
-  **The measurement that would settle this was not run and should be the
-  first thing Phase 3 checks**, before relying on or ruling out
+  **The owner's Raycast observation is evidence for the instance-reuse
+  side of that, and it is the only such evidence there is.** One
+  long-lived real process reported `runningInput = yes` on four-plus
+  separate activations, which is what the instance-reuse hypothesis
+  predicts and what the process-history hypothesis does not. It is not a
+  confirmation: Raycast's internal audio-client shape was not inspected,
+  only one application was observed this way, and the two hypotheses were
+  not separated by a controlled measurement.
+
+  **The controlled measurement that would settle it was still not run and
+  should be the first thing Phase 3 checks**, before relying on or ruling out
   `IsRunningInput` for anything: build one `AudioUnit` instance, call
   `AudioOutputUnitStart`/`AudioOutputUnitStop` on that *same* instance
   twice (no `AudioComponentInstanceDispose`/recreate in between), and
@@ -379,96 +412,202 @@ state" case beyond what the deliberate negative-control test alone shows.
   from a terminal with no prior grant, behaves the same way. Phase 1 must
   still implement `NSMicrophoneUsageDescription` and real TCC handling and
   test it from a clean permission state.
-- **Only this probe's own processes were tested** (the probe itself and
-  helper processes that are literally re-execs of the same binary). It
-  does *not* prove that real third-party applications (Dictation, Chrome,
-  ChatGPT desktop, Zoom, Teams) go through Core Audio in a way that
-  populates the same properties identically, or that they exhibit (or
-  don't exhibit) the same repeat-activation behavior for `IsRunningInput`.
-  Given the finding above, it is now specifically important for the
-  owner's manual pass to check **repeat** activations of each real app,
-  not just a single activation — see the updated "Requires the owner"
-  steps below.
+- **The automated legs tested only this probe's own processes** (the probe
+  itself and helper processes that are literally re-execs of the same
+  binary). Three real processes were observed separately, by hand, in the
+  owner's pass below — Raycast, `com.apple.Sound-Settings.extension`, and
+  `com.apple.WebKit.GPU`. **macOS Dictation, Chrome/Chromium, the ChatGPT
+  desktop app, Zoom and Teams were not tested at all**, by either route.
+  Nothing here shows how they populate these properties, or whether they
+  exhibit the repeat-activation `IsRunningInput` behaviour the synthetic
+  legs saw — see "Requires the owner" below.
 - **No built-in mic on this hardware.** The negative control used a
   different but present device (OWC Thunderbolt 3 Audio Device) rather
   than "the built-in mic" as the brief's Step 4 literally specifies.
 - **Single-machine result**, run repeatedly in one session but not across
   a reboot, a BlackHole reinstall, or other Mac hardware/macOS versions.
 
+## Real applications, measured by the owner
+
+The brief's Step 4 matrix needs a human clicking through real
+applications; it cannot be automated from this agent. The owner has now
+run part of it by hand. **Three** real processes were observed. Everything
+below is what was seen; the applications not listed were not tested, and
+their absence from the table means "not measured," not "passed."
+
+### Session environment
+
+- macOS **26.6.1**, Mac Studio (the same machine as the automated legs
+  above).
+- BlackHole 2ch, `uid=BlackHole2ch_UID`, `AudioObjectID` **99**.
+- Other input devices present: OWC Thunderbolt 3 Audio Device (id 139),
+  Microsoft Teams Audio, ManyCam Virtual Microphone, Parallels Access
+  Sound, Squirrels Audio.
+- Core Audio process-object count ranged **40–42** depending on what was
+  running.
+- All observations via `./demand-probe --watch`. **No appear/clear
+  latencies were recorded** in this pass — the owner recorded state, not
+  timing, so the latency columns of the original matrix stay unmeasured
+  for real applications.
+- Single machine, one sitting per application, no reboot.
+
+### Baseline
+
+With nothing recording and System Settings closed, the table was **empty**
+and `demandCount` was **0**, stable across many polls.
+
+### What each observed process did
+
+| Process | Bundle ID | PID | Activations observed | `runningInput` while active | `onTarget` while active | Input-device list while idle | Appear / clear latency |
+|---|---|---|---|---|---|---|---|
+| Raycast | `com.raycast-x.macos` | 759 | 4+, across four separate `--watch` sessions, same long-lived process throughout | `yes` on **every** activation, including the 2nd, 3rd and 4th | `YES`, `[BlackHole 2ch]` | absent from the list, or `no / - / []` | not recorded |
+| System Settings Sound pane | `com.apple.Sound-Settings.extension` | 91262 | n/a — it is not "activating"; it holds the current **system default input** for as long as the pane is open | `no` (never observed running input) | `YES` only while BlackHole *was* the system default input; `-` once the default was changed to OWC | n/a — present in the process list only while System Settings is open | not recorded |
+| Safari / WebKit GPU process | `com.apple.WebKit.GPU` | 23059 | 1 capture observed | `yes` | `YES`, `[OWC Thunderbolt 3 Audio Device, BlackHole 2ch]` | `no / - / [OWC Thunderbolt 3 Audio Device]` — it **retains the then-current system default device** in its input-device list while not running input | not recorded |
+
+**Raycast (`com.raycast-x.macos`, PID 759).** `ps` confirms the process
+started 2026-08-07 and was never restarted across any of the runs, so
+every activation after the first is a repeat activation of one long-lived
+process. Observed across four separate `--watch` sessions. On each
+activation the row went from absent, or `no / - / []`, to
+`yes / YES / [BlackHole 2ch]`, and `demandCount` incremented. On each
+release it went back to `no / - / []`, or the row dropped off the list
+entirely; **no lingering was ever observed**. `runningInput` read `yes` on
+every one of those activations — see finding 2 above for what that does
+and does not mean for the synthetic result. Raycast targets BlackHole
+**explicitly, independent of the system default input**: it was observed
+holding `[BlackHole 2ch]` while the system default input was the OWC
+device. That is the property the recommended configuration in the design
+spec (§3.4) rests on.
+
+**System Settings Sound pane (`com.apple.Sound-Settings.extension`, PID
+91262).** Present in the process list only while System Settings is open;
+when it was closed the process disappeared from the list entirely (object
+count dropped 42 → 41 → 40). It holds whatever device is currently the
+**system default input**: it showed `[BlackHole 2ch]` with `onTarget=YES`
+while BlackHole was the default, and
+`[OWC Thunderbolt 3 Audio Device]` with `onTarget=-` after the default was
+changed to OWC. It is therefore a false positive **only** when BlackHole is
+the selected system input *and* the Sound pane is open. In that
+combination it put the idle baseline at `demandCount = 1`
+**persistently**, for as long as the pane stayed open — a debounce would
+not help, because the condition does not clear on its own.
+
+**Safari / WebKit GPU process (`com.apple.WebKit.GPU`, PID 23059).** While
+idle it showed `no / - / [OWC Thunderbolt 3 Audio Device]` — it retains
+the system default device in its input-device list while not running
+input. Raycast never did this (Raycast shows `[]` when idle), so this is a
+per-application behaviour, not a general one. While capturing it showed
+`yes / YES / [OWC Thunderbolt 3 Audio Device, BlackHole 2ch]` — a
+multi-device list, which the `contains BlackHole` predicate counted
+correctly, giving `demandCount = 2` alongside Raycast. After the owner
+stopped the mic use, the process dropped off the list entirely:
+**BlackHole did not linger**, and `demandCount` returned to 0 and stayed
+there.
+
+**Not tested for WebKit, and it matters:** whether WebKit would retain
+*BlackHole* in that idle device list if **BlackHole** were the system
+default input. The device it was observed retaining was the default at the
+time (OWC), so the observation says nothing about the BlackHole-as-default
+case — which is exactly the configuration the design originally assumed.
+If WebKit retains the default while idle and BlackHole is the default,
+Safari would sit on the demand predicate whenever it is running, without
+recording anything. This was not measured and must not be assumed either
+way.
+
+### What the owner's pass shows
+
+- Device-scoped detection worked on real, third-party and Apple processes,
+  not only on this probe's own re-execs: the `contains BlackHole`
+  predicate was correct for every row observed, including WebKit's
+  two-device list.
+- Repeat activations of one long-lived real process (Raycast, 4+) were
+  each detected, and each release cleared.
+- Two distinct false-positive *shapes* exist in the wild and were seen:
+  a process that holds the **system default input** while open (Sound
+  Settings), and a process that **retains the default in its idle device
+  list** (WebKit). Both are avoided in practice if BlackHole is not the
+  system default input — see the design spec §3.4 — but neither is
+  eliminated by anything in the code.
+- Nothing observed lingered on BlackHole after the corresponding
+  application stopped using it.
+
 ## Requires the owner
 
-The following matrix from the brief's Step 4 needs a human clicking
-through real applications with a microphone attached, and was **not**
-run — there is no way to automate speaking into Dictation, granting a
-Chrome site mic access, or joining a Zoom/Teams call from this agent. Do
-not read anything into this table; it is blank because it was not
-measured, not because it passed.
-
-**Updated per the `IsRunningInput` finding: for each application, test at
-least two separate recording sessions, not just one**, and record whether
-`onTarget`/device-list membership stays reliable on the second session
-even if `runningInput` does not (matching this probe's own finding, or
-possibly contradicting it — either result is valuable).
+Still not measured. Do not read anything into these rows; they are blank
+because they were not run.
 
 | Application | Session | `runningInput` | `onTarget` (BlackHole) | appear latency | clear latency |
 |---|---|---|---|---|---|
 | macOS Dictation | 1st | not measured | not measured | not measured | not measured |
 | macOS Dictation | 2nd | not measured | not measured | not measured | not measured |
-| Chrome (site requesting mic) | 1st | not measured | not measured | not measured | not measured |
-| Chrome (site requesting mic) | 2nd | not measured | not measured | not measured | not measured |
-| ChatGPT (voice mode) | 1st | not measured | not measured | not measured | not measured |
-| ChatGPT (voice mode) | 2nd | not measured | not measured | not measured | not measured |
-| Zoom or Teams | 1st | not measured | not measured | not measured | not measured |
-| Zoom or Teams | 2nd | not measured | not measured | not measured | not measured |
-| Any app with **built-in mic** selected (false-positive check) | n/a | not measured | not measured | n/a | n/a |
+| Chrome / Chromium (site requesting mic) | 1st | not measured | not measured | not measured | not measured |
+| Chrome / Chromium (site requesting mic) | 2nd | not measured | not measured | not measured | not measured |
+| ChatGPT desktop (voice mode) | 1st | not measured | not measured | not measured | not measured |
+| ChatGPT desktop (voice mode) | 2nd | not measured | not measured | not measured | not measured |
+| Zoom | 1st / 2nd | not measured | not measured | not measured | not measured |
+| Teams | 1st / 2nd | not measured | not measured | not measured | not measured |
+| Safari/WebKit **idle, with BlackHole as system default input** (does it retain BlackHole?) | n/a | not measured | not measured | n/a | n/a |
+| Raycast, Sound Settings, WebKit — appear/clear **latencies** | n/a | n/a | n/a | not measured | not measured |
+| Any app with a true **built-in mic** selected (false-positive check; this machine has none) | n/a | not measured | not measured | n/a | n/a |
 
-### Exact steps for the owner to run this
+### Exact steps for the owner to run the rest
 
 1. Build the probe if not already built:
    ```sh
    cd probes/macos-demand
    swiftc -O -o demand-probe DemandProbe.swift
    ```
-2. Open **System Settings → Sound → Input** and select **BlackHole 2ch**.
+2. Set the system input device **from the command line, not from System
+   Settings**. `switchaudio-osx` is installed for this
+   (`brew install switchaudio-osx`):
+   ```sh
+   SwitchAudioSource -c -t input                    # read the current input device
+   SwitchAudioSource -t input -s "BlackHole 2ch"    # set it, headlessly
+   ```
+   This matters: opening **System Settings → Sound** is what put
+   `com.apple.Sound-Settings.extension` on BlackHole and produced the
+   persistent `demandCount = 1` false positive recorded above. Leaving the
+   Sound pane closed keeps that process out of the picture entirely.
+   Note that `SwitchAudioSource -s` selects by **display name**, which is
+   fine for an interactive owner-run measurement but is not how the
+   shipping agent resolves devices (spec: UID only).
 3. In one terminal, run:
    ```sh
    ./demand-probe --watch
    ```
    Leave it running; it prints a fresh snapshot every 500 ms. The printed
-   `demandCount` is now gated on device-list membership, not on
+   `demandCount` is gated on device-list membership, not on
    `runningInput` — trust the `onTarget`/`demandCount` columns, and treat
-   `runningInput` as informational only (per the finding above, it may
-   correctly show `no` on an app's second-or-later session even while
-   `onTarget` correctly shows `YES`).
-4. For each application in turn (Dictation, Chrome with a site that
-   requests mic access, ChatGPT desktop voice mode, Zoom/Teams), run
+   `runningInput` as informational.
+4. For each remaining application (Dictation, Chrome with a site that
+   requests mic access, ChatGPT desktop voice mode, Zoom, Teams), run
    **two separate recording sessions**:
-   a. Start audio input in that application (e.g. press the Dictation
-      shortcut, click "Allow" on a Chrome mic prompt, start a ChatGPT
-      voice session, join/unmute in Zoom or Teams).
+   a. Start audio input in that application.
    b. Watch the terminal. Note the PID/bundle ID that appears, whether
-      `runningInput` shows `yes`, whether `onTarget` shows `YES`, and
-      roughly how many `--watch` cycles (× 500 ms) elapsed between
-      starting input and the row appearing.
+      `runningInput` shows `yes`, whether `onTarget` shows `YES`, the full
+      input-device list, and roughly how many `--watch` cycles (× 500 ms)
+      elapsed between starting input and the row appearing.
    c. Stop input in the application. Note how many cycles elapse before
       the row disappears or `onTarget` flips back to `-`.
-   d. Repeat steps a-c a second time **without restarting the
-      application** (e.g. dictate again, refresh/reuse the same Chrome
-      tab, start a new ChatGPT voice turn, unmute again in the same Zoom
-      call) and record the same fields for this second session.
-   e. Record all cells in the table above for both sessions of that
-      application.
-5. Repeat the whole pass with **System Settings → Sound → Input** set to
-   the Mac's built-in microphone if this hardware has one (this test
-   machine, a Mac Studio, does not — the owner should run this leg on
-   hardware that does, e.g. a MacBook). Confirm `onTarget` stays `-` and
-   `device-scoped demandCount` stays `0` for every application tested.
-   This is the false-positive check and per the brief is one of the most
-   important measurements remaining in Phase 0.
-6. Fill in the table above with real numbers, and update the verdict below
-   if any application disagrees with the automated self-test results
-   (either the base device-scoping result, or the repeat-activation
-   result).
+   d. Repeat a–c **without restarting the application**, and record the
+      same fields for the second session.
+   e. Also record the application's row **while idle but running** — the
+      WebKit result above shows that an idle process may still carry a
+      device in its list, and that shape is what turns into a false
+      positive when the device happens to be BlackHole.
+5. Close the remaining WebKit gap specifically: with `SwitchAudioSource -t
+   input -s "BlackHole 2ch"`, open Safari, do **not** record anything, and
+   check whether `com.apple.WebKit.GPU` appears with `[BlackHole 2ch]` in
+   its idle device list. A `YES` here means Safari alone is enough to hold
+   the demand predicate on when BlackHole is the default input, and is a
+   direct argument for the §3.4 configuration rather than merely a
+   convenience.
+6. Repeat the pass with the system input set to a true **built-in
+   microphone** on hardware that has one (this Mac Studio does not).
+   Confirm `onTarget` stays `-` and `demandCount` stays `0` for every
+   application tested.
+7. Fill in the table above with real values, and update the verdict below
+   if any application disagrees with what is already recorded.
 
 ## Verdict
 
@@ -478,47 +617,76 @@ automated `--self-test` demonstrates, with real AUHAL input streams and no
 human involvement, that `kAudioProcessPropertyDevices` (input scope)
 correctly reports which specific device a process is recording from —
 positively, negatively, cross-process, and across repeat activations —
-when detection is gated on device-list membership.
+when detection is gated on device-list membership. The owner's manual pass
+extends that to three real processes (Raycast across 4+ activations of one
+long-lived process, the System Settings Sound extension, and the
+Safari/WebKit GPU process including a two-device list), where the same
+predicate was correct in every row observed.
 
-**But the gating condition matters, and the brief's original one is
-wrong.** `kAudioProcessPropertyIsRunningInput`, which the original design
-implicitly relied on as part of the demand signal, does **not** reliably
-re-trigger past a process's first input activation. Gating on it (as
-originally specified and as this probe originally shipped) would cause
-demand detection to work exactly once per application process lifetime
-and then go silently dark. This is corrected in the current version of
-the probe and is the single most important design-relevant finding to
-come out of Phase 0's macOS probe: **Phase 3 must gate demand detection
-on `kAudioProcessPropertyDevices` (input-scope) membership, not on
-`IsRunningInput`.**
+**The gate is device-list membership, and it does not need `IsRunningInput`
+to be reliable.** In this probe's synthetic cycles — which dispose and
+recreate an `AudioComponentInstance` per activation —
+`kAudioProcessPropertyIsRunningInput` read `false` at the instant
+device-list membership was independently confirmed `true`. In Raycast, a
+real long-lived process, it read `yes` on every activation observed,
+including the fourth. The flag therefore behaves differently across client
+shapes, and no single rule about it is supported by what was measured.
+Device-list membership needs no such rule: it was correct in every case
+observed, synthetic and real, and it is correct whether or not
+`IsRunningInput` is reliable. That is the reason for the design decision,
+and it is why the decision is unaffected by the Raycast result. **Phase 3
+must gate demand detection on `kAudioProcessPropertyDevices` (input-scope)
+membership. `IsRunningInput` may be read and displayed as a diagnostic; it
+must not be a required conjunct.**
+
+**Measured false positives, and the configuration that avoids them.** Two
+processes were observed carrying a device they were not recording from:
+`com.apple.Sound-Settings.extension` holds the current system default
+input while the Sound pane is open (a persistent `demandCount = 1` when
+BlackHole is the default — a debounce would not clear it), and
+`com.apple.WebKit.GPU` retains the then-current default in its idle
+device list. Both attach to *the system default input*. Raycast targets
+BlackHole explicitly and independently of the default. So leaving the
+system default input on the real hardware microphone, and letting Raycast
+target BlackHole, removes both observed false-positive shapes. This is a
+recommended configuration, not a guarantee: any application that
+explicitly targets BlackHole will still register, which is the mechanism
+working as designed.
 
 **What remains unverified and must not be treated as settled:**
-1. Whether real target applications (Dictation, Chrome, ChatGPT, Zoom/Teams)
-   go through Core Audio in a way that populates these same properties,
-   including across repeat sessions — the "Requires the owner" matrix
-   above is empty and needs a human pass, now explicitly covering a second
-   session per app.
-2. TCC/microphone-permission behavior for a freshly-launched, signed Phase
+1. macOS Dictation, Chrome/Chromium, the ChatGPT desktop app, Zoom and
+   Teams were **not tested at all** — not by the automated legs and not by
+   the owner's pass. Nothing here says how they populate these properties,
+   on a first session or a repeat one.
+2. Whether `com.apple.WebKit.GPU` would retain **BlackHole** in its idle
+   device list if BlackHole were the system default input. The device it
+   was observed retaining was the default at the time (OWC). This is the
+   configuration the original design assumed, so the gap is
+   design-relevant, not academic.
+3. Appear/clear latencies for real applications. The owner's pass recorded
+   state, not timing; every real-application latency cell is unmeasured.
+4. TCC/microphone-permission behavior for a freshly-launched, signed Phase
    1 app bundle with no prior grant.
-3. The false-positive (true built-in mic) leg specifically, since this
+5. The false-positive (true built-in mic) leg specifically, since this
    test machine has none; the automated self-test substituted a different
    real hardware input device and the negative result held for that
    substitution.
-4. The root cause of `IsRunningInput`'s failure to re-trigger is not
-   identified, only its symptom and a reliable workaround (device-list
-   membership). The leading unresolved hypothesis is **instance reuse**:
-   this probe always disposes and recreates a fresh `AudioComponentInstance`
-   between activations, while a real app is more likely to reuse one
-   instance across its whole session — see "What this does NOT prove"
-   above for the specific measurement (same-instance stop/restart) that
-   would settle this and should be Phase 3's first check before relying on
-   or ruling out `IsRunningInput` for anything.
+6. Why `IsRunningInput` behaves as it does. The leading hypothesis remains
+   **instance reuse** — this probe always disposes and recreates a fresh
+   `AudioComponentInstance` between activations, while a real app is more
+   likely to reuse one instance across its whole session. Raycast's
+   behaviour is consistent with that hypothesis and is the only evidence
+   for it; the controlled same-instance stop/restart measurement described
+   in "What this does NOT prove" has still not been run, and should be
+   Phase 3's first check before relying on or ruling out `IsRunningInput`
+   for anything.
 
 Recommendation for Phase 3: proceed with device-scoped detection as the
 primary mechanism, gated on `kAudioProcessPropertyDevices` membership —
 the core OS API demonstrably supports it, including across repeat
-activations and cross-process. Do **not** use `IsRunningInput` as a gate.
-Do not close spec open question 1 until the owner completes the
-per-application matrix above, with particular attention to whether real
-apps' second-and-later sessions are detected the same way synthetic AUHAL
-cycles were in this probe.
+activations, cross-process, and on the real applications observed. Do
+**not** use `IsRunningInput` as a gate. Spec open question 1 is answered
+for Raycast, the owner's primary application, and remains open for the
+untested applications listed above; keep it open until enough of that
+matrix is filled in to matter for the way the system will actually be
+used.

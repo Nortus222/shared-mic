@@ -38,7 +38,9 @@ What Phase 0 delivered, and where to start reading:
 - [`docs/superpowers/probes/`](docs/superpowers/probes/) — the two throwaway probes' findings. The
   macOS demand-detection probe
   ([findings](docs/superpowers/probes/2026-08-08-macos-demand-findings.md)) changed the design: it
-  disproved `kAudioProcessPropertyIsRunningInput` as a demand gate. The Windows WASAPI latency probe
+  ruled out `kAudioProcessPropertyIsRunningInput` as a demand gate in favour of device-list
+  membership, and the owner's follow-up pass over real applications established that BlackHole need
+  not be the Mac's system input device. The Windows WASAPI latency probe
   ([findings](docs/superpowers/probes/2026-08-08-windows-wasapi-findings.md)) is written but has not
   been run — this repository has no Windows machine.
 

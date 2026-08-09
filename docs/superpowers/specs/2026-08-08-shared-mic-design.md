@@ -17,7 +17,7 @@ this document supersedes it.
 
 | Draft | Now | Why |
 |---|---|---|
-| §5.2: process-level demand detection false-positives are unavoidable in the MVP | Demand is scoped to the shared virtual device by UID | The target Mac runs macOS 26.6.1, where `kAudioProcessPropertyDevices` (14.4+) reports per-process devices with an input scope. The limitation was a version assumption, not a platform one. |
+| §5.2: process-level demand detection false-positives are unavoidable in the MVP | Demand is scoped to the shared virtual device by UID | The target Mac runs macOS 26.6.1, where `kAudioProcessPropertyDevices` (14.4+) reports per-process devices with an input scope. The limitation was a version assumption, not a platform one. Two residual false-positive shapes were later *measured* rather than guessed at, and both are avoided by the device configuration in §3.4 — see §5.1, "False positives, measured". |
 | §7.2: two TCP connections, TLS optional | One TLS connection carrying control and audio, multiplexed with a priority send queue | Hardening is in scope, and two channels means two handshakes, two auth paths, two reconnect state machines. It also puts a TLS handshake on the activation path, which is exactly where the first-word-clipping risk lives. |
 | Phase 5: security hardening | Security is built in Phase 1, with the transport | Retrofitting TLS and auth onto a working plaintext channel means building the connection layer twice. Under a single multiplexed channel, the connection is the chokepoint for everything else. |
 | Phase 6: custom "Shared Mic" Core Audio driver | Dropped | Its only substantive justification was an unambiguous demand signal. Device-scoped detection provides that without the signing, install, and real-time-debugging burden. |
@@ -41,8 +41,10 @@ correction**.
 - No manual switching during normal operation.
 - Microphone audio is transmitted only while macOS has active input demand **on the shared virtual
   device**.
-- Starting dictation on macOS activates the remote microphone automatically; stopping it deactivates
-  after a short debounce.
+- Starting voice input in the primary application activates the remote microphone automatically;
+  stopping it deactivates after a short debounce. **The primary application is Raycast**, which the
+  Phase 0 probe pass confirmed opens BlackHole explicitly (§3.4). macOS Dictation is a secondary
+  case and has **not** been tested against this mechanism.
 - Both agents launch at login and recover from sleep, network changes, and process restarts.
 - The user can hard-disable the remote microphone, and can force it on when detection misses an app.
 
@@ -140,6 +142,47 @@ Swift with Core Audio, packaged as a menu-bar application with launch-at-login.
 | `AudioRenderer` | AUHAL output to BlackHole; real-time-safe render callback | Network |
 | `MenuBarController` | Status UI, kill switch, force-on, diagnostics, pairing | Protocol details |
 
+### 3.4 Mac audio-device configuration
+
+**BlackHole does not need to be the Mac's selected system input device, and the recommended
+configuration is that it is not.** Leave the system input on the real hardware microphone; let the
+application that wants the remote microphone target BlackHole itself.
+
+This is possible because the owner's primary application, Raycast, was observed targeting BlackHole
+**explicitly, independent of the system default input** — it held `[BlackHole 2ch]` in its
+input-device list while the system default was the OWC Thunderbolt 3 Audio Device
+(`docs/superpowers/probes/2026-08-08-macos-demand-findings.md`, "Real applications, measured by the
+owner"). An application that selects BlackHole by itself does not care what the system default is.
+
+Three things follow, and they are the reason this is the recommendation rather than a footnote:
+
+- **It removes both false-positive shapes that were actually observed.** Both attach to the *system
+  default input*: `com.apple.Sound-Settings.extension` holds the default while the Sound pane is
+  open, and `com.apple.WebKit.GPU` retains the default in its device list even while idle. With the
+  default on real hardware, neither lands on BlackHole. See §5.1.
+- **Applications that simply follow the system default get the real microphone** and never touch
+  BlackHole at all, so they cannot start a session.
+- **It shrinks the blast radius of a Windows outage.** With BlackHole permanently selected as the
+  system input — the configuration this spec originally assumed — a sleeping or unreachable Windows
+  host meant *every* macOS application that opened input got silence. Under this configuration only
+  the applications that explicitly target BlackHole are affected; everything else keeps using the
+  real microphone normally. This is what §5.5's notification policy is calibrated against.
+
+Stated precisely: this is a **recommended configuration, not a guarantee**. It does not make false
+positives impossible. An application that explicitly targets BlackHole will still register as
+demand — that is the detection mechanism working as designed, not a defect. What the configuration
+does is keep applications that merely follow the system default out of the picture entirely.
+
+The agent must not change the system input device to achieve this, any more than it changes the
+system output device (§6.4). The configuration is the user's, set once during setup; the menu bar
+should surface the current system input device so a misconfiguration is visible rather than
+mysterious.
+
+Whether this configuration is *required* — i.e. whether BlackHole-as-default is actually unusable —
+is **not established**. It was not measured with BlackHole as the default beyond what §5.1 records,
+and the specific unknown there (does WebKit retain BlackHole when BlackHole is the default?) is
+listed as open in §13 Q1.
+
 ---
 
 ## 4. Transport
@@ -233,71 +276,101 @@ process list (§6.3), so the fallback must target the specific process rather th
 
 **`kAudioProcessPropertyIsRunningInput` is not part of the gate, and must not become one.** An
 earlier version of this section (and the draft before it) required `IsRunningInput` as a second,
-mandatory conjunct alongside `Devices`. Task 10's macOS probe
-(`docs/superpowers/probes/2026-08-08-macos-demand-findings.md`), run on the actual target Mac
-(macOS 26.6.1), found that `IsRunningInput` does **not** reliably re-trigger when a process
-re-activates a device it has already used for input: it read `false` at the exact instant `Devices`
-membership was independently confirmed `true` in both of the committed self-test's repeat-activation
-cases — self-introspectively, re-opening BlackHole a second time (leg 1's targeted cycle), and for a
-genuinely separate helper process re-opening BlackHole after closing it (leg 4's cycle 2) — via the
-targeted-lookup and full-sweep paths respectively. It is not simply a function of activation count:
-leg 2 self-introspectively opens a *different* device (the negative-control device), which is,
-counting purely by activation number, the same process's third activation, and `IsRunningInput`
-read `true` there, agreeing with `Devices` membership. The failure mode the probe establishes is
-specific to re-activating a device the process has already used, not "any second-and-later
-activation."
+mandatory conjunct alongside `Devices`. It was removed for a positive reason, not a negative one:
 
-**That instant is the whole of what the committed probe establishes, and it is enough.** The probe
-polls at 10 ms intervals but records `IsRunningInput` only at the single instant device-list
-membership is confirmed; it does not record whether the flag was `false` for the rest of the
-activation. A stronger observation — that it stays `false` for the *entire* second-and-later
-activation — was made repeatedly during investigation, but with throwaway diagnostic scripts that
-are not part of the committed source; the findings document records it as investigation notes and
-this spec treats it the same way. Do **not** cite this section's cross-process cycle timings
-(§6.3's 543–1166 ms) as the duration of the disagreement either: those figures are dominated by
-helper fork/exec and `AudioUnit` setup, most of which elapses before the helper opens input at all
-— a window in which `IsRunningInput` is `false` trivially and proves nothing.
+> `Devices` membership was correct in **every case observed** — the automated self-test's
+> self-introspective, negative-control, cross-process and repeat-activation legs, and the owner's
+> manual pass over three real processes (Raycast across 4+ activations of one long-lived process,
+> `com.apple.Sound-Settings.extension`, and `com.apple.WebKit.GPU`, the last of these reporting a
+> two-device list that the `contains BlackHole` predicate handled correctly). It is also correct
+> **regardless of whether `IsRunningInput` is reliable**. A gate that needs only the property with
+> an unblemished record, and that is unaffected by however the other property turns out to behave,
+> is the safe gate. Adding `IsRunningInput` as a required conjunct buys nothing and imports a risk.
 
-None of that weakens the design conclusion, because the conclusion does not depend on the stronger
-claim. A gate of the form `IsRunningInput AND Devices` is evaluated at the moment demand is
-detected, and the moment demand is detected is exactly the instant the probe measures — the instant
-at which the two properties were found to disagree in both of the committed probe's
-repeat-activation cases. Gating on device-list membership alone is therefore well-evidenced by the
-committed probe on its own terms.
+That is the whole justification, and it does not rest on any claim about how `IsRunningInput`
+behaves in general. **Do not restate it as "the flag is broken past first activation."** That claim
+is not supported, and one real application contradicts it.
 
-`Devices` membership and the general, non-input-scoped `kAudioProcessPropertyIsRunning`
-both re-triggered correctly on every activation tested. Since real applications (Dictation, a
-browser tab, Chrome, anything on `AVAudioEngine`) are not restarted between recording sessions,
-gating on `IsRunningInput AND Devices` as originally specified would detect an application's first
-use of the microphone and then silently miss every subsequent one for that process's entire
-lifetime — the user would be talking into a dead microphone with no error surfaced anywhere. Demand
-is therefore gated on `Devices` membership alone. `IsRunningInput` may still be read and shown as a
-supplementary or diagnostic signal — it is logged alongside `Devices` membership in the probe for
-exactly this reason — but it must never be a required conjunct for starting or stopping a session.
+What was actually observed about the flag, precisely:
 
-The root cause is unidentified, and the flag may still be salvageable as a secondary signal later.
-Every activation in the probe constructed a **brand-new** `AudioComponentInstance` per cycle
-(dispose the old unit, create and configure a new one), while a real client such as Dictation,
-Chrome, or anything built on `AVAudioEngine` is far more likely to hold **one** engine/unit instance
-for its whole session and call start/stop on that same instance repeatedly. The sticky-false
-behavior may therefore be HAL-client re-registration scoped to a *new instance*, not a genuine
-process-level "Nth activation" property — in which case real long-lived apps might re-trigger
-`IsRunningInput` correctly every time, and it would be salvageable after all. This distinction was
-not tested: leg 2's agreement (above) is consistent with the hypothesis but does not confirm it,
-because every activation in this probe opens a brand-new instance, so a new device and a new
-instance are the same event here — leg 2 cannot distinguish "a new instance re-triggers the flag"
-from "a device this process has not yet used re-triggers the flag" as the operative factor. **The
-first thing Phase 3 should check, before relying on or ruling out
-`IsRunningInput` for anything, is the measurement the probe specifies but did not run: build one
-`AudioUnit` instance, call `AudioOutputUnitStart`/`AudioOutputUnitStop` on that same instance twice
-with no dispose-and-recreate in between, and observe whether `IsRunningInput` re-triggers `true` on
-the second start.** Device-list membership works as the gate regardless of how that measurement
-turns out.
+- **In the probe's synthetic cycles**, which dispose the `AudioComponentInstance` and construct a
+  brand-new one for every activation, `IsRunningInput` read `false` at the exact instant `Devices`
+  membership was independently confirmed `true`, in both repeat-activation cases the committed
+  self-test checks — self-introspectively re-opening BlackHole (leg 1's targeted cycle) and a
+  genuinely separate helper process re-opening BlackHole after closing it (leg 4's cycle 2). That is
+  a single sampled instant per case, not a claim about the duration of the disagreement; a stronger
+  observation was made during investigation with throwaway scripts that are not committed, and the
+  findings document treats it as investigation notes. Do **not** cite §6.3's cross-process cycle
+  timings (543–1166 ms) as the duration of the disagreement either — those figures are dominated by
+  helper fork/exec and `AudioUnit` setup, a window in which the flag is `false` trivially.
+- **In Raycast**, a real, long-lived application (PID 759, confirmed by `ps` never to have restarted
+  across any of the owner's runs), `IsRunningInput` read `yes` on **every** activation the owner
+  observed, including the second, third and fourth activation of that same process.
+
+So the synthetic result **does not generalise to Raycast**, and no general rule about the flag is
+established by what was measured. What the Raycast result does support is the instance-reuse
+hypothesis the findings document already records: that the sticky-`false` behaviour is scoped to
+freshly created `AudioComponentInstance`s rather than to a process's activation history. It is
+evidence for that hypothesis, not confirmation of it — one application, whose internal audio-client
+shape was not inspected. **The controlled measurement that would settle it should still be Phase 3's
+first check before relying on or ruling out `IsRunningInput` for anything: build one `AudioUnit`
+instance, call `AudioOutputUnitStart`/`AudioOutputUnitStop` on that same instance twice with no
+dispose-and-recreate in between, and observe whether `IsRunningInput` re-triggers `true` on the
+second start.**
+
+None of this changes the design. `IsRunningInput` may be read, logged and shown as a diagnostic —
+the probe prints it alongside `Devices` membership for exactly that reason — but it must never be a
+required conjunct for starting or stopping a session, because the gate does not need it and is
+strictly safer without it.
 
 The `Devices` predicate is the entire point. The target Mac has BlackHole, ManyCam, Microsoft Teams
 Audio, Parallels Access Sound, and Squirrels Audio installed. Under process-level detection alone,
 any of those going active would start the remote microphone. Device scoping is not an optimization
 here; it is what makes the privacy claim true.
+
+#### False positives, measured
+
+The draft assumed process-level false positives were unavoidable (§1). Device scoping removes the
+whole class of "an unrelated application opened *a* microphone." What it does not remove is a
+process that carries **BlackHole specifically** in its input-device list without recording anything
+the user would call recording. Two such shapes were observed on the target Mac — these are
+measurements, not speculation, and they replace the guesswork this section previously contained:
+
+| Process | Shape | When it is a false positive | Behaviour |
+|---|---|---|---|
+| `com.apple.Sound-Settings.extension` | Holds whatever device is the **system default input**, for as long as the System Settings Sound pane is open | BlackHole is the system default **and** the Sound pane is open | Persistent `demandCount = 1`. It showed `[BlackHole 2ch]` / `onTarget=YES` while BlackHole was the default and `[OWC Thunderbolt 3 Audio Device]` / `onTarget=-` after the default was changed. The process leaves the process list entirely when System Settings is closed. |
+| `com.apple.WebKit.GPU` (Safari) | **Retains the system default device in its input-device list while idle** — `no / - / [OWC Thunderbolt 3 Audio Device]` with nothing recording | Unknown; see below | While capturing it showed `yes / YES / [OWC Thunderbolt 3 Audio Device, BlackHole 2ch]`, counted correctly. After the capture stopped, the process dropped off the list entirely — **BlackHole did not linger** and `demandCount` returned to 0. |
+
+Both shapes attach to the **system default input**. That is why §3.4 recommends leaving the system
+default on the real hardware microphone: with the default off BlackHole, neither process lands on
+BlackHole at all. Raycast is unaffected by that configuration because it targets BlackHole
+explicitly.
+
+Three consequences for the implementation:
+
+- **The Sound Settings case is not a debounce problem.** While the pane is open the condition does
+  not clear on its own, so `demandCount` sits at 1 indefinitely. No amount of debouncing helps; only
+  the §3.4 configuration (or closing the pane) does. This is worth surfacing in diagnostics — the
+  menu bar already shows the current demand process count (§11), which makes a stuck count
+  attributable rather than mysterious.
+- **Multi-device lists are normal and must be handled as such.** WebKit reported two devices at
+  once. The predicate is `contains(BlackHole)`, not `== [BlackHole]`, and that is load-bearing
+  rather than incidental.
+- **An idle process may still carry a device.** Raycast shows `[]` when idle; WebKit shows the
+  default. Both are legitimate. The observer must not assume that presence in the process list
+  implies recording, nor that a non-empty device list implies recording — only that BlackHole's
+  presence in the input-scope list is what the design has chosen to treat as demand.
+
+**Not tested, and design-relevant:** whether `com.apple.WebKit.GPU` would retain **BlackHole** in
+that idle device list if BlackHole were the system default input. The device it was observed
+retaining was the default at the time (OWC Thunderbolt 3 Audio Device), so the observation says
+nothing about the BlackHole-as-default case — which is exactly the configuration this spec
+originally assumed. If it does retain it, Safari merely being open would hold the demand predicate
+on. This is unmeasured and must not be assumed either way; it is tracked in §13 Q1 and in the
+findings document's "Requires the owner."
+
+Also untested against this mechanism, in any configuration: macOS Dictation, Chrome/Chromium, the
+ChatGPT desktop app, Zoom and Teams (§13 Q1).
 
 ### 5.2 State machine
 
@@ -335,8 +408,13 @@ DEGRADED                       (notification fires here, conditionally)
 ```
 
 `START` is immediate; only `STOP` is debounced. The debounce default is **1000 ms**, configurable
-**500–2000 ms**. It exists because Dictation, browsers, and communication apps routinely tear down
-and immediately recreate an input stream.
+**500–2000 ms**. It exists because applications that tear down and immediately recreate an input
+stream would otherwise produce a stop/start pair on every such cycle. That teardown-and-recreate
+pattern is an assumption inherited from the draft and has **not** been measured here: in the Phase 0
+pass, each Raycast release cleared cleanly with no observed re-appearance, and nothing lingered. The
+debounce is retained as cheap insurance, and Phase 3 should measure whether it fires at all. Note
+that it is no defence against the Sound Settings false positive described in §5.1, which is
+persistent rather than transient.
 
 ### 5.3 Kill switch
 
@@ -354,10 +432,31 @@ exists to eliminate.
 ### 5.5 Notification policy
 
 The user-visible alert fires on entering `DEGRADED` **while demand is active** — the moment where
-the user is dictating into nothing and needs to know immediately.
+the user is speaking into nothing and needs to know immediately.
 
 It deliberately does not fire when the connection drops at idle. Windows sleeping overnight is
 normal, and an alert for it would train the user to ignore the alert that matters.
+
+**The recommended device configuration (§3.4) makes this policy less risky than it was.** This
+policy was written against the assumption that BlackHole was permanently selected as the Mac's
+system input device, under which an unreachable Windows host meant every macOS application that
+opened input got silence — a large blast radius for a failure the user is not told about until they
+happen to be recording. With the system input left on the real hardware microphone, only the
+applications that explicitly target BlackHole are affected by a Windows outage; everything else
+keeps using the real microphone normally and is not degraded at all.
+
+So the silent-at-idle rule now costs less: the failure it stays quiet about is scoped to the remote
+path, not to microphone input on the Mac as a whole. The policy itself is unchanged — alert on
+`DEGRADED` with demand active, stay quiet at idle — but the reason it is acceptable is now the
+narrower blast radius rather than a judgement that the user will tolerate the broader one. Two
+consequences:
+
+- **Do not add an idle-time alert to compensate for the broad failure mode.** It no longer exists in
+  the recommended configuration.
+- **If the user does select BlackHole as the system input**, the broad failure mode returns. The
+  menu bar shows the current system input device (§3.4) precisely so that state is visible; whether
+  that configuration warrants a louder notification policy is a Phase 3 decision, and it is not
+  specified here because it has not been measured.
 
 ---
 
@@ -421,11 +520,18 @@ The demand-detection figure is the targeted-lookup measurement from
 `docs/superpowers/probes/2026-08-08-macos-demand-findings.md` (leg 1: **5 ms** to detect appearance,
 **3 ms** to detect clearing). Two other numbers from that probe are deliberately **not** used here:
 the full-sweep figure (**58 ms** to detect appearance and 58 ms to detect clearing, enumerating all
-40 process objects on the test machine) is roughly 90% enumeration overhead rather than Core Audio
+40 process objects present on the test machine during that run — the owner's later pass saw 40–42
+depending on what was running) is roughly 90% enumeration overhead rather than Core Audio
 propagation, and the cross-process figures (leg 4: **543 ms** and **1166 ms**) are dominated by
 helper-process spawn and `AudioUnit` setup, not steady-state detection latency for an
 already-running application. Neither characterizes what a running demand observer actually
 experiences once its listeners are registered.
+
+All of these are synthetic-probe figures. The owner's real-application pass recorded **state, not
+timing** — no appear or clear latency was measured for Raycast, the Sound Settings extension, or
+WebKit — so there is still no measurement of how quickly a real application's demand becomes
+visible. The first row of the table remains a synthetic self-introspection figure, and should be
+re-measured against a real application in Phase 3.
 
 Every figure in this paragraph is quoted from the run committed in that findings document. These
 are wall-clock measurements on a live machine and they vary run to run — earlier drafts of this
@@ -518,7 +624,7 @@ authentication is rate-limited to 5 attempts followed by a 30 s lockout — see
 
 | Failure | Behavior |
 |---|---|
-| Windows agent unreachable | Mac renders silence, enters `DEGRADED`, reconnects with backoff. Notification only if demand was active. |
+| Windows agent unreachable | Mac renders silence into BlackHole, enters `DEGRADED`, reconnects with backoff. Notification only if demand was active (§5.5). Under the §3.4 configuration this affects only applications that explicitly target BlackHole; applications on the system default input are unaffected. |
 | USB mic unplugged while idle | Windows sends `STATUS{micPresent: false}`. Mac stays connected; activation is blocked with a clear reason. |
 | USB mic unplugged mid-session | Windows stops capture and sends `STATUS`. Mac enters `DEGRADED` and notifies. On replug, auto-restarts if demand is still active. |
 | Network drops mid-session | Mac renders silence, reconnects, reissues `START` if demand persists. |
@@ -535,13 +641,22 @@ authentication is rate-limited to 5 attempts followed by a 30 s lockout — see
 
 - [ ] Both machines running and idle for 10 minutes: microphone payload received by the Mac is
       exactly **zero bytes**.
-- [ ] Starting macOS Dictation activates the remote stream automatically, with no button press.
-- [ ] Stopping Dictation returns the system to idle automatically.
+- [ ] Starting voice input in **Raycast** (the primary application) activates the remote stream
+      automatically, with no button press.
+- [ ] Stopping Raycast voice input returns the system to idle automatically.
+- [ ] The two above hold on Raycast's **second and later** activations without restarting Raycast.
+- [ ] With the Mac's system input device set to the **real hardware microphone** and BlackHole not
+      selected as the system input (§3.4): opening System Settings → Sound, and separately opening
+      Safari, produce **zero** `START` messages.
 - [ ] Windows applications can use the physical USB microphone while the Mac is receiving it.
-- [ ] Across 100 repeated Dictation activations, **at least 95 lose no complete first word**.
+- [ ] Across 100 repeated activations of the primary application, **at least 95 lose no complete
+      first word**.
 - [ ] `START`-to-first-playable-frame latency is **below 300 ms at p95** on the home LAN.
 - [ ] Opening microphone input in ManyCam, Teams, or another non-BlackHole virtual device produces
       **zero** `START` messages.
+- [ ] *Secondary, untested as of Phase 0:* macOS Dictation, Chrome/Chromium, the ChatGPT desktop
+      app, Zoom and Teams each activate and release correctly, or are documented as needing the
+      force-on hold (§5.4). None of these has been observed against this mechanism.
 - [ ] The kill switch guarantees zero bytes even with an application actively requesting input.
 - [ ] The force-on hold expires automatically at its configured duration.
 - [ ] A 30-minute continuous session completes with no drift-induced underruns.
@@ -556,9 +671,14 @@ authentication is rate-limited to 5 attempts followed by a 30 s lockout — see
 
 | Scenario | Expected | Measure | Priority |
 |---|---|---|---|
-| Mac Dictation start/stop | Automatic START/STOP | Activation and stop latency | P0 |
-| ChatGPT / browser voice input | Automatic stream | Audio accepted | P0 |
-| Windows + Mac simultaneous dictation | Both receive speech | No WASAPI conflict | P0 |
+| **Raycast voice input start/stop (primary application)** | Automatic START/STOP | Activation and stop latency | **P0** |
+| **Raycast repeat activations, same process** | Every activation detected | Missed activations = 0 | **P0** |
+| **System Settings Sound pane open, real mic as system input** | No START sent | False-start count = 0 | **P0** |
+| **Safari open and idle, real mic as system input** | No START sent | False-start count = 0 | **P0** |
+| Safari/WebKit idle **with BlackHole as system input** | Unknown — measure before assuming (§13 Q1) | Does BlackHole appear in its idle device list? | P1 |
+| Mac Dictation start/stop (secondary, untested) | Automatic START/STOP, or documented force-on fallback | Activation and stop latency | P1 |
+| ChatGPT / browser voice input (untested) | Automatic stream | Audio accepted | P1 |
+| Windows + Mac simultaneous capture | Both receive speech | No WASAPI conflict | P0 |
 | 10-minute idle | No PCM transport | Byte counter = 0 | P0 |
 | **ManyCam/Teams input opened** | **No START sent** | **False-start count = 0** | **P0** |
 | **Kill switch engaged, app requests input** | **No START sent** | **Byte counter = 0** | **P0** |
@@ -602,7 +722,12 @@ Counters exposed in a diagnostics view:
 - Jitter buffer depth, underrun count, drift corrections applied
 - Frames dropped at the send queue
 - Reconnect count, authentication failures
-- Current demand process count
+- **Current demand process count, and the bundle identifier of each process holding BlackHole** —
+  not just the count. The Phase 0 pass found processes that legitimately carry BlackHole without the
+  user thinking of themselves as recording (§5.1), and a bare count of 1 is unattributable while a
+  named `com.apple.Sound-Settings.extension` explains itself.
+- **The Mac's current system input device** — §3.4 recommends it *not* be BlackHole, and a
+  configuration that drifts should be visible rather than inferred from symptoms.
 
 Showing the daily byte total in the menu makes the central privacy guarantee something the user can
 verify at a glance rather than take on trust.
@@ -615,8 +740,11 @@ verify at a glance rather than take on trust.
 Build two throwaway probes: (a) device-scoped demand detection on macOS 26.6.1, verifying that
 `kAudioProcessPropertyDevices` correctly scopes demand to BlackHole for self-introspection, a
 genuinely separate process, and repeat activations — done, and it also forced a correction to §5.1
-(see §13 Q1); the per-application matrix for Dictation, Chrome, ChatGPT, and Zoom/Teams still needs
-the owner; (b) measured WASAPI shared-mode open latency on the actual Windows host — the probe is
+(see §13 Q1). The owner has since run part of the per-application matrix by hand, covering Raycast
+(the primary application), the System Settings Sound extension and Safari/WebKit; that pass produced
+§3.4's device configuration, §5.1's measured false-positive analysis, and the requalification of the
+`IsRunningInput` finding. Dictation, Chrome/Chromium, ChatGPT desktop and Zoom/Teams remain
+untested. (b) measured WASAPI shared-mode open latency on the actual Windows host — the probe is
 written but has never been compiled or run on Windows hardware (see §13 Q2). One of the two major
 risks is retired before real code is written; the other awaits the owner running the Windows probe.
 
@@ -651,15 +779,31 @@ Resolved by Phase 0 probes:
    leg, so a coarse "system default" signal would have made that leg fail by reporting BlackHole
    anyway; it didn't, which is independent evidence the property is genuinely per-stream-scoped. The
    same probe found that `kAudioProcessPropertyIsRunningInput` must **not** be part of the gate —
-   see §5.1 for the correction this forced in the design itself.
+   see §5.1 for the correction this forced in the design itself, and for the requalification the
+   owner's later real-application pass forced on the *explanation* of that correction.
 
-   **Still open, and not to be treated as settled:** whether the specific target applications —
-   macOS Dictation, ChatGPT, Chrome, Zoom, Teams — go through Core Audio in a way that populates
-   `Devices` the same way, including on a **second** recording session per app (now specifically
-   important given the `IsRunningInput` finding), has not been measured. That per-application matrix
-   needs the owner and has not been run; see "Requires the owner" in the findings document. If some
-   application does not report reliably, the force-on hold is the fallback for that application, and
-   the gap is documented rather than worked around.
+   **Answered for the primary application.** The owner has since observed three real processes with
+   `--watch`. **Raycast** — the owner's primary use case — was detected on each of 4+ activations of
+   one long-lived process, cleared on every release with no lingering, and was seen targeting
+   BlackHole explicitly while the system default input was a different device, which is what §3.4
+   rests on. `com.apple.Sound-Settings.extension` and `com.apple.WebKit.GPU` were also observed, and
+   produced §5.1's measured false-positive analysis. In every row observed, the `Devices` predicate
+   was correct.
+
+   **Still open, and not to be treated as settled:**
+   - **macOS Dictation, Chrome/Chromium, the ChatGPT desktop app, Zoom and Teams have not been
+     tested at all**, on a first session or a repeat one. Dictation in particular is a *secondary*
+     case for this project, not the marquee one, and nothing measured says how it behaves.
+   - Whether `com.apple.WebKit.GPU` retains **BlackHole** in its idle input-device list when
+     BlackHole is the system default input. It was observed retaining the default (OWC) in that
+     state, but not with BlackHole as the default — the configuration this spec originally assumed.
+   - Appear and clear latencies for any real application; the owner's pass recorded state, not
+     timing.
+   - Everything above is a single machine, one sitting per application, with no reboot.
+
+   If some application does not report reliably, the force-on hold is the fallback for that
+   application, and the gap is documented rather than worked around. See "Requires the owner" in the
+   findings document for the exact steps and the remaining matrix.
 
 2. **What is the real WASAPI shared-mode open latency on this Windows host, cold and warm?**
    **Still open.** The probe (`probes/windows-wasapi-latency/`) is written but has **never been
@@ -672,8 +816,10 @@ Resolved by Phase 0 probes:
 
 Resolved by Phase 2 measurement:
 
-3. Does macOS Dictation open its input stream far enough ahead of speech to avoid first-syllable
-   clipping at the measured activation latency?
+3. Does the primary application (Raycast) open its input stream far enough ahead of speech to avoid
+   first-syllable clipping at the measured activation latency? The same question applies to macOS
+   Dictation as a secondary case, and neither has been measured — the Phase 0 pass recorded demand
+   state, not timing.
 4. Is TCP over the actual Wi-Fi network stable enough, or does retransmission stall latency badly
    enough to justify a DTLS/UDP audio path later?
 
@@ -693,7 +839,7 @@ and virtual-device strategy are unaffected either way, which is why it can safel
 | Two TCP connections | Closed audio socket is a structural guarantee | Two handshakes, two auth and reconnect paths; handshake on the activation path | Rejected in favor of one multiplexed TLS channel |
 | DTLS/UDP audio | Best jitter behavior | Materially more code; unproven need | Deferred pending Phase 2 measurement |
 | Custom "Shared Mic" driver | Exact device lifecycle | Signing, install, real-time debugging burden | Dropped — device-scoped detection provides the same signal |
-| **One TLS channel + BlackHole + device-scoped demand** | Fast to build; no driver; no false positives; lowest activation latency | Idle guarantee is a code property, verified by counter rather than by a closed socket | **Selected** |
+| **One TLS channel + BlackHole + device-scoped demand** | Fast to build; no driver; false positives scoped to processes that carry BlackHole specifically, and the two observed shapes are avoided by the §3.4 configuration; lowest activation latency | Idle guarantee is a code property, verified by counter rather than by a closed socket; false positives are reduced, not eliminated (§5.1) | **Selected** |
 
 ---
 
