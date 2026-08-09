@@ -235,11 +235,17 @@ process list (§6.3), so the fallback must target the specific process rather th
 earlier version of this section (and the draft before it) required `IsRunningInput` as a second,
 mandatory conjunct alongside `Devices`. Task 10's macOS probe
 (`docs/superpowers/probes/2026-08-08-macos-demand-findings.md`), run on the actual target Mac
-(macOS 26.6.1), found that `IsRunningInput` does **not** reliably re-trigger past a process's
-*first* input activation: on a process's second and later activations, it read `false` at the exact
-instant `Devices` membership was independently confirmed `true` — reproducibly, on every
-second-and-later activation tested, self-introspectively, for a genuinely separate helper process,
-and via both the full-sweep and targeted-lookup paths.
+(macOS 26.6.1), found that `IsRunningInput` does **not** reliably re-trigger when a process
+re-activates a device it has already used for input: it read `false` at the exact instant `Devices`
+membership was independently confirmed `true` in both of the committed self-test's repeat-activation
+cases — self-introspectively, re-opening BlackHole a second time (leg 1's targeted cycle), and for a
+genuinely separate helper process re-opening BlackHole after closing it (leg 4's cycle 2) — via the
+targeted-lookup and full-sweep paths respectively. It is not simply a function of activation count:
+leg 2 self-introspectively opens a *different* device (the negative-control device), which is,
+counting purely by activation number, the same process's third activation, and `IsRunningInput`
+read `true` there, agreeing with `Devices` membership. The failure mode the probe establishes is
+specific to re-activating a device the process has already used, not "any second-and-later
+activation."
 
 **That instant is the whole of what the committed probe establishes, and it is enough.** The probe
 polls at 10 ms intervals but records `IsRunningInput` only at the single instant device-list
@@ -255,8 +261,9 @@ helper fork/exec and `AudioUnit` setup, most of which elapses before the helper 
 None of that weakens the design conclusion, because the conclusion does not depend on the stronger
 claim. A gate of the form `IsRunningInput AND Devices` is evaluated at the moment demand is
 detected, and the moment demand is detected is exactly the instant the probe measures — the instant
-at which the two properties were found to disagree, every time, on every path tested. Gating on
-device-list membership alone is therefore well-evidenced by the committed probe on its own terms.
+at which the two properties were found to disagree in both of the committed probe's
+repeat-activation cases. Gating on device-list membership alone is therefore well-evidenced by the
+committed probe on its own terms.
 
 `Devices` membership and the general, non-input-scoped `kAudioProcessPropertyIsRunning`
 both re-triggered correctly on every activation tested. Since real applications (Dictation, a
@@ -276,7 +283,11 @@ for its whole session and call start/stop on that same instance repeatedly. The 
 behavior may therefore be HAL-client re-registration scoped to a *new instance*, not a genuine
 process-level "Nth activation" property — in which case real long-lived apps might re-trigger
 `IsRunningInput` correctly every time, and it would be salvageable after all. This distinction was
-not tested. **The first thing Phase 3 should check, before relying on or ruling out
+not tested: leg 2's agreement (above) is consistent with the hypothesis but does not confirm it,
+because every activation in this probe opens a brand-new instance, so a new device and a new
+instance are the same event here — leg 2 cannot distinguish "a new instance re-triggers the flag"
+from "a device this process has not yet used re-triggers the flag" as the operative factor. **The
+first thing Phase 3 should check, before relying on or ruling out
 `IsRunningInput` for anything, is the measurement the probe specifies but did not run: build one
 `AudioUnit` instance, call `AudioOutputUnitStart`/`AudioOutputUnitStop` on that same instance twice
 with no dispose-and-recreate in between, and observe whether `IsRunningInput` re-triggers `true` on

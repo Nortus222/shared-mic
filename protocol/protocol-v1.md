@@ -220,10 +220,20 @@ byte-for-byte wrong) output. Verify this against `protocol/vectors/audio-frames.
 trusting a capture or render path — a reversed-endianness bug in PCM sounds like heavy static, not
 like a crash.
 
-**[VERIFIED]** — `test_audio.py::test_frame_is_little_endian_signed_16_bit` asserts the sample byte
-order directly, and `test_audio.py::test_constants_match_spec` pins every row of the format table
-above. The envelope-level consequence is byte-matched by
-`test_vectors.py::test_audio_vectors_encode_to_expected_bytes`.
+**[VERIFIED]** that the reference *generator* emits little-endian PCM —
+`test_audio.py::test_frames_are_phase_continuous` is the test that would actually fail under a
+byte-swapped generator, since a byte-swapped wave is discontinuous at the frame boundary;
+`test_frame_is_little_endian_signed_16_bit` unpacks with a little-endian format string but only
+asserts sample count and range, both of which hold for any byte order, so it does not pin
+endianness by itself despite its name. `test_audio.py::test_constants_match_spec` pins sample
+rate, frame samples, frame bytes, frames per second, and frame duration;
+`test_control.py::test_canonical_audio_format_matches_spec` pins the remaining two rows of the
+format table above, `channels` and `sampleFormat`. The envelope-level consequence is byte-matched
+by `test_vectors.py::test_audio_vectors_encode_to_expected_bytes`.
+**[CARRIED]** that a *receiving* implementation is held to little-endian PCM — nothing in the
+harness inspects a peer's byte order; the golden vectors pin `encode_audio_payload`'s framing of
+PCM bytes supplied to it, not that a receiver validates the endianness of PCM bytes it did not
+generate itself.
 
 `captureTimestampUs` is relative to session start (the first frame of a session is timestamp `0`,
 and each subsequent frame's timestamp increases by `20000`, i.e. 20 ms in microseconds, matching
