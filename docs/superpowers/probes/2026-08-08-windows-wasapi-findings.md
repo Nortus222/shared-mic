@@ -59,13 +59,16 @@ As printed by the probe (sample rate / bit depth / channels / encoding):
 
 ## Latency results
 
-Attempted/succeeded/timed out/failed counts and the cold/min/p50/p95/max
-table, exactly as printed by the probe's summary:
+Attempted/succeeded/conflicts/timed out/failed counts and the
+cold/min/p50/p95/max table, exactly as printed by the probe's summary.
+Note: `conflicts` (not `failed`) is the shared-mode-conflict signal --
+see "Concurrent-access check" below.
 
 | metric | value |
 |---|---|
 | attempted | **[NOT MEASURED]** |
 | succeeded | **[NOT MEASURED]** |
+| conflicts | **[NOT MEASURED]** |
 | timed out | **[NOT MEASURED]** |
 | failed | **[NOT MEASURED]** |
 | cold (run 1) | **[NOT MEASURED]** |
@@ -83,13 +86,30 @@ Full, unedited console output of the run (paste verbatim once available):
 ## Concurrent-access check (shared mode)
 
 Whether the probe still opened successfully while another Windows
-application (e.g. Voice Typing, Win+H) held the same microphone:
+application (e.g. Voice Typing, Win+H) held the same microphone.
+
+**Read this before filling in "Result" below.** A genuine WASAPI
+shared-mode conflict cannot produce a `FAILED` line in this probe --
+NAudio runs the actual device-open call on a background thread inside
+its own try/catch and reports a failure through `RecordingStopped`, not
+by throwing back through this probe's own code. The real signal is the
+probe's `conflicts` count / `CONFLICT` lines, and/or unexplained
+`TIMED OUT` runs that only appear while the other app holds the device.
+`FAILED`/`failed` in this probe means something unrelated went wrong
+(e.g. the device disappeared between enumeration and open), not a
+shared-mode conflict. See `probes/windows-wasapi-latency/README.md`
+("Running the concurrency check" section) for the full explanation.
 
 - Other application used to hold the device: **[NOT MEASURED]**
-- Result (pass: every run still opened / fail: some or all runs
-  failed): **[NOT MEASURED]**
-- If any run failed while the device was held, paste the exact error
-  here and treat this as an escalation, not something to work around:
+- Baseline run's `conflicts`/`timed out`/`failed` counts (device not
+  held by anything else): **[NOT MEASURED]**
+- Concurrency run's `conflicts`/`timed out`/`failed` counts (device held
+  by the other app): **[NOT MEASURED]**
+- Result (pass: concurrency run's counts match the baseline, `conflicts`
+  stayed 0 / fail: `conflicts` > 0 or new `TIMED OUT`/`CONFLICT` activity
+  appeared only while the device was held): **[NOT MEASURED]**
+- If any `CONFLICT` line appeared, paste its exact text here and treat
+  this as an escalation, not something to work around:
   **[NOT MEASURED]**
 
 ## What this proves

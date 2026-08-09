@@ -116,14 +116,33 @@ application to use the microphone at the same time?
    ```
 4. **Expected:** every run still opens and reports a latency, same as the
    baseline. This confirms shared mode allows simultaneous access.
-5. **If any/every run instead prints `FAILED` while Voice Typing holds
-   the device:** stop and escalate immediately. That means shared mode
-   is not actually granting concurrent access on this hardware/driver,
-   which invalidates a functional goal of the whole project and must not
-   be worked around silently (e.g. by switching to exclusive mode, or by
-   adding retry/wait logic to paper over it).
-6. Record the result (which apps were tested, whether every run
-   succeeded or any failed and how) in the findings doc.
+5. **Watch for `CONFLICT` lines and the `conflicts` count in the
+   summary -- that is the real signal, not the word `FAILED`.** A genuine
+   WASAPI shared-mode conflict does not throw synchronously back through
+   this probe's own code, so it can never produce a `FAILED` line. NAudio
+   runs the actual device-open call (`IAudioClient.Initialize`) on a
+   background thread inside its own try/catch, and reports a failure
+   there through the `RecordingStopped` event instead. Concretely, a real
+   conflict looks like one of:
+   - `run N: CONFLICT - capture stopped before any data arrived: <message>`
+     printed for that run, and/or
+   - `run N: TIMED OUT after 5000 ms` with no data ever arriving, if
+     `RecordingStopped` is slow to fire relative to the timeout.
+
+   If you see either of these **while Voice Typing (or the other app) is
+   actively holding the device**, and you do *not* see them in the
+   baseline run from step 1: stop and escalate immediately. That means
+   shared mode is not actually granting concurrent access on this
+   hardware/driver, which invalidates a functional goal of the whole
+   project and must not be worked around silently (e.g. by switching to
+   exclusive mode, or by adding retry/wait logic to paper over it).
+   `FAILED`/`errorCount` in this probe only ever means something else
+   went wrong before the device-open call itself (e.g. the device
+   disappeared between enumeration and open) -- it is not the
+   shared-mode-conflict signal.
+6. Record the result (which apps were tested, the `succeeded` /
+   `conflicts` / `timed out` / `failed` counts from the summary, and
+   the exact text of any `CONFLICT` lines) in the findings doc.
 
 ## What to send back
 
@@ -143,10 +162,14 @@ needs -- fill these into
 - The .NET target framework actually used to build (net10.0-windows
   unless you retargeted -- see above).
 - The full cold/min/p50/p95/max table from the summary, plus
-  attempted/succeeded/timed out/failed counts.
-- The concurrency check result: pass (every run still opened while
-  Voice Typing/another app held the device) or fail (some/all runs
-  failed), and which other application you used to hold the device.
+  attempted/succeeded/conflicts/timed out/failed counts.
+- The concurrency check result: pass (every run still opened and reported
+  a latency while Voice Typing/another app held the device, `conflicts`
+  stayed 0) or fail (`conflicts` > 0, and/or `CONFLICT` lines or
+  unexplained `TIMED OUT` runs appeared, while the other app held the
+  device but not in the baseline run) -- and which other application you
+  used to hold the device. Note that a real conflict shows up as
+  `CONFLICT`/`conflicts` (or a `TIMED OUT` run), not as `FAILED`.
 - Anything that looked wrong or surprising, even if you're not sure it
   matters -- this feeds a design budget, so overreporting is better than
   underreporting.

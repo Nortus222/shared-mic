@@ -87,6 +87,7 @@ var results = new List<double>();
 double? coldMs = null;
 var timeoutCount = 0;
 var errorCount = 0;
+var conflictCount = 0;
 
 for (var run = 0; run < iterations; run++)
 {
@@ -117,6 +118,7 @@ for (var run = 0; run < iterations; run++)
     var firstData = new TaskCompletionSource<double>(TaskCreationOptions.RunContinuationsAsynchronously);
     var stopped = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
     var stopwatch = Stopwatch.StartNew();
+    string? conflictMessage = null;
 
     WasapiCapture? capture = null;
     try
@@ -141,22 +143,31 @@ for (var run = 0; run < iterations; run++)
         };
         capture.RecordingStopped += (_, e) =>
         {
+            // WasapiCapture's background capture thread runs the real
+            // IAudioClient.Initialize() call, wrapped in its own
+            // try/catch -- an Initialize-time failure (the realistic
+            // shape of a shared-mode conflict: another app already holds
+            // the device) is reported here, as a non-null Exception, NOT
+            // thrown back through StartRecording(). That is why the
+            // conflict signal is captured here rather than in the outer
+            // try/catch below. Do not print from this handler: it can
+            // fire after this iteration has moved on (bounded-awaited,
+            // not guaranteed), which would interleave with the next
+            // iteration's output. The message is stashed and printed
+            // deterministically below instead, at the point this
+            // iteration actually observes it.
             if (e.Exception != null)
             {
-                Console.WriteLine($"  run {runNumber,2}: RecordingStopped with error: {e.Exception.Message}");
+                conflictMessage = e.Exception.Message;
             }
             stopped.TrySetResult(true);
         };
 
         capture.StartRecording();
 
-        var gotData = await Task.WhenAny(firstData.Task, Task.Delay(5000)) == firstData.Task;
-        if (!gotData)
-        {
-            Console.WriteLine($"  run {runNumber,2}: TIMED OUT after 5000 ms");
-            timeoutCount++;
-        }
-        else
+        var winner = await Task.WhenAny(firstData.Task, stopped.Task, Task.Delay(5000));
+
+        if (winner == firstData.Task)
         {
             var elapsed = await firstData.Task;
             results.Add(elapsed);
@@ -166,29 +177,53 @@ for (var run = 0; run < iterations; run++)
             }
 
             Console.WriteLine($"  run {runNumber,2}: {elapsed,7:F1} ms{(runNumber == 1 ? "   <- cold" : "")}");
+
+            capture.StopRecording();
+
+            // Wait (bounded) for the capture thread to actually finish
+            // before disposing. Disposing a WasapiCapture while its
+            // background capture thread is still calling into the COM
+            // AudioClient/CaptureClient is a real race -- it can throw
+            // during Dispose, or leave the device endpoint in a state
+            // where the *next* iteration's fresh open fails or hangs. The
+            // bound keeps a stuck stop from hanging the whole probe; if it
+            // doesn't fire in time, Dispose() below still runs, which is
+            // best-effort but no worse than an unbounded wait.
+            await Task.WhenAny(stopped.Task, Task.Delay(2000));
         }
+        else if (winner == stopped.Task)
+        {
+            // The capture stopped on its own -- before we ever called
+            // StopRecording() and before any DataAvailable callback
+            // fired. THIS, not a `FAILED` line from the outer try/catch,
+            // is the real signal for a WASAPI shared-mode conflict (e.g.
+            // another application already holding the device). See the
+            // README's concurrency section: this is what to watch for
+            // while Voice Typing or another app holds the microphone.
+            var detail = conflictMessage ?? "(RecordingStopped fired with no exception attached)";
+            Console.WriteLine($"  run {runNumber,2}: CONFLICT - capture stopped before any data arrived: {detail}");
+            conflictCount++;
+        }
+        else
+        {
+            Console.WriteLine($"  run {runNumber,2}: TIMED OUT after 5000 ms");
+            timeoutCount++;
 
-        capture.StopRecording();
-
-        // Wait (bounded) for the capture thread to actually finish before
-        // disposing. Disposing a WasapiCapture while its background
-        // capture thread is still calling into the COM AudioClient /
-        // CaptureClient is a real race -- it can throw during Dispose, or
-        // leave the device endpoint in a state where the *next*
-        // iteration's fresh open fails or hangs. The bound keeps a stuck
-        // stop from hanging the whole probe; if it doesn't fire in time,
-        // Dispose() below still runs, which is best-effort but no worse
-        // than the original code's immediate dispose.
-        await Task.WhenAny(stopped.Task, Task.Delay(2000));
+            capture.StopRecording();
+            await Task.WhenAny(stopped.Task, Task.Delay(2000));
+        }
     }
     catch (Exception ex)
     {
-        // Do not let one bad iteration take down the whole run. A shared
-        // -mode open failure while another app holds the device (the
-        // concurrency check in README.md) is itself an important,
-        // reportable result -- it must show up in this output as a clear
-        // per-run failure, not as an unhandled crash that loses every
-        // measurement collected so far.
+        // This only catches *synchronous* failures -- e.g. GetDevice() or
+        // the AudioClient activation inside the WasapiCapture constructor
+        // throwing directly on this thread. It does NOT catch a WASAPI
+        // Initialize-time conflict; that is the realistic shape a
+        // shared-mode conflict takes, and it is handled above as CONFLICT
+        // / conflictCount instead, because NAudio reports it via
+        // RecordingStopped on the background capture thread rather than
+        // throwing it back through StartRecording(). Do not treat this
+        // FAILED path as the shared-mode-conflict signal; see README.
         Console.WriteLine($"  run {runNumber,2}: FAILED - {ex.GetType().Name}: {ex.Message}");
         errorCount++;
     }
@@ -212,19 +247,34 @@ for (var run = 0; run < iterations; run++)
     await Task.Delay(500);
 }
 
+// Print the attempt breakdown unconditionally, before the results.Count
+// == 0 early-out below. If every run conflicts (e.g. shared mode
+// genuinely failing to co-open while another app holds the device -- the
+// actual failure shape the concurrency check is looking for), succeeded
+// would be 0 and the summary would otherwise never print, hiding exactly
+// the information that matters most for that check.
+Console.WriteLine($"\n  attempted : {iterations}");
+Console.WriteLine($"  succeeded : {results.Count}");
+Console.WriteLine($"  conflicts : {conflictCount}   (capture stopped before any data arrived -- this," +
+                   " not a `failed` line, is the shared-mode-conflict signal; see README)");
+Console.WriteLine($"  timed out : {timeoutCount}");
+Console.WriteLine($"  failed    : {errorCount}");
+
 if (results.Count == 0)
 {
-    Console.Error.WriteLine("\nNo successful measurements.");
+    Console.Error.WriteLine("\nNo successful measurements -- no latency percentiles to report.");
+    if (conflictCount > 0)
+    {
+        Console.Error.WriteLine($"{conflictCount} run(s) reported CONFLICT. If another application was " +
+                                 "holding the device, this is the escalation signal described in the README " +
+                                 "-- shared mode may not be granting concurrent access on this hardware.");
+    }
     return 1;
 }
 
 var sorted = results.OrderBy(x => x).ToList();
 double Percentile(double p) => sorted[Math.Min(sorted.Count - 1, (int)Math.Ceiling(p / 100.0 * sorted.Count) - 1)];
 
-Console.WriteLine($"\n  attempted : {iterations}");
-Console.WriteLine($"  succeeded : {results.Count}");
-Console.WriteLine($"  timed out : {timeoutCount}");
-Console.WriteLine($"  failed    : {errorCount}");
 Console.WriteLine(coldMs.HasValue
     ? $"  cold      : {coldMs.Value,7:F1} ms"
     : "  cold      : N/A (run 1 did not succeed -- see \"run  1\" line above)");
