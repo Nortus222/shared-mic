@@ -67,6 +67,19 @@ versioned independently of both.
   interfaces only and is never exposed to the public Internet. **[CARRIED]** — the harness always
   binds an OS-assigned ephemeral port (`port=0`) for test isolation and never exercises the fixed
   default; a real Windows implementation must still default to 47800.
+- **"Private interfaces" is a concrete address set, not a judgement call.** An interface qualifies
+  if the address being bound is in one of: IPv4 RFC 1918 (`10.0.0.0/8`, `172.16.0.0/12`,
+  `192.168.0.0/16`), IPv4 loopback (`127.0.0.0/8`), IPv4 link-local (`169.254.0.0/16`), IPv6
+  loopback (`::1/128`), IPv6 link-local (`fe80::/10`), or IPv6 unique-local (`fc00::/7`). Every
+  other address — a globally routable IPv4 or IPv6 address, or a carrier-grade NAT address
+  (`100.64.0.0/10`) — MUST NOT be bound. **Binding a wildcard address (`0.0.0.0` or `::`) does not
+  satisfy this rule**, because a wildcard bind covers every interface including public ones; an
+  implementation MUST enumerate the host's interfaces and bind the qualifying addresses
+  individually. This set is stated because "private" otherwise resolves differently in two
+  implementations, and the side that resolves it more loosely is the one that exposes the listener.
+  **[CARRIED]** — `MockWindowsServer` binds `127.0.0.1` by default, which is inside the set but
+  exercises none of the rest of it; nothing in the harness enumerates interfaces or rejects a
+  public address.
 - **TLS 1.3** wraps the connection immediately after the TCP handshake. Windows is the TLS server
   (it holds the certificate and private key generated at first run); macOS is the TLS client.
   **[VERIFIED]** — `test_tls.py::test_session_works_over_tls_with_matching_pin`,
@@ -88,6 +101,34 @@ versioned independently of both.
   reach).
 - Everything after the TLS handshake — every byte described in §3 onward — flows inside the
   encrypted TLS stream. Nothing in this protocol is ever sent in the clear.
+
+**Implementation note (macOS / `Network.framework`): a rejected pin does not surface as an error,
+and the default behavior is to retry forever.** This is the one place where an implementer can
+believe they have built the hard stop above and have in fact built an indefinite retry loop against
+a peer that may be an attacker. When the `sec_protocol_options_set_verify_block` callback answers
+`false`, `NWConnection` does **not** transition to `.failed`. It transitions to
+**`.waiting(-9808: "bad certificate format")`** and keeps retrying on its own schedule, with no
+further call into the verify block and no terminal event. Two consequences are normative for a
+macOS implementation:
+
+- **A connection state that merely *waits* MUST be treated as terminal for a pin failure.** After
+  the verify block has refused a certificate, the implementation MUST cancel the connection on the
+  first `.waiting` it observes rather than letting `Network.framework` retry. Waiting for `.failed`
+  is waiting for an event that never arrives, and the retry loop it leaves running is exactly the
+  automatic recovery the bullet above forbids.
+- **The refusal reason MUST be recorded out of band, because the transport will not carry it.**
+  `-9808` (`errSSLBadCert`) says nothing about pinning — the same code covers unrelated certificate
+  problems — so the reason the verify block said no MUST be stored by the verify block itself (for
+  example in a lock-protected property on the transport, read by the `.waiting` handler) rather
+  than reconstructed from the `NWError`. An implementation that infers "pin mismatch" from `-9808`
+  will misreport unrelated certificate failures as attacks and vice versa.
+
+`URLSession` and other stacks surface a rejected trust evaluation differently; the requirement that
+a pin failure is terminal and explicable applies to all of them, and this note names the API and
+the error code because on `Network.framework` specifically the failure is silent.
+**[CARRIED]** — the Python harness's client is a `ssl`-module socket client that raises
+`FingerprintMismatch` synchronously out of `connect()`, so nothing here is or can be exercised by
+`test_tls.py`; this note describes a platform behavior the harness has no way to model.
 
 ---
 
@@ -192,6 +233,16 @@ byte-matches complete 1,937-byte envelopes.
 `decode_audio_payload` accepts any payload of at least 12 bytes (only
 `test_audio_payload_rejects_short_header` is exercised, i.e. shorter than the header itself) and
 returns whatever PCM follows. A Phase 1 receiver must be stricter than the harness here.
+
+**Coverage gap — the mock will pass a receiver that is wrong about this.** The harness is the
+conformance oracle for both platforms, and on this specific rule it is a lax one: because
+`decode_audio_payload` accepts any payload of 12 bytes or more, a receiver that also accepts a
+1,000-byte or a 5,000-byte `AUDIO` payload will exchange audio with the mock indefinitely and never
+fail a test. Nothing on the Python side will tell an implementer that their receiver is too
+permissive. **Test the exact-1,932-byte check locally**, with a unit test that feeds the decoder a
+short payload, an over-long payload, and an exactly-1,932-byte payload and asserts the first two
+are rejected as protocol violations (§3: close the connection) and only the third is accepted. Do
+not treat a green run against the harness as evidence on this point.
 
 Audio format, fixed for protocol version 1 — no negotiation of any of these values is possible; a
 peer that cannot honor them must reject the session (`START_NACK`, §7) rather than send nonconforming
@@ -357,7 +408,20 @@ Required fields: `requestId` (string, matches the triggering `START`), `reason` 
 Direction: Mac → Windows. Ends the active audio session.
 
 Required fields: `requestId` (string, echoed in `STOP_ACK`), `sessionId` (string — the session
-being stopped; see §7 for what to send when no session is active).
+being stopped).
+
+`sessionId` is required in the sense that the field MUST be present; it is not required to be
+non-empty. **A client that holds no session identifier — it never started one, or a previous `STOP`
+already ended it, or it reconnected and does not know whether its earlier `START` landed — MUST
+send `sessionId` as the empty string `""`.** The empty string satisfies "present"; omitting the
+field entirely is a missing required field and therefore a protocol violation (§5, above). This is
+the only case where the empty string is a legal `sessionId`, and it exists so that the idle `STOP`
+that §7 requires to succeed has a well-defined encoding rather than each implementation inventing
+one. **[VERIFIED]** that the empty string is accepted: `MockMacClient.stop_session()` sends
+`self._session_id or ""`, so `test_loopback.py::test_stop_without_start_succeeds` puts a
+`STOP` carrying `"sessionId": ""` on a live connection and requires a `STOP_ACK` back — a server
+that rejected the empty string would fail that test. **[CARRIED]** that a client MUST choose the
+empty string rather than some other filler; nothing forces that choice from the far end.
 
 ```json
 {"v":1,"type":"STOP","requestId":"req-0003","sessionId":"sess-0001"}
@@ -369,6 +433,23 @@ Direction: Windows → Mac. Confirms the session has ended and audio has stopped
 
 Required fields: `requestId` (string, matches the triggering `STOP`), `sessionId` (string — the
 session that was ended).
+
+**When no session was active, "the session that was ended" has no referent, so the server echoes
+the request.** The rule is: if a session was active, `STOP_ACK.sessionId` is that session's
+identifier — which may differ from the `sessionId` the client sent, since §7 does not reject a
+`STOP` on `sessionId` mismatch. If no session was active, `STOP_ACK.sessionId` MUST be the
+`sessionId` field of the `STOP` being answered, echoed verbatim, which is the empty string `""` for
+a client that held no session. The server never synthesizes an identifier and never omits the
+field. A client MUST NOT treat a `STOP_ACK` as unmatched because its `sessionId` differs from the
+one it sent — `requestId` is what matches a reply to its request.
+
+**[CARRIED]** — this is what the reference does (`MockWindowsServer._handle`'s `STOP` branch sends
+`"sessionId": ended or msg["sessionId"]`: the ended session if there was one, the request's value
+otherwise), and `test_loopback.py::test_duplicate_stop_succeeds` and `test_stop_without_start_succeeds`
+both drive the no-session path — but neither reads the returned `sessionId`. `MockMacClient.stop_session()`
+awaits a `STOP_ACK` and never compares its `sessionId` to anything, so a server that returned a
+synthesized identifier here would pass the whole suite. The contract matches the reference's code,
+not a test.
 
 ```json
 {"v":1,"type":"STOP_ACK","requestId":"req-0003","sessionId":"sess-0001"}
@@ -427,6 +508,33 @@ not equal the one it sent; a server echoing a constant or an incremented `seq` f
 Exercised for one exchange (`seq = 1`) only — no test sends several `PING`s and checks each `PONG`
 is matched to the right one.
 
+### A well-formed control message arriving in the wrong direction
+
+The `Direction:` line on each type above is a statement about which peer sends it, not a
+validation rule the receiver enforces. **A control message that is well-formed for its type — the
+`"v"` is `1`, the `"type"` is one of the eleven, every required field for that type is present —
+but that arrives in the direction opposite to the one listed, and after authentication has
+completed, MUST be ignored silently.** The receiver does not reply to it, does not treat it as a
+protocol violation, and MUST NOT close the connection. Examples: a `GREETING` or a `START_ACK`
+reaching Windows from the Mac; a `START` or a `HELLO` reaching the Mac from Windows.
+
+This is deliberately more forgiving than the rest of the document, and the reason is that a
+disagreement here costs a working connection over a message that changes nothing. Two rules
+nearby are unaffected and still close the connection: a message whose `"type"` is not one of the
+eleven, or that is missing a required field, or whose `"v"` is not `1`, is a protocol violation
+(§1, §5, §3); and an `AUDIO` frame from the Mac is a protocol violation at any point in the
+connection's lifetime (§6). Pre-authentication is also unaffected — before a verified `HELLO`,
+anything that is not `HELLO` closes the connection (§6). This rule governs only the
+post-authentication, well-formed, wrong-direction case.
+
+**[CARRIED]** — the reference implements exactly this on both sides, but no test drives it.
+`MockWindowsServer._handle` is an `if`/`elif` chain over `PING`/`START`/`STOP` with no `else`, so
+any other well-formed type falls through and is dropped. `MockMacClient._reader_loop` routes
+`STATUS` to its own queue and everything else to `_control_in`, where `_await()` discards any
+message that is not the reply it is waiting for. Neither side counts or reports the message; an
+implementation that logs and counts it instead is conformant and is the better choice for
+diagnosability.
+
 ---
 
 ## 6. Handshake
@@ -472,6 +580,25 @@ separately exercised. `AUDIO` is structurally different and stricter: any frame 
 violation at any point in the connection's lifetime). That broader rule is not exercised by any
 current test either.
 
+**A second Mac connecting while one is already authenticated.** There is one microphone, so there
+is at most one meaningful session, and the contract resolves the collision rather than leaving it
+to whichever implementation gets there first: **a Windows agent MUST serve at most one
+authenticated Mac at a time, and a newly authenticated connection supersedes the older one** —
+Windows ends the older connection's session (stopping capture), closes it, and the new connection
+becomes the live one. Supersession happens only *after* the new connection's `HELLO` verifies, so an
+unauthenticated peer — including one that opens a connection and sends nothing until the 5-second
+deadline — can never displace a live session. Windows still accepts and TLS-handshakes concurrent
+inbound connections; what it does not do is run two authenticated peers at once.
+
+**[CARRIED], and the reference does something different — do not take the harness's behavior as
+the contract here.** `MockWindowsServer` calls `listen(4)` and spawns an independent
+`_ServerSession` thread per accepted connection, each with its own `_session_id` and its own audio
+loop, and never supersedes: two authenticated clients would both get `START_ACK`s and both receive
+audio. That is a test-double property — the harness needs concurrent connections for test
+isolation and has no physical microphone to contend over — not a statement about the protocol. No
+harness test drives two authenticated clients at once, and none would fail an implementation that
+supersedes.
+
 ---
 
 ## 7. Session lifecycle
@@ -489,6 +616,14 @@ current test either.
   string or a stale value from a previous session — Windows does not reject `STOP` on `sessionId`
   mismatch; `STOP` always means "make sure no session is active" for the current connection, not
   "end specifically this session ID".
+
+  This is not in tension with §5 listing `sessionId` as a required field on `STOP` and `STOP_ACK`.
+  Required means **present**, not non-empty. A client holding no session identifier sends
+  `"sessionId": ""` — omitting the field is still a protocol violation — and Windows answers a
+  `STOP` that ended nothing with `STOP_ACK` carrying the request's `sessionId` echoed verbatim
+  (so `""` for that client). If a session *was* active, `STOP_ACK` carries the identifier of the
+  session that actually ended, which need not equal the one the client sent. §5's `STOP` and
+  `STOP_ACK` entries state the same rule from the field's side.
 
 **[VERIFIED]** — `test_loopback.py::test_duplicate_start_is_idempotent` sends a second `START` with
 no intervening `STOP` and asserts both `START_ACK`s carry the *same* `sessionId` and that
@@ -549,9 +684,26 @@ zero audio — is asserted without tolerance.
 |---|---|---|---|---|
 | `START` response | 2 s | Mac, per outstanding `START` | Treat as a failed/dead peer — do not wait indefinitely for `START_ACK`/`START_NACK` | **[CARRIED]** |
 | `STOP` response | 1 s | Mac, per outstanding `STOP` | Treat the session as ended locally regardless; do not block shutdown on a `STOP_ACK` that may never arrive | **[CARRIED]** |
-| `PING` interval | 15 s | Mac (sends `PING` to Windows) | Windows replies `PONG` immediately; Windows applies the same 15 s interval and dead-peer rule to *absent* `PING`s from the Mac | **[CARRIED]** |
-| Peer dead | 45 s without a `PONG` (three missed heartbeats) | Both sides, watching the heartbeat | Declare the connection dead; close it and begin reconnect (Mac) or accept a new connection (Windows) | **[CARRIED]** |
+| `PING` interval | 15 s | Mac only — `PING` is Mac → Windows (§5), and Windows never sends one | Windows replies `PONG` immediately | **[CARRIED]** |
+| Peer dead (Mac) | 45 s without a `PONG` (three missed heartbeats) | Mac, watching for replies to the `PING`s it sent | Declare the connection dead; close it and begin reconnect | **[CARRIED]** |
+| Peer dead (Windows) | 45 s of silence — no complete frame of any type received | Windows, watching the connection, not any one message type | Declare the connection dead; close it and accept a new connection | **[CARRIED]** |
 | Pre-auth (`HELLO`) deadline | 5 s | Windows, per new connection | Close the connection; see §6 | **[VERIFIED]** |
+
+**The dead-peer rule is asymmetric, because the heartbeat is.** §5 defines `PING` as Mac → Windows
+only, so "45 s without a `PONG`" has no referent on the Windows side — Windows sends no `PING` and
+therefore has no `PONG` to miss. The two halves are:
+
+- **The Mac** sends `PING` every 15 s and declares the peer dead after 45 s with no `PONG`. Its
+  timer is driven by the heartbeat it owns.
+- **Windows** declares the peer dead after 45 s of *silence*: no complete frame of any type
+  decoded from the connection in that window. The timer resets on every completely decoded frame —
+  a `PING`, a `START`, a `STOP`, anything — not only on the `PING`s the Mac is expected to send.
+  Resetting on a *complete* frame rather than on received bytes is deliberate: a peer dribbling a
+  partial envelope forever must not be able to hold the connection open.
+
+The 45 s value is the same on both sides; only the thing being timed differs. A Windows
+implementation that literally waits for a `PONG` will never fire its timer and will hold dead
+connections open indefinitely.
 
 **[CARRIED]** detail: the harness's `MockMacClient.start_session()`/`stop_session()` accept the 2 s
 / 1 s values as default *parameters* on their reply-wait helper, and `ping()` performs one
@@ -563,6 +715,24 @@ and the mock exists to let both platform agents be built against a peer that beh
 the wire, not to itself be a complete implementation of every timer. **A Phase 1 (or later)
 implementation of this protocol MUST still implement the full heartbeat loop, dead-peer detection,
 and both response timeouts** — their absence from the harness is not license to skip them.
+
+**Coverage gap — every row of this table except the last is invisible to the conformance harness.**
+This is the one section of the document with no `[VERIFIED]` timing behavior at all, and the
+practical consequence is worth stating plainly: **an implementation whose heartbeat interval, 45 s
+dead-peer window, 2 s `START` timeout, or 1 s `STOP` timeout is simply wrong — off by an order of
+magnitude, or absent — will pass the entire harness suite.** The mock answers every `START`,
+`STOP`, and `PING` promptly, so no timeout is ever reached; and no clock or timer loop exists
+anywhere in `server.py` or `client.py` for a wrong value to disagree with. A green run against the
+harness is evidence about bytes on the wire and about session semantics; it is no evidence at all
+about timing.
+
+**Test these locally, with an injected clock.** Each timer belongs in a unit test that drives time
+forward under the implementation's control rather than sleeping — a fake or virtual clock the test
+advances — and asserts the timer fires at the specified value and does not fire before it. Testing
+them by waiting in wall time makes the suite slow enough that the tests get deleted, which is how a
+timer silently reverts to whatever the platform's default was. The §6 pre-auth deadline is the
+model to copy: the harness test for it exists precisely because `MockWindowsServer` accepts an
+injected short `hello_timeout` instead of paying the real 5 seconds.
 
 The heartbeat is deliberately slow (15 s) — it exists to keep connection-alive UI state honest and
 NAT/firewall state fresh, not to detect a dead peer quickly. When it actually matters — a session
@@ -792,16 +962,36 @@ library defaults to:
 | Signature | ECDSA with SHA-256, self-signed (issuer == subject) |
 | Subject | `CN = <common name>` (the reference implementation uses `shared-mic`) |
 | Subject Alternative Name | **Required.** One `dNSName` entry, byte-identical to the subject CN |
-| Validity | 3,650 days (10 years), starting 5 minutes in the past to absorb clock skew |
+| Validity | `notBefore` = 5 minutes before generation (to absorb clock skew); `notAfter` = 3,650 days (10 years) after generation. See the note below — the window is 3,650 days *plus* 5 minutes |
 | Chain | None. There is no CA and no intermediate; the chain is one certificate long |
+
+**On the validity window.** "3,650 days, starting 5 minutes in the past" is ambiguous between two
+readings — a 3,650-day span shifted 5 minutes earlier, and a span of 3,650 days plus 5 minutes —
+and the two differ in where `notAfter` lands. The contract means the second: both endpoints are
+computed from the moment of generation, `notBefore = now - 5 minutes` and
+`notAfter = now + 3650 days`, so the certificate is valid for 3,650 days and 5 minutes in total.
+The 5 minutes exists only to keep a client whose clock is slightly behind the Windows host from
+rejecting a certificate generated moments ago; it is not meant to shorten the 10-year life. A test
+asserting the window should allow slack rather than an exact equality against 3,650 days.
+**[CARRIED]** — `harness/sharedmic_protocol/tls.py` builds exactly this
+(`.not_valid_before(now - timedelta(minutes=5))`, `.not_valid_after(now + timedelta(days=CERT_VALIDITY_DAYS))`),
+but no test reads either field.
 
 **The SAN is not decorative and MUST be present.** The client disables both CA verification and
 hostname verification (§2 — the pin is the check), but several TLS stacks a Swift client is likely
-to use, including Network.framework and `URLSession`, evaluate the certificate *before* handing it
-to a custom trust callback, and some reject a certificate with no SAN at that earlier stage — so a
-SAN-less certificate can fail before the pinning hook ever runs, producing a failure that looks like
-a network error rather than a certificate problem. Emit the SAN even though nothing in this protocol
-matches a hostname against it.
+to use — `URLSession` and `SecTrustEvaluate`-based paths among them — evaluate the certificate
+before handing it to a custom trust callback, and some reject a certificate with no SAN at that
+earlier stage, producing a failure that looks like a network error rather than a certificate
+problem. Emit the SAN even though nothing in this protocol matches a hostname against it.
+
+Be precise about the evidence for that, because this document has been read as claiming more than
+it can support: **on `Network.framework` with a `sec_protocol_options_set_verify_block`, the
+pre-callback evaluation stage does not run, so a SAN-less certificate would not fail there** — the
+risk described above does not materialise on the one path Phase 1 actually verified. The
+requirement stands anyway, and is not weakened: it is load-bearing on the other stacks, an
+implementation may switch stacks, and a certificate that only works under one client's trust
+configuration is a trap for the next one. Emit the SAN. Just do not implement it in the belief that
+`Network.framework` is where it will bite you.
 
 **A macOS implementer must explicitly opt out of both CA and hostname validation.** This does not
 happen by default in any of these stacks and is not something to discover at integration time: the
@@ -826,6 +1016,17 @@ agent MUST refuse further attempts for 30 seconds.** A "failed attempt" is any c
 reaches §6 and does not produce a verified `HELLO` — a wrong `mac`, a malformed or non-`HELLO`
 message, or the 5-second pre-auth deadline expiring. The lockout is counted per Windows agent, not
 per source address; an attacker choosing source ports freely must not be able to reset it.
+
+**The lockout resets the failure count; it does not extend.** Applying the lockout sets the
+consecutive-failure count back to `0`, and connections arriving during the 30-second window are
+refused *without being counted as failures* — so a peer hammering the listener gets a series of
+fixed 30-second lockouts (5 attempts, 30 s, 5 attempts, 30 s, …) rather than one window that grows
+without bound. A single successful authentication also resets the count to `0`; that is what
+"consecutive" means. This is stated because both readings satisfy the `MUST` above and two
+implementations that chose differently would disagree observably — a user who mistypes their
+pairing string five times must get their agent back after 30 seconds, not be locked out for longer
+each time they retry. **[CARRIED]** — see the coverage note below; nothing in the harness
+implements a lockout, so nothing exercises either reading.
 
 Without this, §6 is an unthrottled HMAC verification oracle reachable by anything that can open a
 TCP connection to the listener, and the 256-bit token's strength is doing all the work against an
