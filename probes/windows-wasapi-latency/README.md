@@ -29,10 +29,12 @@ baseline 20/20 opens, 0 conflicts, p50 78.5 ms / p95 93.4 ms / cold
 same microphone, also 20/20 with 0 conflicts. Results are in the findings
 doc; the co-access check **passed** on that combination.
 
-Two values the findings doc still needs were not captured from that run:
-the **exact MMDevice endpoint ID string** and the **device's shared mix
-format**. Both are printed by the probe. If you re-run it, keep the whole
-console output.
+Two values were not captured from that first run: the **exact MMDevice
+endpoint ID string** and the **device's shared mix format**. Both are
+printed by the probe, and both have since been supplied by the owner and
+recorded in the findings doc. Windows version, SDK version, and the
+verbatim console output are still outstanding; if you re-run it, keep
+the whole console output.
 
 Note on building it: a doubled hyphen inside an XML comment is illegal
 and fails the build with `MSB4025`. The committed `.csproj` originally

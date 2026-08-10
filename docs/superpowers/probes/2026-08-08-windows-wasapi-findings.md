@@ -13,12 +13,14 @@
 > honestly: **one microphone, one driver, one Windows machine, one
 > concurrent application, 20 cycles.**
 >
-> **Still outstanding, and only the owner can supply them:** the exact
-> MMDevice endpoint ID string, the device's shared mix format as printed
-> by the probe, the Windows version, the SDK version, and the verbatim
-> console output. See "Requires the owner" at the end. The endpoint ID in
-> particular is load-bearing — Phase 1 persists precisely that string, so
-> it must be copy-pasted, never retyped or approximated.
+> **Still outstanding, and only the owner can supply them:** the Windows
+> version, the SDK version, and the verbatim console output. See
+> "Requires the owner" at the end. The two values that were blocking
+> Phase 1 — the exact MMDevice endpoint ID string and the device's shared
+> mix format — have since been supplied by the owner, measured by the
+> probe on the real Windows host, and are recorded below under "Device
+> identity" and "Shared mix format", along with the design consequences
+> they carry.
 
 **Probe:** `probes/windows-wasapi-latency/WasapiLatencyProbe/` (throwaway;
 see its README)
@@ -58,23 +60,57 @@ was the largest single unknown in the budget.
 ## Device identity
 
 - Exact MMDevice endpoint ID (copy-paste from probe output, do not
-  retype): **[NOT RECORDED -- REQUIRED BEFORE PHASE 1.** Phase 1's
-  `DeviceManager` persists exactly this string (spec §6.1), so an
-  approximation or a retyped GUID is worse than nothing.**]**
-- Device friendly name as printed by the probe: **[NOT RECORDED.** The
-  hardware is a Samson Meteorite Mic; the exact endpoint friendly name
-  string the probe printed was not captured. Note that the design
-  resolves devices by endpoint ID, never by friendly name, so this one is
-  informational rather than load-bearing.**]**
+  retype): **`{0.0.1.00000000}.{dcea823c-c06f-40bf-8f35-9de9fb96acfd}`**.
+  Supplied by the owner, measured by the probe on the real Windows host
+  against the Samson Meteorite Mic. Phase 1's `DeviceManager` persists
+  exactly this string (spec §6.1); it must be reproduced
+  character-for-character, never retyped or approximated.
+- Device friendly name as printed by the probe: **`Microphone (Samson
+  Meteorite Mic)`**. Note that the design resolves devices by endpoint
+  ID, never by friendly name, so this one is informational rather than
+  load-bearing.
 
 ## Shared mix format
 
 As printed by the probe (sample rate / bit depth / channels / encoding):
 
-**[NOT RECORDED -- REQUIRED.** `PcmNormalizer` (spec §6.1) converts from
-this format to 48 kHz / mono / s16le, and whether it must resample and
-whether it must downmix both follow directly from it. Until this is
-recorded, the normalizer's actual workload on this hardware is unknown.**]**
+**48,000 Hz, 32-bit, 2 channels, encoding=Extensible.** Supplied by the
+owner, measured by the probe on the real Windows host against the Samson
+Meteorite Mic. `PcmNormalizer` (spec §6.1) converts from this format to
+48 kHz / mono / s16le; whether it must resample, whether it must convert
+float to int, and whether it must downmix all follow directly from it,
+and all three are now known rather than assumed, on this one microphone
+and this one host:
+
+- **No resampling is needed for this device.** The mix format's sample
+  rate is already 48,000 Hz — exactly the wire format's rate (spec
+  §6.2). §6.1's conditional, resample "only if the mix format is not
+  already 48 kHz," does not fire on this hardware, so `PcmNormalizer`'s
+  common path for this microphone carries no rate-conversion step and no
+  resampling dependency. Scope this narrowly: it is true of the Samson
+  Meteorite on this host. A different microphone could present a
+  different rate, so the conditional logic stays in the design — what
+  changes here is that the common path does not exercise it.
+- **Float-to-int16 conversion is confirmed required, not assumed.**
+  32-bit is what §6.1 already anticipated (float32 to int16); this is
+  now measured on the real device rather than inferred from the API
+  surface.
+- **The stereo-to-mono downmix path is live on every frame, from day
+  one — and which mode is correct is not yet known.** The Samson
+  Meteorite is a mono condenser microphone, but WASAPI presents its
+  shared mix format as 2 channels, so §6.1's channel-mode setting
+  (`mix` default, `left`, `right`) is not a defensive hedge for this
+  hardware; it is load-bearing on every frame this device produces. What
+  is *not* known is which mode is correct: whether the two channels
+  carry identical (dual-mono) signal, where averaging (`mix`) is right,
+  or signal on only one channel, where averaging costs 6 dB. Nothing
+  measured so far distinguishes the two. Determining the Meteorite's
+  actual channel layout is now a concrete Phase 2 task (spec §12), not a
+  hypothesis — done before the default channel mode is chosen. The tray
+  input level meter that §6.1 already specifies is the mechanism for
+  catching it, which matters because the failure mode is silent: "the
+  Mac sounds quiet," with no error anywhere, unless someone looks at the
+  meter.
 
 ## Latency results
 
@@ -279,19 +315,15 @@ than the old budget suggested.
 
 ## Requires the owner
 
-These are the values that are still missing. None of them can be
-invented, and two of them block Phase 1 work:
+Two of the four values originally listed here have been supplied: the
+exact MMDevice endpoint ID string and the device's shared mix format —
+see "Device identity" and "Shared mix format" above. Neither of the
+remaining two blocks Phase 1 or Phase 2 work; they are record-keeping:
 
-1. **The exact MMDevice endpoint ID string** for the Samson Meteorite Mic,
-   copy-pasted from the probe's device list (do not retype). Phase 1's
-   `DeviceManager` persists exactly this string.
-2. **The device's shared mix format** as printed by the probe (sample
-   rate / bit depth / channels / encoding). `PcmNormalizer`'s resample
-   and downmix behavior follows from it.
-3. The **Windows version** (`winver`) and **`dotnet --version`**, for the
+1. The **Windows version** (`winver`) and **`dotnet --version`**, for the
    record of what this was measured on.
-4. Ideally, the **verbatim console output** of both runs, which supplies
-   1-3 and the friendly name and capture-type startup line in one paste.
+2. Ideally, the **verbatim console output** of both runs, which supplies
+   1 and the friendly name and capture-type startup line in one paste.
 
-Re-running the probe once and pasting the whole output produces all of
-these; no re-measurement of the latency figures is needed.
+Re-running the probe once and pasting the whole output produces both; no
+re-measurement of the latency figures is needed.

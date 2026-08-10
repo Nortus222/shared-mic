@@ -466,17 +466,31 @@ consequences:
 
 `DeviceManager` persists the MMDevice endpoint ID rather than the friendly name. On `START` it
 verifies presence; if the device is absent, Windows replies `START_NACK{reason: MIC_UNAVAILABLE}`
-and the Mac enters `DEGRADED`.
+and the Mac enters `DEGRADED`. Measured on the owner's Windows host, the target device is the
+**Samson Meteorite Mic**, friendly name `Microphone (Samson Meteorite Mic)`, endpoint ID
+`{0.0.1.00000000}.{dcea823c-c06f-40bf-8f35-9de9fb96acfd}` — see
+`docs/superpowers/probes/2026-08-08-windows-wasapi-findings.md`.
 
 Capture opens in **WASAPI shared mode**. Exclusive mode is prohibited — it would take the microphone
 away from Windows applications, defeating the simultaneous-use goal.
 
 `PcmNormalizer` converts the shared mix format to 48 kHz / mono / signed 16-bit little-endian:
 float32 to int16, resampling only when the mix format is not already 48 kHz, and downmixing to
-mono. Channel handling is configurable — **`mix` (default) | `left` | `right`**. A mono capsule
-presented as dual-mono averages correctly, but a microphone that places signal only on the left
-channel loses 6 dB under averaging. The tray shows an input level meter so this is caught in
-seconds rather than diagnosed as a mysterious volume problem.
+mono. Measured on this device (same source), the shared mix format is **48,000 Hz, 32-bit,
+2 channels, encoding=Extensible**: the rate already matches the wire format (§6.2), so the resample
+step does not fire on this hardware — this device's common path carries no rate conversion and no
+resampling dependency, though the conditional stays in the design because a different microphone
+could present a different rate. The float-to-int16 conversion is confirmed rather than assumed.
+Channel handling is configurable — **`mix` (default) | `left` | `right`**. A mono capsule presented
+as dual-mono averages correctly, but a microphone that places signal only on the left channel loses
+6 dB under averaging. This is not a hypothetical for this project: the Meteorite is a mono condenser
+microphone, but its shared mix format is 2 channels, so the downmix path executes on every frame
+from day one — and which mode is correct is not yet known, because nothing measured so far
+distinguishes dual-mono signal from signal placed on only one channel. Phase 2 must determine the
+Meteorite's actual channel layout before choosing the default mode (§12); the tray input level meter
+above is the mechanism for catching a wrong default, and the symptom of getting it wrong is "the Mac
+sounds quiet" with no error anywhere, which is why it is worth settling deliberately rather than
+discovering.
 
 Capture lifecycle:
 
@@ -825,21 +839,27 @@ owner built and ran the probe against a Samson Meteorite Mic (`net10.0-windows`,
 it both produced a real open-latency figure (78.5 ms p50, 93.4 ms p95, 114.1 ms cold, forcing the
 §6.3 revision) and confirmed shared-mode co-access with Windows Voice Typing at 20/20 opens and 0
 conflicts (see §13 Q2). **Both major risks are retired before real code is written.** What the
-Windows probe left behind is bookkeeping rather than risk: the exact MMDevice endpoint ID string and
-the device's shared mix format were not captured from the probe's output, and Phase 1 needs the
-endpoint ID because it persists exactly that string (§6.1). Re-running the probe once and keeping
-the console output supplies both.
+Windows probe initially left behind was bookkeeping rather than risk: the exact MMDevice endpoint ID
+string and the device's shared mix format were not captured from the probe's first output. Both have
+since been supplied by the owner and are recorded in §6.1 and the findings document, along with the
+design consequences the mix format carries (§6.1, §12 Phase 2).
 
 **Phase 1 — Transport and security.** Single TLS channel, certificate generation, pairing, HMAC
 auth, framing, priority send queue, heartbeat, reconnect. Both ends. No audio yet.
 
 **Phase 2 — Audio path.** Windows capture and normalization, Mac render to BlackHole, manual
 START/STOP from the menu. Validate quality, measure latency, set the prefill figure, verify drift
-correction. Two items are heavier here than the original plan assumed, both because of the measured
-WASAPI open (§6.3): the **first-word-clipping criterion** (§9, 95 of 100) now has 15–35 ms less
-slack than when it was written and needs real measurement time budgeted rather than a quick check,
-and **setting the prefill figure** is no longer only a jitter/underrun trade — it is also the main
-remaining lever on cold-start activation latency, so measure both effects before fixing it.
+correction. Three items are heavier here than the original plan assumed. Two are because of the
+measured WASAPI open (§6.3): the **first-word-clipping criterion** (§9, 95 of 100) now has 15–35 ms
+less slack than when it was written and needs real measurement time budgeted rather than a quick
+check, and **setting the prefill figure** is no longer only a jitter/underrun trade — it is also the
+main remaining lever on cold-start activation latency, so measure both effects before fixing it. The
+third is because of the measured shared mix format (§6.1): the Samson Meteorite is a mono
+microphone presented as 2 channels, so the stereo-to-mono downmix path runs on every frame, and
+**which channel mode is correct for it — `mix` or one of the single-channel modes — is not yet known
+and must be determined before the default is chosen**, using the tray input level meter. Getting it
+wrong is silent — a quieter Mac-side signal with no error anywhere — which is why it is worth
+settling deliberately rather than discovering.
 
 **Phase 3 — Automatic demand.** Device-scoped observer, full state machine, kill switch, force-on
 hold, notification policy.
@@ -916,10 +936,15 @@ Resolved by Phase 0 probes:
      An application that opens the endpoint in *exclusive* mode would still lock the agent out, and
      nothing here tests that.
    - 20 samples give a usable p50 and a rough p95; they say nothing about a rare long tail.
-   - The **exact MMDevice endpoint ID string** and the **device's shared mix format** were not
-     captured from the probe's output. Phase 1 persists precisely that endpoint ID (§6.1), so it
-     must be copy-pasted from a probe run, not retyped or approximated; the mix format determines
-     `PcmNormalizer`'s resample/downmix work. Both remain outstanding on the owner.
+   - The **exact MMDevice endpoint ID string**
+     (`{0.0.1.00000000}.{dcea823c-c06f-40bf-8f35-9de9fb96acfd}`) and the **device's shared mix
+     format** (48,000 Hz, 32-bit, 2 channels, encoding=Extensible) have since been supplied by the
+     owner and are recorded in §6.1 and the findings document. The mix format means no resampling is
+     needed for this device — its rate already matches the wire format — and confirms the
+     float-to-int16 conversion; it also confirms the microphone presents as 2 channels despite being
+     physically mono, so the stereo-to-mono downmix path is live on every frame. Which channel mode
+     (`mix`/`left`/`right`) is actually correct for this hardware is not known and is now a Phase 2
+     task (§12).
    - The Windows version and SDK version were not recorded either.
 
 Resolved by Phase 2 measurement:
