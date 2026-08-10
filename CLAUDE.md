@@ -26,9 +26,45 @@ both implementations and the conformance harness. Treat it as an API, not an imp
 
 ## Commands
 
-The Windows and macOS projects are created in Phase 1. Until then there is nothing to build, and
-this section is deliberately empty rather than aspirational. Add real, verified commands here as
-each project lands — not before.
+The Windows and macOS agent projects are created in Phase 1; there is nothing to build for them
+yet. The protocol harness and both Phase 0 probes exist now. Every command below has actually been
+run on this machine — see `harness/README.md` and `docs/superpowers/probes/` for more detail.
+
+**Harness (from `harness/`).** There is no bare `python` on this machine's `PATH`, and the system
+`python3` has no `pytest` installed — use the project virtualenv's interpreter explicitly rather
+than relying on `PATH` or activation:
+
+```sh
+cd harness
+.venv/bin/python -m pip install -e '.[dev]'   # install (already done in .venv; cryptography builds from source and takes several minutes)
+.venv/bin/python -m pytest -v                 # run the conformance suite (101 tests)
+.venv/bin/python tools/generate_vectors.py    # regenerate protocol/vectors/*.json — a deliberate act, see protocol-v1.md §10
+```
+
+**macOS demand-detection probe (from `probes/macos-demand/`).** Built and run on the target Mac
+(macOS 26.6.1); see `docs/superpowers/probes/2026-08-08-macos-demand-findings.md` for full results:
+
+```sh
+cd probes/macos-demand
+swiftc -O -o demand-probe DemandProbe.swift
+./demand-probe --self-test   # automated; ./demand-probe --watch for live manual observation
+```
+
+**Windows WASAPI latency probe (from `probes/windows-wasapi-latency/`).** Written for
+`net10.0-windows` and NAudio, both Windows-only, so it cannot be built on this Mac. The owner has
+built and run it on the actual Windows host (Samson Meteorite Mic, NAudio 2.2.1, 0 warnings /
+0 errors); see `docs/superpowers/probes/2026-08-08-windows-wasapi-findings.md` for the results and
+`probes/windows-wasapi-latency/README.md` for the procedure:
+
+```powershell
+cd probes\windows-wasapi-latency\WasapiLatencyProbe
+dotnet build --no-incremental
+dotnet run --project WasapiLatencyProbe -- 20
+```
+
+The `.csproj` is XML: **never put a doubled hyphen inside an `<!-- -->` comment.** It is illegal XML
+and fails the build with `MSB4025`. Two slipped through review here precisely because nobody in this
+repo could compile the file.
 
 ## Design constraints that are not negotiable
 

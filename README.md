@@ -21,9 +21,33 @@ USB mic → Windows agent ══ one TLS connection ══ macOS agent → Black
 
 ## Status
 
-Design approved; implementation not started. See
-[`docs/superpowers/specs/2026-08-08-shared-mic-design.md`](docs/superpowers/specs/2026-08-08-shared-mic-design.md)
-for the full design and phased plan.
+**Phase 0 complete: protocol and probes. No product code yet** — neither platform agent exists, and
+Phase 1 creates those projects.
+
+What Phase 0 delivered, and where to start reading:
+
+- [`docs/superpowers/specs/2026-08-08-shared-mic-design.md`](docs/superpowers/specs/2026-08-08-shared-mic-design.md)
+  — the full design and phased plan. Start here for *why*.
+- [`protocol/protocol-v1.md`](protocol/protocol-v1.md) — the wire contract both platforms implement,
+  with golden vectors in [`protocol/vectors/`](protocol/vectors/). Every normative requirement is
+  tagged `[VERIFIED]` (a passing harness test asserts it) or `[CARRIED]` (required, but the harness
+  does not yet prove it), so the measured/unmeasured boundary is explicit rather than implied.
+- [`harness/`](harness/) — a Python reference implementation of the protocol that doubles as a
+  conformance test double for both sides of the wire, with a 101-test suite. It is what Phase 1 and
+  Phase 2 build against before either agent exists. `harness/README.md` lists its known limitations.
+- [`docs/superpowers/probes/`](docs/superpowers/probes/) — the two throwaway probes' findings. The
+  macOS demand-detection probe
+  ([findings](docs/superpowers/probes/2026-08-08-macos-demand-findings.md)) changed the design: it
+  ruled out `kAudioProcessPropertyIsRunningInput` as a demand gate in favour of device-list
+  membership, and the owner's follow-up pass over real applications established that BlackHole need
+  not be the Mac's system input device. The Windows WASAPI latency probe
+  ([findings](docs/superpowers/probes/2026-08-08-windows-wasapi-findings.md)) has now been run by the
+  owner on the real Windows host, and changed the design too: it confirmed that Windows applications
+  can keep using the microphone while the probe holds it — 20/20 opens with **zero conflicts** while
+  Windows Voice Typing was actively using the same mic — and it measured the WASAPI open at
+  **78.5 ms p50 / 93.4 ms p95 / 114.1 ms cold**, above the spec's assumed 20–80 ms, which forced the
+  activation budget in §6.3 to be recomputed. That is one microphone (Samson Meteorite), one driver,
+  one machine, one concurrent application, 20 cycles per run — not a general claim about WASAPI.
 
 ## Requirements
 

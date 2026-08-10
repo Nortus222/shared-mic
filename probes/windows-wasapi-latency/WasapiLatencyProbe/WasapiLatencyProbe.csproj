@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <!-- net10.0-windows matches the Phase 1 target in the design spec.
+         If `dotnet build` fails because the .NET 10 SDK isn't installed,
+         retarget this single line to net9.0-windows or net8.0-windows.
+         This is a throwaway probe, not shipping code, and the WASAPI
+         open-latency measurement is identical regardless of which .NET
+         version runs it. See probes/windows-wasapi-latency/README.md.
+         (Note: a doubled hyphen is illegal inside an XML comment and
+         breaks the build with MSB4025. Do not add one here.) -->
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- Pinned per the task brief. If restore fails or 2.2.1 is no longer
+         available, taking the current NAudio 2.x release is fine. Record
+         whichever version actually gets restored in the findings doc;
+         Phase 1 depends on knowing it. See README.md.
+         (2.2.1 is what actually restored on the owner's Windows host.) -->
+    <PackageReference Include="NAudio" Version="2.2.1" />
+  </ItemGroup>
+</Project>

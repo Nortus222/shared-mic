@@ -1,5 +1,32 @@
 # Phase 0 — Protocol and Probes Implementation Plan
 
+> ## ⚠️ THIS PLAN HAS BEEN EXECUTED. IT IS A HISTORICAL RECORD, NOT A SPECIFICATION.
+>
+> Phase 0 is complete. This document is kept as the record of what was *planned*; several of its
+> verbatim code samples were **found to be defective while executing it**, and were corrected in the
+> deliverables. Do not copy code out of this plan. If you want to know what Phase 0 actually
+> produced, read these instead:
+>
+> - `protocol/protocol-v1.md` — the wire contract, with per-requirement verified/carried tags
+> - `harness/` — the reference implementation and its 101-test conformance suite
+> - `docs/superpowers/probes/` — what each probe actually measured
+> - `docs/superpowers/specs/2026-08-08-shared-mic-design.md` — the design, updated by what was learned
+>
+> **The single most important correction: the demand-detection gate specified in this plan is
+> wrong and must not be implemented.** Task 10's probe code below gates demand on
+> `row.runningInput && onTarget` (see the annotations at Task 10 Step 1 and Step 4). Running that
+> probe on the target Mac disproved the `runningInput` conjunct: on a process's second and later
+> input activation, `kAudioProcessPropertyIsRunningInput` reads `false` at the instant device-list
+> membership is confirmed `true`, so a gate requiring it detects an application's first use of the
+> microphone and then silently misses every later one for that process's lifetime. Demand is gated
+> on `kAudioProcessPropertyDevices` (input-scope) membership **alone**. Authoritative sources:
+> design spec §5.1 and `docs/superpowers/probes/2026-08-08-macos-demand-findings.md`.
+>
+> **Commands in this plan do not run as written on this machine.** Every `python …` invocation
+> below must be `.venv/bin/python …` from `harness/`: there is no bare `python` on this machine's
+> `PATH`, and the system `python3` has no `pytest`. See `CLAUDE.md` and `harness/README.md` for the
+> commands that were actually run.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Produce a proven wire protocol, a reference implementation that doubles as a conformance test harness, and two throwaway probes that retire the project's remaining technical risks before any production code is written.
@@ -96,8 +123,14 @@ Create an empty `harness/sharedmic_protocol/__init__.py`.
 
 Then install the test dependencies:
 
-Run: `cd harness && python -m pip install pytest 'cryptography>=42'`
+Run: `cd harness && .venv/bin/python -m pip install pytest 'cryptography>=42'`
 Expected: successful install. Both are needed before any test in this plan can run.
+
+> **Corrected during execution.** This step was written as `python -m pip install …`, which cannot
+> run here — there is no bare `python` on this machine's `PATH`. The same substitution applies to
+> every `python -m pytest …` and `python tools/…` line in the rest of this plan, which are left as
+> originally written. `cryptography` builds from source on this machine and takes several minutes;
+> once the virtualenv has it, reuse that virtualenv rather than reinstalling.
 
 - [ ] **Step 2: Write the failing test**
 
@@ -2233,6 +2266,12 @@ func report(target: Device, devicesByID: [AudioObjectID: Device]) {
     var demandCount = 0
     for row in rows where row.runningInput || !row.inputDeviceIDs.isEmpty {
         let onTarget = row.inputDeviceIDs.contains(target.id)
+        // ⚠️ SUPERSEDED — DO NOT COPY THIS LINE. Executing this plan disproved the
+        // `row.runningInput` conjunct: it reads false on a process's second and later
+        // input activation, at the instant `onTarget` is confirmed true, so this gate
+        // detects an app's first use of the mic and silently misses every later one.
+        // The shipped probe gates on `onTarget && row.pid != ourPID` alone. See design
+        // spec §5.1 and docs/superpowers/probes/2026-08-08-macos-demand-findings.md.
         let counts = row.runningInput && onTarget && row.pid != ourPID
         if counts { demandCount += 1 }
         let deviceNames = row.inputDeviceIDs
@@ -2295,6 +2334,14 @@ For each of macOS Dictation, Chrome (any site requesting the mic), ChatGPT voice
 3. Start audio input in the application.
 4. Record whether the app appears with `runningInput=yes`, whether `onTarget=YES`, and how long after starting input it appeared.
 5. Stop input and record how quickly the row clears.
+
+> **⚠️ SUPERSEDED — this instruction encodes the same defective gate as the code above.** Step 4
+> reads as though `runningInput=yes` is part of what makes an app count as demand. It is not, and
+> requiring it is what this probe disproved. When running the manual pass, record `runningInput`
+> only as a **diagnostic** column alongside `onTarget`, and treat `onTarget=YES` alone as demand.
+> Also test **repeat** activations of each app, not just the first — the first activation is
+> precisely the case in which the two properties agree and the defect is invisible. See design spec
+> §5.1 and `docs/superpowers/probes/2026-08-08-macos-demand-findings.md`.
 
 Then repeat with the Mac's input set to the **built-in microphone** instead, and confirm `onTarget` is `-` and `demandCount` stays `0`. This is the false-positive test, and it is the single most important measurement in Phase 0.
 
