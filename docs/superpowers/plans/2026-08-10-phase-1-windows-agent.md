@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Ship a Windows tray agent that a macOS client (or the Python `MockMacClient`) can connect to over TLS 1.3, pair with, authenticate against by HMAC challenge-response, and hold a healthy, heartbeat-monitored session with — producing wire bytes that byte-match `protocol/vectors/*.json`, and capturing no audio at all.
+**Goal:** Ship a Windows tray agent that **several** macOS clients (or the Python `MockMacClient`) can connect to over TLS 1.3, pair with individually, authenticate against by HMAC challenge-response, and hold healthy, heartbeat-monitored connections with — while **at most one of them holds the microphone session at a time** — producing wire bytes that byte-match `protocol/vectors/*.json`, and capturing no audio at all.
 
-**Architecture:** A single `SharedMic.Agent` project holds four layers: a pure `Protocol/` codec layer (envelope framing, audio-payload framing, canonical control-message JSON) that is the only thing the golden-vector tests touch; a `Security/` layer (pairing token, base32 pairing string, HMAC proof, rate limiter, P-256 device certificate, DPAPI-protected identity store); a `Net/` layer (TLS listener bound to private interfaces, incremental frame reader, priority send queue, and the `ControlConnection` state machine that runs the handshake, session lifecycle and heartbeat); and a thin `Ui/` tray shell. `Session/SessionStateMachine` is a pure transition function with no I/O, exactly as spec §3.1 requires. Every network-facing task is verified twice: by a C# test over a loopback socket, and by pointing the Python `MockMacClient` at the running agent.
+**Architecture:** A single `SharedMic.Agent` project holds four layers: a pure `Protocol/` codec layer (envelope framing, audio-payload framing, canonical control-message JSON) that is the only thing the golden-vector tests touch; a `Security/` layer (pairing token, base32 pairing string, HMAC proof, rate limiter, P-256 device certificate, DPAPI-protected identity store, DPAPI-protected paired-device list); a `Net/` layer (TLS listener bound to private interfaces, incremental frame reader, priority send queue, and the `ControlConnection` state machine that runs the handshake, session lifecycle and heartbeat); and a thin `Ui/` tray shell. `Session/SessionStateMachine` is a pure transition function with no I/O, exactly as spec §3.1 requires; `Session/SessionArbiter` is the thread-safe shell around it that grants the one session to one connection at a time. Every network-facing task is verified twice: by a C# test over a loopback socket, and by pointing the Python `MockMacClient` at the running agent.
 
 **Tech Stack:** C# 13 on .NET 10 (`net10.0-windows`), WinForms `NotifyIcon` tray, `SslStream`/Schannel for TLS 1.3, `System.Text.Json` (`Utf8JsonWriter` with an explicit ordinal-sorted-key canonical writer), `System.Security.Cryptography` (ECDsa P-256, HMACSHA256, `ProtectedData`/DPAPI), xUnit for tests, and the Phase 0 Python harness (`harness/sharedmic_protocol`) as the interoperability peer.
 
@@ -56,7 +56,7 @@ Audio header is **12 bytes**; audio payload length MUST be exactly **1,932** byt
 | `HELLO_ACK` | `serverId` (string), `micPresent` (bool), `deviceLabel` (string) |
 | `START` | `requestId` (string), `preferredFormat` (object) |
 | `START_ACK` | `requestId`, `sessionId` (string), `format` (object) |
-| `START_NACK` | `requestId`, `reason` (string) |
+| `START_NACK` | `requestId`, `reason` (string). **Plus one optional advisory field, `holder` (string)** — the friendly name of the paired device that currently holds the session. It is emitted only when `reason` is `"SESSION_IN_USE"`, it is advisory (a receiver must work without it), and it is omitted entirely rather than sent as `null` or `""` when the holder has no usable name. |
 | `STOP` | `requestId`, `sessionId` |
 | `STOP_ACK` | `requestId`, `sessionId` |
 | `STATUS` | `micPresent` (bool), `active` (bool), `deviceLabel` (string) — these three fields are the whole message, there is no `errors` field |
@@ -65,9 +65,20 @@ Audio header is **12 bytes**; audio payload length MUST be exactly **1,932** byt
 
 `preferredFormat`/`format` are always exactly `{"sampleRate":48000,"channels":1,"sampleFormat":"s16le"}`.
 
-**Handshake (protocol §6).** Windows sends `GREETING{serverId, nonce}` immediately after the TLS handshake; `nonce` is 32 fresh random bytes, lowercase hex, **never reused across connections**. The Mac replies `HELLO{clientId, mac}` where `mac = lowercase_hex(HMAC-SHA256(token, nonce))` computed over the **raw 32 nonce bytes, not the hex string**. Windows verifies with a **constant-time** comparison and replies `HELLO_ACK`, or closes without replying. **The token never crosses the wire.** **5-second pre-auth deadline**: from TLS handshake completion, Windows gives the Mac 5 seconds to deliver a valid `HELLO` — no message, an unparseable message, a non-`HELLO` message, or a failing `mac` all mean close. No `START`/`STOP`/`PING`/`STATUS`/`AUDIO` is valid before authentication. **Any frame whose envelope `type` is not `CONTROL` is rejected unconditionally at any point in the connection's lifetime** — the Mac never sends `AUDIO`.
+**Handshake (protocol §6).** Windows sends `GREETING{serverId, nonce}` immediately after the TLS handshake; `nonce` is 32 fresh random bytes, lowercase hex, **never reused across connections**. The Mac replies `HELLO{clientId, mac}` where `mac = lowercase_hex(HMAC-SHA256(token, nonce))` computed over the **raw 32 nonce bytes, not the hex string**. Windows verifies with a **constant-time** comparison **against every stored paired-device token in turn** and replies `HELLO_ACK`, or closes without replying. **The proof is the only thing that identifies the device.** `clientId` is a display label and is **explicitly untrusted**: it arrives unauthenticated, so it must never be used to look up which token to check, must never grant anything, and must never overwrite a device's owner-assigned friendly name. **The token never crosses the wire.** **5-second pre-auth deadline**: from TLS handshake completion, Windows gives the Mac 5 seconds to deliver a valid `HELLO` — no message, an unparseable message, a non-`HELLO` message, or a failing `mac` all mean close. No `START`/`STOP`/`PING`/`STATUS`/`AUDIO` is valid before authentication. **Any frame whose envelope `type` is not `CONTROL` is rejected unconditionally at any point in the connection's lifetime** — the Mac never sends `AUDIO`.
 
-**Session lifecycle (protocol §7).** `START` and `STOP` are idempotent. A duplicate `START` while active returns `START_ACK` carrying the **existing** `sessionId` and format, does not create a second session, and does not reset the audio `sequence` counter. A `STOP` while idle still returns `STOP_ACK`; Windows does not reject `STOP` on `sessionId` mismatch — `STOP` means "make sure no session is active". A `STOP` sent with no session active MAY carry an empty string or a stale `sessionId`. `sequence` resets to `0` at each `START_ACK` (implement the reset; the harness does not prove it). **No `AUDIO` frame may be sent outside an active session, and an idle connection MUST carry zero audio bytes.** In Phase 1 a session carries zero audio bytes at all times, active or not.
+**Session lifecycle (protocol §7).** `START` and `STOP` are idempotent. A duplicate `START` **from the connection that already holds the session** returns `START_ACK` carrying the **existing** `sessionId` and format, does not create a second session, and does not reset the audio `sequence` counter. A `STOP` while idle still returns `STOP_ACK`; Windows does not reject `STOP` on `sessionId` mismatch — `STOP` means "make sure no session is active **on this connection**". A `STOP` sent with no session active MAY carry an empty string or a stale `sessionId`. `sequence` resets to `0` at each `START_ACK` (implement the reset; the harness does not prove it). **No `AUDIO` frame may be sent outside an active session, and an idle connection MUST carry zero audio bytes.** In Phase 1 a session carries zero audio bytes at all times, active or not.
+
+**Several paired Macs, one session at a time.** This is the load-bearing change from the first draft of this plan, and it touches the identity store, the auth path, the session state, the connection and the tray:
+
+- Windows keeps a **list of paired devices**. Each has its own fresh 256-bit token, an owner-assigned friendly name, and a paired-at timestamp. Devices are **individually revocable**; revoking one must not disturb any other.
+- **Several paired Macs may be connected and authenticated at the same time.** There is no supersession: a newly authenticated connection never displaces an older one. (An earlier draft of the contract said the opposite. It is wrong and must not be implemented.)
+- **At most one session exists across all connections.** The connection that received the `START_ACK` owns it.
+- A `START` from any other connection while the session is held is answered `START_NACK{requestId, reason: "SESSION_IN_USE", holder}` — refused, but the connection stays up and healthy.
+- **A session ends when its owning control connection closes, not only on `STOP`.** This is load-bearing: without it, a Mac that crashes or has its cable pulled locks every other Mac out until the 45-second dead-peer timer fires. **Dead-peer detection must end that peer's session too**, by the same path.
+- A `STOP` from a connection that does not hold the session ends nothing and still returns `STOP_ACK`. Anything else would let any paired Mac cancel another's session by sending one message.
+
+**What the Python mock cannot catch, and what to do about it.** `MockWindowsServer` is a per-connection test double: it accepts any connection that proves a single shared token, keeps no device list, and gives **each connection its own independent `_session_id` and its own audio loop**. Two mock clients both get `START_ACK`. An implementation that gets every one of the multi-device rules above wrong therefore still passes `harness/tests` and still passes `drive_windows_agent.py --mode session`. **Every rule in the block above is proved by a local C# test over loopback (Tasks 9, 13, 14 and 15) and by nothing else.** The Python driver is still run, but as evidence of wire compatibility, not of arbitration.
 
 **Timers (protocol §8).**
 
@@ -81,7 +92,7 @@ Audio header is **12 bytes**; audio payload length MUST be exactly **1,932** byt
 
 **Send priority (protocol §9).** Control messages are queued **unboundedly** and are **always drained before any audio frame**. Audio is a **bounded ring of 25 frames (500 ms at 50 fps) that drops the oldest frame on overflow and never blocks**. Two drop counters, kept separate: **evicted on overflow** (network could not keep up — alarm-worthy) and **discarded at session teardown** (intended). The identity `offered = received + evicted + discarded` must close, to within one frame in flight.
 
-**Pairing token and string (protocol §11.1, §11.2).** The token is **32 bytes (256 bits) from a cryptographically secure random source**, generated at first run, never regenerated except by explicit re-pair, and never on the wire. Displayed as: **RFC 4648 base32** (`A`–`Z` then `2`–`7`), **uppercase**, **unpadded** (strip the four `=`), **hyphen-grouped in runs of 8** with a single `-` (U+002D). 32 bytes → 52 base32 characters → six groups of 8 plus a final group of 4 → **always 58 characters**. Worked example:
+**Pairing token and string (protocol §11.1, §11.2).** A token is **32 bytes (256 bits) from a cryptographically secure random source**, minted **once per paired device**, never regenerated except by explicitly re-pairing that device, and never on the wire. **The pairing-string format is unchanged by the multi-device work** — same base32 alphabet, same 58 characters, same tolerant decode — so the macOS pairing path needs no change at all. Displayed as: **RFC 4648 base32** (`A`–`Z` then `2`–`7`), **uppercase**, **unpadded** (strip the four `=`), **hyphen-grouped in runs of 8** with a single `-` (U+002D). 32 bytes → 52 base32 characters → six groups of 8 plus a final group of 4 → **always 58 characters**. Worked example:
 
 ```
 token (hex): 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
@@ -103,13 +114,29 @@ Decoding is deliberately tolerant: uppercase first, delete every character not i
 
 The SAN is not decorative: some Swift TLS stacks reject a SAN-less certificate *before* the pinning callback runs. Private key is **DPAPI-protected** at rest (spec §7.1).
 
-**Authentication rate limiting (protocol §11.4).** After **5 consecutive failed attempts**, refuse further attempts for **30 seconds**. A failed attempt is any connection that reaches §6 without producing a verified `HELLO` — wrong `mac`, malformed or non-`HELLO` message, or the 5-second deadline expiring. **The lockout is counted per Windows agent, not per source address.** Surface it in the UI.
+**Authentication rate limiting (protocol §11.4), and how multiple devices resolve it.** After **5 consecutive failed attempts**, refuse further attempts for **30 seconds**. A failed attempt is any connection that reaches §6 without producing a verified `HELLO` — wrong `mac`, malformed or non-`HELLO` message, or the 5-second deadline expiring. Surface it in the UI.
 
-**Privacy and logging (spec §7.3).** Audio payload is never logged or persisted. Logs carry lifecycle events and counters only. Never log the pairing token, the private key, or the raw `mac` proof.
+With one token there was one obvious scope for that counter. With a list of paired devices there are three candidates, and they are not equivalent:
+
+- **Per device — impossible, and not merely hard.** A device is identified *by* the proof, so before a proof verifies there is no device to count against. The only pre-identification hint is `clientId`, which is unauthenticated; keying the counter on it would hand an attacker a targeted weapon — claim to be `"Mac Studio"`, fail five times, and lock out that Mac specifically while every other device stays reachable. That is strictly worse than the problem it tries to solve.
+- **Per connection — no throttle at all.** A failed `HELLO` closes the connection, so a per-connection counter never reaches 2, let alone 5. The attacker just reconnects.
+- **Globally, one counter for the whole listener — a one-attacker denial of service on every paired Mac.** Anything that can reach TCP 47800 can fail five `HELLO`s every 30 seconds forever and no legitimate Mac ever authenticates again. With one Mac this was a self-inflicted annoyance; with several it is an outage of the whole fleet caused by one host.
+
+**Decision: the lockout is keyed on the peer's source IP address, with the source port deliberately excluded, and the agent-wide counters are kept but made advisory.** Concretely:
+
+- `AuthRateLimiter` holds one 5-failure/30-second counter **per remote `IPAddress`**. Five consecutive failures from `192.168.1.66` refuse further attempts *from `192.168.1.66`* for 30 seconds; every other address, including every other paired Mac, is untouched.
+- **The port is excluded from the key on purpose.** §11.4's stated reason for rejecting a per-source scope was that an attacker must not be able to reset the counter by picking a new source port. Keying on the address alone satisfies that concern exactly, without the fleet-wide outage a single global counter causes.
+- A successful authentication clears **only that address's** counter.
+- The agent-wide totals (`TotalFailures`, `LockoutCount`) are still kept, still surfaced in the tray and in the final counters line, and still logged — as an **alarm**, since a burst of failures across many addresses is the signal worth seeing. They refuse nothing.
+- The table is bounded (`MaxTrackedPeers`, 1,024) and evicts expired entries first, so an attacker spraying source addresses cannot grow it without bound.
+
+Every non-loopback address is a distinct key, which is what makes this testable: the `--mode lockout` Python run still works unchanged, because all five of its attempts come from the same Mac.
+
+**Privacy and logging (spec §7.3).** Audio payload is never logged or persisted. Logs carry lifecycle events and counters only. Never log any paired device's token, the private key, or the raw `mac` proof. A pairing string is the same secret in base32 — it may be shown to the user on the console banner and in the tray, and it must never reach the log.
 
 **Phase 1 is transport and security only.** No WASAPI, no `MicCaptureService`, no `PcmNormalizer`, no `DeviceManager`, no device enumeration, no audio capture of any kind. A `START` establishes a session and returns `START_ACK`; it does not open a microphone and streams nothing.
 
-**Known platform risk to watch.** TLS 1.3 server support in Schannel requires Windows 11 / Windows Server 2022 or later. Task 13 logs `SslStream.SslProtocol` after every handshake; if it is not `Tls13`, the Windows host's OS version is the cause and the finding must be reported rather than worked around by lowering `EnabledSslProtocols`.
+**Known platform risk to watch.** TLS 1.3 server support in Schannel requires Windows 11 / Windows Server 2022 or later. Task 15 logs `SslStream.SslProtocol` after every handshake; if it is not `Tls13`, the Windows host's OS version is the cause and the finding must be reported rather than worked around by lowering `EnabledSslProtocols`.
 
 ---
 
@@ -135,17 +162,19 @@ windows/
     Security/
       PairingToken.cs                         256-bit token generation, base32 pairing-string encode/decode
       AuthProof.cs                            nonce generation, HMAC-SHA256 proof, constant-time verify
-      AuthRateLimiter.cs                      5 consecutive failures then a 30 s agent-wide lockout
+      AuthRateLimiter.cs                      5 consecutive failures then a 30 s lockout, keyed per source address
       DeviceCertificate.cs                    self-signed P-256 certificate with SAN, DER SHA-256 fingerprint
-      IdentityStore.cs                        DPAPI-protected persistence of token, certificate and serverId
+      IdentityStore.cs                        DPAPI-protected persistence of certificate and serverId
+      PairedDeviceStore.cs                    DPAPI-protected list of paired devices; pair, revoke, identify-by-proof
     Net/
       FrameReader.cs                          incremental envelope reader over any Stream
       PrioritySendQueue.cs                    unbounded control queue, bounded 25-frame drop-oldest audio ring
       ControlConnection.cs                    handshake, pre-auth deadline, session lifecycle, heartbeat, writer loop
       PrivateAddress.cs                       RFC1918 / loopback / link-local classification and enumeration
-      TlsListener.cs                          TCP 47800 bind per private interface, TLS 1.3, connection supervision
+      TlsListener.cs                          TCP 47800 bind per private interface, TLS 1.3, concurrent connections
     Session/
       SessionStateMachine.cs                  pure START/STOP transition function, idempotent
+      SessionArbiter.cs                       the single session, its owner, and SESSION_IN_USE; shared by all connections
     Diagnostics/
       AgentLog.cs                             timestamped console log; never payload
       AgentMetrics.cs                         spec §11 counters plus a snapshot record
@@ -162,9 +191,11 @@ windows/
     PairingAndAuthTests.cs
     AuthRateLimiterTests.cs
     SessionStateMachineTests.cs
+    SessionArbiterTests.cs                    one session across many owners, release on owner loss
     PrioritySendQueueTests.cs
     FrameReaderTests.cs
     IdentityTests.cs                          certificate profile, fingerprint, DPAPI round-trip
+    PairedDeviceStoreTests.cs                 pair, revoke, identify-by-proof, DPAPI round-trip
     LoopbackPeer.cs                           test harness: connected socket pair + client-side protocol helpers
     ControlConnectionTests.cs
     PrivateAddressTests.cs
@@ -997,7 +1028,7 @@ git commit -m "Phase 1 Task 3: audio payload codec, strict 1932-byte receiver, l
 
 **Interfaces:**
 - Consumes: `ProtocolConstants.ProtocolVersion`, `ProtocolConstants.SampleRate`, `ProtocolConstants.Channels`, `ProtocolConstants.SampleFormat`, `ProtocolException(string)`.
-- Produces: `static class ControlCodec` with `IReadOnlyDictionary<string, string[]> RequiredFields`, `byte[] Encode(IReadOnlyDictionary<string, object?> message)`, `Dictionary<string, object?> Decode(ReadOnlySpan<byte> payload)`, `Dictionary<string, object?> Normalize(IReadOnlyDictionary<string, object?> message)`, `void Validate(IReadOnlyDictionary<string, object?> message)`, `Dictionary<string, object?> FromJsonElement(JsonElement element)`, `bool DeepEquals(object? left, object? right)`; `static class ControlMessages` with `IReadOnlyDictionary<string, object?> AudioFormat` and factories `Greeting(string serverId, string nonceHex)`, `Hello(string clientId, string mac)`, `HelloAck(string serverId, bool micPresent, string deviceLabel)`, `Start(string requestId)`, `StartAck(string requestId, string sessionId)`, `StartNack(string requestId, string reason)`, `Stop(string requestId, string sessionId)`, `StopAck(string requestId, string sessionId)`, `Status(bool micPresent, bool active, string deviceLabel)`, `Ping(long seq)`, `Pong(long seq)` — each returning `Dictionary<string, object?>`.
+- Produces: `static class ControlCodec` with `IReadOnlyDictionary<string, string[]> RequiredFields`, `byte[] Encode(IReadOnlyDictionary<string, object?> message)`, `Dictionary<string, object?> Decode(ReadOnlySpan<byte> payload)`, `Dictionary<string, object?> Normalize(IReadOnlyDictionary<string, object?> message)`, `void Validate(IReadOnlyDictionary<string, object?> message)`, `Dictionary<string, object?> FromJsonElement(JsonElement element)`, `bool DeepEquals(object? left, object? right)`; `static class ControlMessages` with `IReadOnlyDictionary<string, object?> AudioFormat` and factories `Greeting(string serverId, string nonceHex)`, `Hello(string clientId, string mac)`, `HelloAck(string serverId, bool micPresent, string deviceLabel)`, `Start(string requestId)`, `StartAck(string requestId, string sessionId)`, `StartNack(string requestId, string reason, string? holder = null)`, `Stop(string requestId, string sessionId)`, `StopAck(string requestId, string sessionId)`, `Status(bool micPresent, bool active, string deviceLabel)`, `Ping(long seq)`, `Pong(long seq)` — each returning `Dictionary<string, object?>`.
 
 The message model is a dictionary rather than eleven record types on purpose: it lets the golden-vector test in Task 5 iterate the committed fixtures generically instead of hand-copying cases, and it makes the canonical sorted-key encoder a pure function of message content.
 
@@ -1175,6 +1206,50 @@ public class ControlCodecTests
     }
 
     [Fact]
+    public void StartNackOmitsTheAdvisoryHolderFieldUnlessOneIsGiven()
+    {
+        var plain = ControlMessages.StartNack("req-0002", "MIC_UNAVAILABLE");
+
+        Assert.False(plain.ContainsKey("holder"));
+        Assert.Equal(
+            "{\"reason\":\"MIC_UNAVAILABLE\",\"requestId\":\"req-0002\",\"type\":\"START_NACK\",\"v\":1}",
+            Encoding.UTF8.GetString(ControlCodec.Encode(plain)));
+    }
+
+    [Fact]
+    public void StartNackCarriesTheHolderNameWhenTheSessionIsInUse()
+    {
+        var busy = ControlMessages.StartNack("req-0002", "SESSION_IN_USE", "Mac Studio");
+
+        Assert.Equal("Mac Studio", busy["holder"]);
+        Assert.Equal(
+            "{\"holder\":\"Mac Studio\",\"reason\":\"SESSION_IN_USE\"," +
+            "\"requestId\":\"req-0002\",\"type\":\"START_NACK\",\"v\":1}",
+            Encoding.UTF8.GetString(ControlCodec.Encode(busy)));
+    }
+
+    [Fact]
+    public void AnEmptyOrWhitespaceHolderIsOmittedRatherThanSentBlank()
+    {
+        // A blank advisory field is worse than no advisory field: the Mac would
+        // render "In use by " with nothing after it. Omission is the contract.
+        Assert.False(ControlMessages.StartNack("r", "SESSION_IN_USE", "").ContainsKey("holder"));
+        Assert.False(ControlMessages.StartNack("r", "SESSION_IN_USE", "   ").ContainsKey("holder"));
+        Assert.False(ControlMessages.StartNack("r", "SESSION_IN_USE", null).ContainsKey("holder"));
+    }
+
+    [Fact]
+    public void AnAdvisoryFieldDoesNotBreakDecodeOrRoundTrip()
+    {
+        var busy = ControlMessages.StartNack("req-0002", "SESSION_IN_USE", "Mac Studio");
+
+        var decoded = ControlCodec.Decode(ControlCodec.Encode(busy));
+
+        Assert.True(ControlCodec.DeepEquals(ControlCodec.Normalize(busy), decoded));
+        Assert.Equal("Mac Studio", decoded["holder"]);
+    }
+
+    [Fact]
     public void FromJsonElementBuildsTheSameModelTheDecoderDoes()
     {
         using var document = JsonDocument.Parse("{\"v\":1,\"type\":\"STATUS\",\"micPresent\":false,\"active\":false,\"deviceLabel\":\"x\"}");
@@ -1228,7 +1303,10 @@ namespace SharedMic.Agent.Protocol;
 ///
 /// Validation runs on both encode and decode, deliberately: a bug here should
 /// surface as a loud local failure rather than as bytes the far end has to
-/// guess about.
+/// guess about. Validation checks that every REQUIRED field is present; it does
+/// not reject additional fields, which is what lets START_NACK carry the
+/// optional advisory "holder" name without a protocol version change, and what
+/// lets this decoder accept a future peer that adds one.
 ///
 /// Messages are modelled as Dictionary&lt;string, object?&gt; with values
 /// restricted to string, bool, long, double and nested dictionaries. That is
@@ -1522,14 +1600,30 @@ public static class ControlMessages
             ["format"] = AudioFormat,
         };
 
-    public static Dictionary<string, object?> StartNack(string requestId, string reason) =>
-        new(StringComparer.Ordinal)
+    /// <summary>
+    /// `holder` is the ONE optional field in version 1: the friendly name of the
+    /// paired device that currently holds the session, sent only alongside
+    /// reason "SESSION_IN_USE". It is advisory — the Mac must render a sensible
+    /// message without it — so a null, empty or whitespace name is omitted from
+    /// the object entirely rather than encoded as null or "".
+    /// </summary>
+    public static Dictionary<string, object?> StartNack(string requestId, string reason, string? holder = null)
+    {
+        var message = new Dictionary<string, object?>(StringComparer.Ordinal)
         {
             ["v"] = (long)ProtocolConstants.ProtocolVersion,
             ["type"] = "START_NACK",
             ["requestId"] = requestId,
             ["reason"] = reason,
         };
+
+        if (!string.IsNullOrWhiteSpace(holder))
+        {
+            message["holder"] = holder;
+        }
+
+        return message;
+    }
 
     public static Dictionary<string, object?> Stop(string requestId, string sessionId) =>
         new(StringComparer.Ordinal)
@@ -1585,7 +1679,7 @@ Run, from the repo's `windows` directory on Windows:
 dotnet test SharedMic.Windows.sln --filter "FullyQualifiedName~ControlCodecTests"
 ```
 
-Expected: PASS, 17 tests.
+Expected: PASS, 21 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -2204,9 +2298,14 @@ namespace SharedMic.Agent.Security;
 
 /// <summary>
 /// The challenge-response of protocol-v1.md section 6: the server issues a
-/// fresh 32-byte nonce per connection, and the client proves possession of the
+/// fresh 32-byte nonce per connection, and the client proves possession of a
 /// pairing token with HMAC-SHA256 over the RAW nonce bytes, not over the hex
 /// string. Verification is constant time.
+///
+/// Verify() checks ONE token. With several paired devices the agent checks
+/// every stored token in turn; PairedDeviceStore.Identify owns that loop and is
+/// responsible for not short-circuiting it. Constant-time-per-token is this
+/// class's job; constant-time-across-the-list is that one's.
 ///
 /// Never log the token, the nonce, or an offered proof.
 /// </summary>
@@ -2292,9 +2391,18 @@ git commit -m "Phase 1 Task 6: 256-bit pairing token, base32 pairing string, HMA
 
 **Interfaces:**
 - Consumes: `ProtocolConstants.MaxAuthFailures`, `ProtocolConstants.AuthLockoutDuration`.
-- Produces: `sealed class AuthRateLimiter` with constructor `AuthRateLimiter(int maxFailures = ProtocolConstants.MaxAuthFailures, TimeSpan? lockoutDuration = null, Func<DateTimeOffset>? clock = null)` and members `int ConsecutiveFailures`, `long LockoutCount`, `bool IsLockedOut`, `TimeSpan LockoutRemaining`, `bool TryBeginAttempt()`, `void RecordFailure()`, `void RecordSuccess()`.
+- Produces: `sealed class AuthRateLimiter` with constructor `AuthRateLimiter(int maxFailures = ProtocolConstants.MaxAuthFailures, TimeSpan? lockoutDuration = null, Func<DateTimeOffset>? clock = null)`, constant `const int MaxTrackedPeers = 1024`, static helper `static string PeerKey(EndPoint? endPoint)`, and members `long TotalFailures`, `long LockoutCount`, `int TrackedPeers`, `int ConsecutiveFailures(string peer)`, `bool IsLockedOut(string peer)`, `TimeSpan LockoutRemaining(string peer)`, `bool TryBeginAttempt(string peer)`, `void RecordFailure(string peer)`, `void RecordSuccess(string peer)`.
 
-The clock is injectable so the 30-second lockout is testable without a 30-second test. The limiter is agent-wide (one instance shared by every connection), because protocol §11.4 requires the count not be resettable by choosing a new source port.
+One instance is shared by every connection, as before — but the 5-failure/30-second counter inside it is **keyed on the peer's source IP address, with the source port excluded**, per the "Authentication rate limiting" block in Global Constraints. The reasoning, restated because this is the one place it is implemented:
+
+- A **per-device** counter cannot exist. Identifying the device *is* the thing being attempted, and the only pre-identification hint, `clientId`, is unauthenticated — keying on it would let an attacker lock out a named Mac by impersonating it.
+- A **per-connection** counter never throttles anything: one failed `HELLO` closes the connection, so the count never reaches 5.
+- A **single global** counter lets any host that can reach port 47800 lock every paired Mac out indefinitely, five failures at a time. That is the outcome this design must not have.
+- Keying on the **address without the port** keeps §11.4's actual requirement — the counter must not be resettable by picking a new source port — while confining the refusal to the host that earned it.
+
+Agent-wide `TotalFailures` and `LockoutCount` are still tracked, still shown in the tray, and still logged, but they **refuse nothing**; they are the alarm that says "someone is hammering the listener".
+
+The clock is injectable so the 30-second lockout is testable without a 30-second test.
 
 **This task runs on Windows.**
 
@@ -2303,6 +2411,7 @@ The clock is injectable so the 30-second lockout is testable without a 30-second
 `windows/SharedMic.Agent.Tests/AuthRateLimiterTests.cs`:
 
 ```csharp
+using System.Net;
 using SharedMic.Agent.Protocol;
 using SharedMic.Agent.Security;
 using Xunit;
@@ -2311,6 +2420,10 @@ namespace SharedMic.Agent.Tests;
 
 public class AuthRateLimiterTests
 {
+    private const string Attacker = "192.168.1.66";
+    private const string MacStudio = "192.168.1.10";
+    private const string MacBook = "192.168.1.11";
+
     private sealed class TestClock
     {
         public DateTimeOffset Now { get; set; } = new(2026, 8, 10, 12, 0, 0, TimeSpan.Zero);
@@ -2320,14 +2433,22 @@ public class AuthRateLimiterTests
         public void Advance(TimeSpan amount) => Now += amount;
     }
 
+    private static void Fail(AuthRateLimiter limiter, string peer, int times)
+    {
+        for (var i = 0; i < times; i++)
+        {
+            limiter.RecordFailure(peer);
+        }
+    }
+
     [Fact]
     public void DefaultsMatchTheContract()
     {
         var limiter = new AuthRateLimiter();
 
-        Assert.False(limiter.IsLockedOut);
-        Assert.True(limiter.TryBeginAttempt());
-        Assert.Equal(TimeSpan.Zero, limiter.LockoutRemaining);
+        Assert.False(limiter.IsLockedOut(Attacker));
+        Assert.True(limiter.TryBeginAttempt(Attacker));
+        Assert.Equal(TimeSpan.Zero, limiter.LockoutRemaining(Attacker));
         Assert.Equal(5, ProtocolConstants.MaxAuthFailures);
         Assert.Equal(TimeSpan.FromSeconds(30), ProtocolConstants.AuthLockoutDuration);
     }
@@ -2338,14 +2459,11 @@ public class AuthRateLimiterTests
         var clock = new TestClock();
         var limiter = new AuthRateLimiter(clock: clock.Read);
 
-        for (var i = 0; i < 4; i++)
-        {
-            limiter.RecordFailure();
-        }
+        Fail(limiter, Attacker, 4);
 
-        Assert.False(limiter.IsLockedOut);
-        Assert.True(limiter.TryBeginAttempt());
-        Assert.Equal(4, limiter.ConsecutiveFailures);
+        Assert.False(limiter.IsLockedOut(Attacker));
+        Assert.True(limiter.TryBeginAttempt(Attacker));
+        Assert.Equal(4, limiter.ConsecutiveFailures(Attacker));
     }
 
     [Fact]
@@ -2354,15 +2472,52 @@ public class AuthRateLimiterTests
         var clock = new TestClock();
         var limiter = new AuthRateLimiter(clock: clock.Read);
 
-        for (var i = 0; i < 5; i++)
+        Fail(limiter, Attacker, 5);
+
+        Assert.True(limiter.IsLockedOut(Attacker));
+        Assert.False(limiter.TryBeginAttempt(Attacker));
+        Assert.Equal(TimeSpan.FromSeconds(30), limiter.LockoutRemaining(Attacker));
+        Assert.Equal(1, limiter.LockoutCount);
+        Assert.Equal(5, limiter.TotalFailures);
+    }
+
+    /// <summary>
+    /// The reason this limiter is keyed at all. One host failing five times must
+    /// not take every paired Mac offline for 30 seconds — that would make a
+    /// fleet-wide outage available to anything that can open a TCP connection.
+    /// </summary>
+    [Fact]
+    public void OneLockedOutPeerDoesNotLockOutAnyOtherPeer()
+    {
+        var clock = new TestClock();
+        var limiter = new AuthRateLimiter(clock: clock.Read);
+
+        Fail(limiter, Attacker, 5);
+
+        Assert.True(limiter.IsLockedOut(Attacker));
+        Assert.False(limiter.IsLockedOut(MacStudio));
+        Assert.False(limiter.IsLockedOut(MacBook));
+        Assert.True(limiter.TryBeginAttempt(MacStudio));
+        Assert.True(limiter.TryBeginAttempt(MacBook));
+        Assert.Equal(0, limiter.ConsecutiveFailures(MacStudio));
+    }
+
+    [Fact]
+    public void FailuresFromDifferentPeersDoNotAccumulateIntoOneLockout()
+    {
+        var clock = new TestClock();
+        var limiter = new AuthRateLimiter(clock: clock.Read);
+
+        for (var i = 0; i < 4; i++)
         {
-            limiter.RecordFailure();
+            limiter.RecordFailure(Attacker);
+            limiter.RecordFailure(MacStudio);
         }
 
-        Assert.True(limiter.IsLockedOut);
-        Assert.False(limiter.TryBeginAttempt());
-        Assert.Equal(TimeSpan.FromSeconds(30), limiter.LockoutRemaining);
-        Assert.Equal(1, limiter.LockoutCount);
+        Assert.False(limiter.IsLockedOut(Attacker));
+        Assert.False(limiter.IsLockedOut(MacStudio));
+        Assert.Equal(0, limiter.LockoutCount);
+        Assert.Equal(8, limiter.TotalFailures);
     }
 
     [Fact]
@@ -2371,18 +2526,15 @@ public class AuthRateLimiterTests
         var clock = new TestClock();
         var limiter = new AuthRateLimiter(clock: clock.Read);
 
-        for (var i = 0; i < 5; i++)
-        {
-            limiter.RecordFailure();
-        }
+        Fail(limiter, Attacker, 5);
 
         clock.Advance(TimeSpan.FromSeconds(29));
-        Assert.True(limiter.IsLockedOut);
+        Assert.True(limiter.IsLockedOut(Attacker));
 
         clock.Advance(TimeSpan.FromSeconds(1.5));
-        Assert.False(limiter.IsLockedOut);
-        Assert.True(limiter.TryBeginAttempt());
-        Assert.Equal(TimeSpan.Zero, limiter.LockoutRemaining);
+        Assert.False(limiter.IsLockedOut(Attacker));
+        Assert.True(limiter.TryBeginAttempt(Attacker));
+        Assert.Equal(TimeSpan.Zero, limiter.LockoutRemaining(Attacker));
     }
 
     [Fact]
@@ -2391,57 +2543,47 @@ public class AuthRateLimiterTests
         var clock = new TestClock();
         var limiter = new AuthRateLimiter(clock: clock.Read);
 
-        for (var i = 0; i < 5; i++)
-        {
-            limiter.RecordFailure();
-        }
+        Fail(limiter, Attacker, 5);
 
         clock.Advance(TimeSpan.FromSeconds(31));
-        Assert.Equal(0, limiter.ConsecutiveFailures);
+        Assert.Equal(0, limiter.ConsecutiveFailures(Attacker));
 
-        for (var i = 0; i < 4; i++)
-        {
-            limiter.RecordFailure();
-        }
+        Fail(limiter, Attacker, 4);
+        Assert.False(limiter.IsLockedOut(Attacker));
 
-        Assert.False(limiter.IsLockedOut);
-
-        limiter.RecordFailure();
-        Assert.True(limiter.IsLockedOut);
+        limiter.RecordFailure(Attacker);
+        Assert.True(limiter.IsLockedOut(Attacker));
         Assert.Equal(2, limiter.LockoutCount);
     }
 
     [Fact]
-    public void SuccessClearsTheConsecutiveCount()
+    public void SuccessClearsTheConsecutiveCountForThatPeerOnly()
     {
         var clock = new TestClock();
         var limiter = new AuthRateLimiter(clock: clock.Read);
 
-        limiter.RecordFailure();
-        limiter.RecordFailure();
-        limiter.RecordFailure();
-        limiter.RecordFailure();
-        limiter.RecordSuccess();
-        limiter.RecordFailure();
+        Fail(limiter, MacStudio, 4);
+        Fail(limiter, Attacker, 4);
+        limiter.RecordSuccess(MacStudio);
+        limiter.RecordFailure(MacStudio);
 
-        Assert.Equal(1, limiter.ConsecutiveFailures);
-        Assert.False(limiter.IsLockedOut);
+        Assert.Equal(1, limiter.ConsecutiveFailures(MacStudio));
+        Assert.Equal(4, limiter.ConsecutiveFailures(Attacker));
+        Assert.False(limiter.IsLockedOut(MacStudio));
     }
 
     [Fact]
-    public void ACorrectTokenIsAlsoRefusedWhileLockedOut()
+    public void ACorrectTokenFromALockedOutPeerIsAlsoRefused()
     {
         var clock = new TestClock();
         var limiter = new AuthRateLimiter(clock: clock.Read);
 
-        for (var i = 0; i < 5; i++)
-        {
-            limiter.RecordFailure();
-        }
+        Fail(limiter, Attacker, 5);
 
         // The caller must consult TryBeginAttempt before verifying anything, so
-        // the lockout is not a per-credential check but a per-agent one.
-        Assert.False(limiter.TryBeginAttempt());
+        // the lockout is not a per-credential check: even a valid proof from
+        // that address is refused without being evaluated.
+        Assert.False(limiter.TryBeginAttempt(Attacker));
     }
 
     [Fact]
@@ -2450,12 +2592,63 @@ public class AuthRateLimiterTests
         var clock = new TestClock();
         var limiter = new AuthRateLimiter(maxFailures: 2, lockoutDuration: TimeSpan.FromMilliseconds(200), clock: clock.Read);
 
-        limiter.RecordFailure();
-        limiter.RecordFailure();
+        Fail(limiter, Attacker, 2);
 
-        Assert.True(limiter.IsLockedOut);
+        Assert.True(limiter.IsLockedOut(Attacker));
         clock.Advance(TimeSpan.FromMilliseconds(250));
-        Assert.False(limiter.IsLockedOut);
+        Assert.False(limiter.IsLockedOut(Attacker));
+    }
+
+    /// <summary>
+    /// protocol-v1.md section 11.4's stated concern: the count must not be
+    /// resettable by picking a new source port. Excluding the port from the key
+    /// is exactly what satisfies that.
+    /// </summary>
+    [Fact]
+    public void PeerKeyExcludesTheSourcePortSoReconnectingDoesNotResetTheCount()
+    {
+        var first = AuthRateLimiter.PeerKey(new IPEndPoint(IPAddress.Parse("192.168.1.66"), 51000));
+        var second = AuthRateLimiter.PeerKey(new IPEndPoint(IPAddress.Parse("192.168.1.66"), 51001));
+
+        Assert.Equal(first, second);
+        Assert.Equal("192.168.1.66", first);
+        Assert.NotEqual(first, AuthRateLimiter.PeerKey(new IPEndPoint(IPAddress.Parse("192.168.1.67"), 51000)));
+    }
+
+    [Fact]
+    public void PeerKeyCollapsesIpv4MappedIpv6SoOneHostIsOneCounter()
+    {
+        var mapped = AuthRateLimiter.PeerKey(
+            new IPEndPoint(IPAddress.Parse("192.168.1.66").MapToIPv6(), 51000));
+
+        Assert.Equal("192.168.1.66", mapped);
+    }
+
+    [Fact]
+    public void PeerKeyHandlesAnUnknownEndpointWithoutThrowing()
+    {
+        Assert.Equal("unknown", AuthRateLimiter.PeerKey(null));
+    }
+
+    /// <summary>
+    /// An attacker who sprays source addresses must not be able to grow the
+    /// table without bound. Expired entries are evicted first, and the table is
+    /// capped.
+    /// </summary>
+    [Fact]
+    public void TheTableIsBoundedAndPrunesExpiredEntries()
+    {
+        var clock = new TestClock();
+        var limiter = new AuthRateLimiter(clock: clock.Read);
+
+        for (var i = 0; i < 2000; i++)
+        {
+            limiter.RecordFailure($"10.0.{i / 256}.{i % 256}");
+        }
+
+        Assert.True(limiter.TrackedPeers <= AuthRateLimiter.MaxTrackedPeers,
+            $"tracked {limiter.TrackedPeers} peers, cap is {AuthRateLimiter.MaxTrackedPeers}");
+        Assert.Equal(2000, limiter.TotalFailures);
     }
 }
 ```
@@ -2475,6 +2668,8 @@ Expected: FAIL with `CS0246: The type or namespace name 'AuthRateLimiter' could 
 `windows/SharedMic.Agent/Security/AuthRateLimiter.cs`:
 
 ```csharp
+using System.Net;
+using System.Net.Sockets;
 using SharedMic.Agent.Protocol;
 
 namespace SharedMic.Agent.Security;
@@ -2486,23 +2681,51 @@ namespace SharedMic.Agent.Security;
 /// verified HELLO: a wrong mac, a malformed or non-HELLO message, or the
 /// 5-second pre-auth deadline expiring.
 ///
-/// The lockout is counted PER AGENT, not per source address. One instance is
-/// shared by every connection, so an attacker choosing source ports freely
-/// cannot reset it.
-///
 /// Without this, the handshake is an unthrottled HMAC verification oracle
 /// reachable by anything that can open a TCP connection to the listener.
+///
+/// SCOPE, and why. The counter is keyed on the peer's source IP ADDRESS, with
+/// the source PORT deliberately excluded. The alternatives were all worse:
+///
+///   per device      impossible. The device is identified BY the proof, so
+///                   before a proof verifies there is nothing to key on but
+///                   clientId, which is unauthenticated. Keying on clientId
+///                   would let an attacker lock out a named Mac by claiming to
+///                   be it.
+///   per connection  never throttles. A failed HELLO closes the connection, so
+///                   the count never reaches 2.
+///   one global      lets any host that can reach port 47800 lock out EVERY
+///                   paired Mac indefinitely, five failures at a time. With one
+///                   paired Mac that was an annoyance; with several it is a
+///                   fleet outage handed to a single attacker.
+///
+/// Excluding the port preserves section 11.4's actual requirement — the count
+/// must not be resettable by choosing a new source port — while confining the
+/// refusal to the host that earned it.
+///
+/// TotalFailures and LockoutCount are agent-wide and REFUSE NOTHING. They exist
+/// so the tray and the logs can show that the listener is being hammered.
 /// </summary>
 public sealed class AuthRateLimiter
 {
+    /// <summary>An attacker spraying source addresses must not grow this table without bound.</summary>
+    public const int MaxTrackedPeers = 1024;
+
+    private sealed class PeerState
+    {
+        public int ConsecutiveFailures;
+        public DateTimeOffset LockedUntil = DateTimeOffset.MinValue;
+        public DateTimeOffset LastSeen;
+    }
+
     private readonly int _maxFailures;
     private readonly TimeSpan _lockoutDuration;
     private readonly Func<DateTimeOffset> _clock;
     private readonly object _gate = new();
+    private readonly Dictionary<string, PeerState> _peers = new(StringComparer.Ordinal);
 
-    private int _consecutiveFailures;
+    private long _totalFailures;
     private long _lockoutCount;
-    private DateTimeOffset _lockedUntil = DateTimeOffset.MinValue;
 
     public AuthRateLimiter(
         int maxFailures = ProtocolConstants.MaxAuthFailures,
@@ -2519,18 +2742,40 @@ public sealed class AuthRateLimiter
         _clock = clock ?? (() => DateTimeOffset.UtcNow);
     }
 
-    public int ConsecutiveFailures
+    /// <summary>
+    /// The key a connection is counted under: the remote address, never the
+    /// port. An IPv4-mapped IPv6 address (what a dual-stack socket reports for
+    /// an IPv4 peer) collapses to its IPv4 form so one host is one counter.
+    /// </summary>
+    public static string PeerKey(EndPoint? endPoint)
+    {
+        if (endPoint is not IPEndPoint ip)
+        {
+            return "unknown";
+        }
+
+        var address = ip.Address;
+        if (address.AddressFamily == AddressFamily.InterNetworkV6 && address.IsIPv4MappedToIPv6)
+        {
+            address = address.MapToIPv4();
+        }
+
+        return address.ToString();
+    }
+
+    /// <summary>Agent-wide total of failed attempts. Advisory: it refuses nothing.</summary>
+    public long TotalFailures
     {
         get
         {
             lock (_gate)
             {
-                ExpireLockout();
-                return _consecutiveFailures;
+                return _totalFailures;
             }
         }
     }
 
+    /// <summary>Agent-wide count of lockouts applied, across all peers. Advisory.</summary>
     public long LockoutCount
     {
         get
@@ -2542,65 +2787,150 @@ public sealed class AuthRateLimiter
         }
     }
 
-    public bool IsLockedOut
+    public int TrackedPeers
     {
         get
         {
             lock (_gate)
             {
-                ExpireLockout();
-                return _clock() < _lockedUntil;
+                return _peers.Count;
             }
         }
     }
 
-    public TimeSpan LockoutRemaining
+    public int ConsecutiveFailures(string peer)
     {
-        get
+        lock (_gate)
         {
-            lock (_gate)
+            if (!_peers.TryGetValue(peer, out var state))
             {
-                var remaining = _lockedUntil - _clock();
-                return remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero;
+                return 0;
             }
+
+            Expire(state);
+            return state.ConsecutiveFailures;
+        }
+    }
+
+    public bool IsLockedOut(string peer)
+    {
+        lock (_gate)
+        {
+            if (!_peers.TryGetValue(peer, out var state))
+            {
+                return false;
+            }
+
+            Expire(state);
+            return _clock() < state.LockedUntil;
+        }
+    }
+
+    public TimeSpan LockoutRemaining(string peer)
+    {
+        lock (_gate)
+        {
+            if (!_peers.TryGetValue(peer, out var state))
+            {
+                return TimeSpan.Zero;
+            }
+
+            var remaining = state.LockedUntil - _clock();
+            return remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero;
         }
     }
 
     /// <summary>
-    /// Call this before verifying any proof. False means the agent is locked
+    /// Call this before verifying any proof. False means this peer is locked
     /// out and the connection must be closed without evaluating the credential.
+    /// Every other peer is unaffected.
     /// </summary>
-    public bool TryBeginAttempt() => !IsLockedOut;
+    public bool TryBeginAttempt(string peer) => !IsLockedOut(peer);
 
-    public void RecordFailure()
+    public void RecordFailure(string peer)
     {
         lock (_gate)
         {
-            ExpireLockout();
-            _consecutiveFailures++;
-            if (_consecutiveFailures >= _maxFailures)
+            _totalFailures++;
+
+            var state = GetOrAdd(peer);
+            Expire(state);
+            state.ConsecutiveFailures++;
+            if (state.ConsecutiveFailures >= _maxFailures)
             {
-                _lockedUntil = _clock() + _lockoutDuration;
-                _consecutiveFailures = 0;
+                state.LockedUntil = _clock() + _lockoutDuration;
+                state.ConsecutiveFailures = 0;
                 _lockoutCount++;
             }
         }
     }
 
-    public void RecordSuccess()
+    public void RecordSuccess(string peer)
     {
         lock (_gate)
         {
-            _consecutiveFailures = 0;
-            _lockedUntil = DateTimeOffset.MinValue;
+            // A success clears only this peer. It must not clear an attacker's
+            // counter just because a legitimate Mac authenticated.
+            _peers.Remove(peer);
         }
     }
 
-    private void ExpireLockout()
+    private PeerState GetOrAdd(string peer)
     {
-        if (_lockedUntil != DateTimeOffset.MinValue && _clock() >= _lockedUntil)
+        if (_peers.TryGetValue(peer, out var existing))
         {
-            _lockedUntil = DateTimeOffset.MinValue;
+            existing.LastSeen = _clock();
+            return existing;
+        }
+
+        if (_peers.Count >= MaxTrackedPeers)
+        {
+            Prune();
+        }
+
+        var state = new PeerState { LastSeen = _clock() };
+        _peers[peer] = state;
+        return state;
+    }
+
+    /// <summary>
+    /// Drop every entry that is neither locked out nor recently active, then, if
+    /// that was not enough, the oldest entries by last activity. Called under
+    /// _gate only.
+    /// </summary>
+    private void Prune()
+    {
+        var now = _clock();
+
+        foreach (var key in _peers
+                     .Where(pair => pair.Value.LockedUntil <= now &&
+                                    now - pair.Value.LastSeen > _lockoutDuration)
+                     .Select(pair => pair.Key)
+                     .ToList())
+        {
+            _peers.Remove(key);
+        }
+
+        if (_peers.Count < MaxTrackedPeers)
+        {
+            return;
+        }
+
+        foreach (var key in _peers
+                     .OrderBy(pair => pair.Value.LastSeen)
+                     .Take((_peers.Count - MaxTrackedPeers) + 1)
+                     .Select(pair => pair.Key)
+                     .ToList())
+        {
+            _peers.Remove(key);
+        }
+    }
+
+    private void Expire(PeerState state)
+    {
+        if (state.LockedUntil != DateTimeOffset.MinValue && _clock() >= state.LockedUntil)
+        {
+            state.LockedUntil = DateTimeOffset.MinValue;
         }
     }
 }
@@ -2614,13 +2944,13 @@ Run, from the repo's `windows` directory on Windows:
 dotnet test SharedMic.Windows.sln --filter "FullyQualifiedName~AuthRateLimiterTests"
 ```
 
-Expected: PASS, 8 tests.
+Expected: PASS, 14 tests. `OneLockedOutPeerDoesNotLockOutAnyOtherPeer` is the one that encodes the decision above; if a later change makes the counter global again, that is the test that must fail.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add windows/SharedMic.Agent/Security/AuthRateLimiter.cs windows/SharedMic.Agent.Tests/AuthRateLimiterTests.cs
-git commit -m "Phase 1 Task 7: agent-wide 5-attempt/30-second authentication lockout"
+git commit -m "Phase 1 Task 7: 5-attempt/30-second authentication lockout, keyed per source address"
 ```
 
 ---
@@ -2635,7 +2965,9 @@ git commit -m "Phase 1 Task 7: agent-wide 5-attempt/30-second authentication loc
 - Consumes: nothing beyond the BCL.
 - Produces: `enum SessionState { Idle, Active }`; `readonly record struct StartOutcome(bool Accepted, string SessionId, string? Reason, bool StartedNewSession)`; `readonly record struct StopOutcome(string SessionId, bool EndedSession)`; `sealed class SessionStateMachine` with constructor `SessionStateMachine(Func<string>? sessionIdFactory = null)` and members `static string DefaultSessionId()`, `SessionState State`, `string? SessionId`, `long SessionsStarted`, `StartOutcome HandleStart(bool micPresent)`, `StopOutcome HandleStop(string requestedSessionId)`, `void Reset()`.
 
-This is one of the three pure units spec §3.1 names. It performs no I/O and is not thread-safe by design: `ControlConnection` dispatches every control message from a single read loop.
+This is one of the three pure units spec §3.1 names. It performs no I/O and is **not thread-safe by design**.
+
+That last point used to be justified by "`ControlConnection` dispatches every control message from a single read loop". With several Macs connected at once that is no longer sufficient on its own: there is one session shared across many connections, each with its own read loop. The resolution is that **nothing outside `SessionArbiter` (Task 9) ever touches a `SessionStateMachine`**. The arbiter owns exactly one instance, serializes every call to it behind a lock, and adds the owner tracking the machine deliberately does not have. Keeping the machine ignorant of owners and locks is what keeps it a pure unit that spec §3.1 can point at.
 
 **This task runs on Windows.**
 
@@ -2852,10 +3184,15 @@ public readonly record struct StopOutcome(string SessionId, bool EndedSession);
 /// anything, which is what makes it safe for the Mac to retry START after a
 /// reconnect without knowing whether the previous one landed. A STOP while
 /// idle still succeeds, and STOP is never rejected on a sessionId mismatch:
-/// STOP means "make sure no session is active on this connection".
+/// STOP means "make sure no session is active".
 ///
-/// Not thread-safe by design. ControlConnection dispatches every control
-/// message from its single read loop.
+/// This type knows nothing about WHO holds the session, and that is deliberate.
+/// There is one session across every connected Mac; deciding whose START opens
+/// it, whose START is refused with SESSION_IN_USE, and whose disconnect ends it
+/// belongs to SessionArbiter, which owns the single instance of this class and
+/// is the only caller of it.
+///
+/// Not thread-safe by design. SessionArbiter serializes every call.
 ///
 /// Phase 1 note: an active session streams nothing. There is no capture path
 /// yet, so State == Active means only that a session identifier is allocated.
@@ -2928,7 +3265,529 @@ git commit -m "Phase 1 Task 8: pure session state machine with idempotent START 
 
 ---
 
-### Task 9: Priority send queue
+### Task 9: Session arbiter — one session, many connections
+
+There is one microphone, so there is one session; there are several paired Macs, so there are several connections competing for it. This task is the whole of that arbitration, and it is deliberately separate from Task 8 so the pure state machine stays pure.
+
+**The Python mock proves nothing here.** `MockWindowsServer` gives every connection its own `_session_id`, so two mock clients both get `START_ACK` and no harness test drives two authenticated clients at once. Everything in this task is proved by these local xUnit tests and by the loopback tests in Tasks 14 and 15 — never by `harness/tests` and never by `drive_windows_agent.py`.
+
+**Files:**
+- Create: `windows/SharedMic.Agent/Session/SessionArbiter.cs`
+- Test: `windows/SharedMic.Agent.Tests/SessionArbiterTests.cs`
+
+**Interfaces:**
+- Consumes: `SessionState`, `SessionStateMachine(Func<string>?)`, `SessionStateMachine.HandleStart(bool)`, `SessionStateMachine.HandleStop(string)`, `SessionStateMachine.Reset()`, `SessionStateMachine.State`, `SessionStateMachine.SessionId`, `SessionStateMachine.SessionsStarted` (Task 8).
+- Produces: `readonly record struct SessionGrant(bool Accepted, string SessionId, string? Reason, string? HolderName, bool StartedNewSession)`; `readonly record struct SessionRelease(string SessionId, bool EndedSession)`; `sealed class SessionArbiter` with constants `const string MicUnavailable = "MIC_UNAVAILABLE"` and `const string SessionInUse = "SESSION_IN_USE"`, constructor `SessionArbiter(Func<string>? sessionIdFactory = null)`, and members `string? ActiveSessionId`, `string? HolderId`, `string? HolderName`, `long SessionsStarted`, `SessionGrant Start(string ownerId, string ownerName, bool micPresent)`, `SessionRelease Stop(string ownerId, string requestedSessionId)`, `bool EndSessionOwnedBy(string ownerId)`, `void Reset()`.
+
+`ownerId` is the **connection's** identifier, not the device's: one paired Mac may hold two connections open, and only the one that received the `START_ACK` owns the session. `ownerName` is the owner-assigned friendly name of the paired device behind that connection — the value that travels as the advisory `holder` field in a `START_NACK`.
+
+**This task runs on Windows.** It is pure — no sockets, no timers — so it is the cheapest place to get the multi-device rules right.
+
+- [ ] **Step 1: Write the failing test**
+
+`windows/SharedMic.Agent.Tests/SessionArbiterTests.cs`:
+
+```csharp
+using SharedMic.Agent.Session;
+using Xunit;
+
+namespace SharedMic.Agent.Tests;
+
+public class SessionArbiterTests
+{
+    private static SessionArbiter Counting()
+    {
+        var next = 0;
+        return new SessionArbiter(() => $"sess-{++next:0000}");
+    }
+
+    [Fact]
+    public void StartsIdleWithNoHolder()
+    {
+        var arbiter = Counting();
+
+        Assert.Null(arbiter.ActiveSessionId);
+        Assert.Null(arbiter.HolderId);
+        Assert.Null(arbiter.HolderName);
+        Assert.Equal(0, arbiter.SessionsStarted);
+    }
+
+    [Fact]
+    public void TheFirstStartGrantsTheSessionAndRecordsTheHolder()
+    {
+        var arbiter = Counting();
+
+        var grant = arbiter.Start("conn-a", "Mac Studio", micPresent: true);
+
+        Assert.True(grant.Accepted);
+        Assert.True(grant.StartedNewSession);
+        Assert.Null(grant.Reason);
+        Assert.Equal("sess-0001", grant.SessionId);
+        Assert.Equal("Mac Studio", grant.HolderName);
+        Assert.Equal("conn-a", arbiter.HolderId);
+        Assert.Equal("Mac Studio", arbiter.HolderName);
+        Assert.Equal(1, arbiter.SessionsStarted);
+    }
+
+    [Fact]
+    public void TheHolderRepeatingStartGetsTheSameSessionIdAndNoSecondSession()
+    {
+        var arbiter = Counting();
+
+        var first = arbiter.Start("conn-a", "Mac Studio", micPresent: true);
+        var second = arbiter.Start("conn-a", "Mac Studio", micPresent: true);
+
+        Assert.True(second.Accepted);
+        Assert.False(second.StartedNewSession);
+        Assert.Equal(first.SessionId, second.SessionId);
+        Assert.Equal(1, arbiter.SessionsStarted);
+    }
+
+    [Fact]
+    public void ASecondDeviceIsRefusedWithSessionInUseAndTheHolderName()
+    {
+        var arbiter = Counting();
+        arbiter.Start("conn-a", "Mac Studio", micPresent: true);
+
+        var refused = arbiter.Start("conn-b", "MacBook Pro", micPresent: true);
+
+        Assert.False(refused.Accepted);
+        Assert.Equal("SESSION_IN_USE", refused.Reason);
+        Assert.Equal(SessionArbiter.SessionInUse, refused.Reason);
+        Assert.Equal("Mac Studio", refused.HolderName);
+        Assert.Equal(string.Empty, refused.SessionId);
+        Assert.False(refused.StartedNewSession);
+    }
+
+    [Fact]
+    public void ARefusalLeavesTheExistingSessionCompletelyUndisturbed()
+    {
+        var arbiter = Counting();
+        var granted = arbiter.Start("conn-a", "Mac Studio", micPresent: true);
+
+        arbiter.Start("conn-b", "MacBook Pro", micPresent: true);
+        arbiter.Start("conn-c", "Mac mini", micPresent: true);
+
+        Assert.Equal(granted.SessionId, arbiter.ActiveSessionId);
+        Assert.Equal("conn-a", arbiter.HolderId);
+        Assert.Equal(1, arbiter.SessionsStarted);
+    }
+
+    /// <summary>
+    /// Otherwise any paired Mac could cancel another's session with one message.
+    /// </summary>
+    [Fact]
+    public void StopFromANonHolderEndsNothingButStillSucceeds()
+    {
+        var arbiter = Counting();
+        var granted = arbiter.Start("conn-a", "Mac Studio", micPresent: true);
+
+        var release = arbiter.Stop("conn-b", "sess-whatever");
+
+        Assert.False(release.EndedSession);
+        Assert.Equal("sess-whatever", release.SessionId);
+        Assert.Equal(granted.SessionId, arbiter.ActiveSessionId);
+        Assert.Equal("conn-a", arbiter.HolderId);
+    }
+
+    [Fact]
+    public void StopFromTheHolderEndsTheSessionAndReleasesTheHold()
+    {
+        var arbiter = Counting();
+        var granted = arbiter.Start("conn-a", "Mac Studio", micPresent: true);
+
+        var release = arbiter.Stop("conn-a", granted.SessionId);
+
+        Assert.True(release.EndedSession);
+        Assert.Equal(granted.SessionId, release.SessionId);
+        Assert.Null(arbiter.ActiveSessionId);
+        Assert.Null(arbiter.HolderId);
+        Assert.Null(arbiter.HolderName);
+    }
+
+    [Fact]
+    public void TheHolderIsNotRejectedOnAStaleSessionId()
+    {
+        var arbiter = Counting();
+        arbiter.Start("conn-a", "Mac Studio", micPresent: true);
+
+        var release = arbiter.Stop("conn-a", "sess-from-a-previous-connection");
+
+        Assert.True(release.EndedSession);
+        Assert.Equal("sess-0001", release.SessionId);
+    }
+
+    [Fact]
+    public void StopWhileIdleSucceedsAndEchoesTheRequestedId()
+    {
+        var arbiter = Counting();
+
+        var release = arbiter.Stop("conn-b", "");
+
+        Assert.False(release.EndedSession);
+        Assert.Equal("", release.SessionId);
+    }
+
+    [Fact]
+    public void AfterTheHolderStopsTheOtherDeviceCanStart()
+    {
+        var arbiter = Counting();
+        var first = arbiter.Start("conn-a", "Mac Studio", micPresent: true);
+        arbiter.Stop("conn-a", first.SessionId);
+
+        var second = arbiter.Start("conn-b", "MacBook Pro", micPresent: true);
+
+        Assert.True(second.Accepted);
+        Assert.True(second.StartedNewSession);
+        Assert.NotEqual(first.SessionId, second.SessionId);
+        Assert.Equal("conn-b", arbiter.HolderId);
+        Assert.Equal(2, arbiter.SessionsStarted);
+    }
+
+    /// <summary>
+    /// The load-bearing rule. A Mac that crashes, sleeps, or has its cable
+    /// pulled never sends STOP. Without this, every other paired Mac is locked
+    /// out until the 45-second dead-peer timer fires — and if the session were
+    /// only ever released by STOP, forever.
+    /// </summary>
+    [Fact]
+    public void LosingTheOwningConnectionEndsTheSession()
+    {
+        var arbiter = Counting();
+        arbiter.Start("conn-a", "Mac Studio", micPresent: true);
+
+        Assert.True(arbiter.EndSessionOwnedBy("conn-a"));
+
+        Assert.Null(arbiter.ActiveSessionId);
+        Assert.Null(arbiter.HolderId);
+        Assert.True(arbiter.Start("conn-b", "MacBook Pro", micPresent: true).Accepted);
+    }
+
+    [Fact]
+    public void LosingANonOwningConnectionDoesNotEndTheSession()
+    {
+        var arbiter = Counting();
+        var granted = arbiter.Start("conn-a", "Mac Studio", micPresent: true);
+
+        Assert.False(arbiter.EndSessionOwnedBy("conn-b"));
+
+        Assert.Equal(granted.SessionId, arbiter.ActiveSessionId);
+        Assert.Equal("conn-a", arbiter.HolderId);
+    }
+
+    [Fact]
+    public void LosingAConnectionWhileIdleIsANoOp()
+    {
+        var arbiter = Counting();
+
+        Assert.False(arbiter.EndSessionOwnedBy("conn-a"));
+
+        Assert.Null(arbiter.ActiveSessionId);
+        Assert.Equal(0, arbiter.SessionsStarted);
+    }
+
+    [Fact]
+    public void MicUnavailableIsStillRefusedWhenNobodyHoldsTheSession()
+    {
+        var arbiter = Counting();
+
+        var refused = arbiter.Start("conn-a", "Mac Studio", micPresent: false);
+
+        Assert.False(refused.Accepted);
+        Assert.Equal("MIC_UNAVAILABLE", refused.Reason);
+        Assert.Null(refused.HolderName);
+        Assert.Equal(0, arbiter.SessionsStarted);
+    }
+
+    /// <summary>
+    /// SESSION_IN_USE is the more specific and more actionable answer, and a
+    /// session cannot be active without the mic having been present when it
+    /// opened, so it takes precedence.
+    /// </summary>
+    [Fact]
+    public void SessionInUseTakesPrecedenceOverMicUnavailable()
+    {
+        var arbiter = Counting();
+        arbiter.Start("conn-a", "Mac Studio", micPresent: true);
+
+        var refused = arbiter.Start("conn-b", "MacBook Pro", micPresent: false);
+
+        Assert.Equal("SESSION_IN_USE", refused.Reason);
+        Assert.Equal("Mac Studio", refused.HolderName);
+    }
+
+    /// <summary>
+    /// The arbiter passes the holder's name through verbatim, including a blank
+    /// one. Suppressing a useless advisory value is the message layer's job:
+    /// ControlMessages.StartNack omits the field for null, empty or whitespace.
+    /// </summary>
+    [Fact]
+    public void ABlankHolderNameIsPassedThroughRatherThanInvented()
+    {
+        var arbiter = Counting();
+        arbiter.Start("conn-a", "", micPresent: true);
+
+        var refused = arbiter.Start("conn-b", "MacBook Pro", micPresent: true);
+
+        Assert.Equal("SESSION_IN_USE", refused.Reason);
+        Assert.Equal("", refused.HolderName);
+        Assert.False(ControlMessagesHolderPresent(refused.HolderName));
+    }
+
+    private static bool ControlMessagesHolderPresent(string? holder) =>
+        SharedMic.Agent.Protocol.ControlMessages
+            .StartNack("r", SessionArbiter.SessionInUse, holder)
+            .ContainsKey("holder");
+
+    /// <summary>
+    /// Unlike SessionStateMachine, this type is reached from every connection's
+    /// read loop at once, so the "one session" rule has to survive a race.
+    /// </summary>
+    [Fact]
+    public void ConcurrentStartsGrantExactlyOneSession()
+    {
+        var arbiter = Counting();
+        var grants = new SessionGrant[32];
+
+        Parallel.For(0, grants.Length, index =>
+        {
+            grants[index] = arbiter.Start($"conn-{index}", $"Mac {index}", micPresent: true);
+        });
+
+        Assert.Equal(1, grants.Count(grant => grant.Accepted));
+        Assert.Equal(1, arbiter.SessionsStarted);
+        Assert.All(
+            grants.Where(grant => !grant.Accepted),
+            grant => Assert.Equal("SESSION_IN_USE", grant.Reason));
+    }
+
+    [Fact]
+    public void ResetClearsTheSessionAndTheHolderWithoutCountingANewOne()
+    {
+        var arbiter = Counting();
+        arbiter.Start("conn-a", "Mac Studio", micPresent: true);
+
+        arbiter.Reset();
+
+        Assert.Null(arbiter.ActiveSessionId);
+        Assert.Null(arbiter.HolderId);
+        Assert.Null(arbiter.HolderName);
+        Assert.Equal(1, arbiter.SessionsStarted);
+    }
+}
+```
+
+- [ ] **Step 2: Run it and confirm it fails**
+
+Run, from the repo's `windows` directory on Windows:
+
+```powershell
+dotnet test SharedMic.Windows.sln --filter "FullyQualifiedName~SessionArbiterTests"
+```
+
+Expected: FAIL with `CS0246: The type or namespace name 'SessionArbiter' could not be found`.
+
+- [ ] **Step 3: Implement**
+
+`windows/SharedMic.Agent/Session/SessionArbiter.cs`:
+
+```csharp
+namespace SharedMic.Agent.Session;
+
+/// <summary>Outcome of one connection's START (protocol-v1.md section 7).</summary>
+public readonly record struct SessionGrant(
+    bool Accepted,
+    string SessionId,
+    string? Reason,
+    string? HolderName,
+    bool StartedNewSession);
+
+/// <summary>Outcome of one connection's STOP (protocol-v1.md section 7).</summary>
+public readonly record struct SessionRelease(string SessionId, bool EndedSession);
+
+/// <summary>
+/// One microphone, one session, several paired Macs. This type owns the single
+/// SessionStateMachine and everything the machine deliberately does not know:
+/// who holds the session, who is refused, and when a lost connection gives it
+/// back.
+///
+/// Rules, all of which have a test in SessionArbiterTests:
+///
+///   - The connection that received the START_ACK owns the session. ownerId is
+///     the CONNECTION's id, not the device's: one Mac may hold two connections
+///     and only one of them can own the session.
+///   - A START from any other connection while the session is held is refused
+///     with SESSION_IN_USE and the holder's friendly name, and changes nothing.
+///   - A STOP from a connection that does not hold the session ends nothing and
+///     still succeeds. The alternative lets any paired Mac cancel another's
+///     session with one message.
+///   - EndSessionOwnedBy is called when the owning connection closes for ANY
+///     reason — STOP is not the only way a session ends. Dead-peer detection
+///     and a socket error both come through here. Without it a crashed Mac
+///     locks every other Mac out.
+///
+/// Every method takes _gate. Unlike SessionStateMachine, this object is reached
+/// concurrently from every connection's read loop.
+/// </summary>
+public sealed class SessionArbiter
+{
+    public const string MicUnavailable = "MIC_UNAVAILABLE";
+    public const string SessionInUse = "SESSION_IN_USE";
+
+    private readonly SessionStateMachine _machine;
+    private readonly object _gate = new();
+
+    private string? _ownerId;
+    private string? _ownerName;
+
+    public SessionArbiter(Func<string>? sessionIdFactory = null) =>
+        _machine = new SessionStateMachine(sessionIdFactory);
+
+    public string? ActiveSessionId
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _machine.SessionId;
+            }
+        }
+    }
+
+    /// <summary>The connection id that holds the session, or null when idle.</summary>
+    public string? HolderId
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _ownerId;
+            }
+        }
+    }
+
+    /// <summary>The friendly name of the device that holds the session, or null when idle.</summary>
+    public string? HolderName
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _ownerName;
+            }
+        }
+    }
+
+    public long SessionsStarted
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _machine.SessionsStarted;
+            }
+        }
+    }
+
+    public SessionGrant Start(string ownerId, string ownerName, bool micPresent)
+    {
+        lock (_gate)
+        {
+            if (_machine.State == SessionState.Active && !string.Equals(_ownerId, ownerId, StringComparison.Ordinal))
+            {
+                // Refused, not queued and not superseded: the holder keeps it.
+                return new SessionGrant(false, string.Empty, SessionInUse, _ownerName, false);
+            }
+
+            var outcome = _machine.HandleStart(micPresent);
+            if (!outcome.Accepted)
+            {
+                return new SessionGrant(false, string.Empty, outcome.Reason, null, false);
+            }
+
+            _ownerId = ownerId;
+            _ownerName = ownerName;
+            return new SessionGrant(true, outcome.SessionId, null, ownerName, outcome.StartedNewSession);
+        }
+    }
+
+    public SessionRelease Stop(string ownerId, string requestedSessionId)
+    {
+        lock (_gate)
+        {
+            if (_machine.State == SessionState.Active && !string.Equals(_ownerId, ownerId, StringComparison.Ordinal))
+            {
+                // Someone else's session. STOP still succeeds — protocol-v1.md
+                // section 7 never rejects a STOP — but it ends nothing.
+                return new SessionRelease(requestedSessionId, false);
+            }
+
+            var outcome = _machine.HandleStop(requestedSessionId);
+            if (outcome.EndedSession)
+            {
+                _ownerId = null;
+                _ownerName = null;
+            }
+
+            return new SessionRelease(outcome.SessionId, outcome.EndedSession);
+        }
+    }
+
+    /// <summary>
+    /// Release the session if this connection holds it. Called on every exit
+    /// path of a connection — STOP, clean close, socket error, dead peer,
+    /// agent shutdown. Returns true when a session was actually ended, which is
+    /// what the caller logs.
+    /// </summary>
+    public bool EndSessionOwnedBy(string ownerId)
+    {
+        lock (_gate)
+        {
+            if (_machine.State != SessionState.Active ||
+                !string.Equals(_ownerId, ownerId, StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            _machine.Reset();
+            _ownerId = null;
+            _ownerName = null;
+            return true;
+        }
+    }
+
+    public void Reset()
+    {
+        lock (_gate)
+        {
+            _machine.Reset();
+            _ownerId = null;
+            _ownerName = null;
+        }
+    }
+}
+```
+
+- [ ] **Step 4: Run and confirm it passes**
+
+Run, from the repo's `windows` directory on Windows:
+
+```powershell
+dotnet test SharedMic.Windows.sln --filter "FullyQualifiedName~SessionArbiterTests"
+```
+
+Expected: PASS, 18 tests.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add windows/SharedMic.Agent/Session/SessionArbiter.cs windows/SharedMic.Agent.Tests/SessionArbiterTests.cs
+git commit -m "Phase 1 Task 9: session arbiter, one session across many connected Macs"
+```
+
+---
+
+### Task 10: Priority send queue
 
 **Files:**
 - Create: `windows/SharedMic.Agent/Net/PrioritySendQueue.cs`
@@ -3366,12 +4225,12 @@ Expected: PASS, 12 tests.
 
 ```bash
 git add windows/SharedMic.Agent/Net/PrioritySendQueue.cs windows/SharedMic.Agent.Tests/PrioritySendQueueTests.cs
-git commit -m "Phase 1 Task 9: priority send queue, unbounded control, 25-frame drop-oldest audio ring"
+git commit -m "Phase 1 Task 10: priority send queue, unbounded control, 25-frame drop-oldest audio ring"
 ```
 
 ---
 
-### Task 10: Incremental frame reader
+### Task 11: Incremental frame reader
 
 **Files:**
 - Create: `windows/SharedMic.Agent/Net/FrameReader.cs`
@@ -3627,12 +4486,12 @@ Expected: PASS, 7 tests.
 
 ```bash
 git add windows/SharedMic.Agent/Net/FrameReader.cs windows/SharedMic.Agent.Tests/FrameReaderTests.cs
-git commit -m "Phase 1 Task 10: incremental frame reader with close-on-violation semantics"
+git commit -m "Phase 1 Task 11: incremental frame reader with close-on-violation semantics"
 ```
 
 ---
 
-### Task 11: Device certificate and DPAPI-protected identity store
+### Task 12: Device certificate and DPAPI-protected identity store
 
 **Files:**
 - Create: `windows/SharedMic.Agent/Security/DeviceCertificate.cs`
@@ -3640,8 +4499,10 @@ git commit -m "Phase 1 Task 10: incremental frame reader with close-on-violation
 - Test: `windows/SharedMic.Agent.Tests/IdentityTests.cs`
 
 **Interfaces:**
-- Consumes: `ProtocolConstants.CertificateCommonName`, `ProtocolConstants.CertificateValidityDays`, `ProtocolConstants.CertificateBackdate`, `ProtocolConstants.TokenBytes`; `PairingToken.Generate()`, `PairingToken.Encode(ReadOnlySpan<byte>)`.
-- Produces: `static class DeviceCertificate` with `X509Certificate2 CreateSelfSigned(string commonName = ProtocolConstants.CertificateCommonName)` and `string Fingerprint(X509Certificate2 certificate)`; `sealed record AgentIdentity(string ServerId, byte[] Token, X509Certificate2 Certificate, string Fingerprint)` with computed property `string PairingString`; `sealed class IdentityStore` with constructor `IdentityStore(string directory)`, `static string DefaultDirectory`, `AgentIdentity LoadOrCreate()`, `void Reset()`.
+- Consumes: `ProtocolConstants.CertificateCommonName`, `ProtocolConstants.CertificateValidityDays`, `ProtocolConstants.CertificateBackdate`.
+- Produces: `static class DeviceCertificate` with `X509Certificate2 CreateSelfSigned(string commonName = ProtocolConstants.CertificateCommonName)` and `string Fingerprint(X509Certificate2 certificate)`; `sealed record AgentIdentity(string ServerId, X509Certificate2 Certificate, string Fingerprint)`; `sealed class IdentityStore` with constructor `IdentityStore(string directory)`, `static string DefaultDirectory`, `AgentIdentity LoadOrCreate()`, `void Reset()`.
+
+**The agent identity no longer carries a pairing token.** It used to: there was one token, so it sat next to the certificate. With a list of paired devices, each with its own token, tokens move to `PairedDeviceStore` (Task 13) and `AgentIdentity` is reduced to what is genuinely one-per-agent — the server identifier and the certificate the Mac pins. Anything that previously read `identity.Token` or `identity.PairingString` now goes through the device store instead.
 
 **This task runs on Windows.** DPAPI (`ProtectedData`) is Windows-only, and so is the Schannel-compatible PKCS#12 round-trip.
 
@@ -3739,25 +4600,25 @@ public class IdentityTests : IDisposable
         var first = store.LoadOrCreate();
         var second = store.LoadOrCreate();
 
-        Assert.Equal(ProtocolConstants.TokenBytes, first.Token.Length);
-        Assert.Equal(first.Token, second.Token);
         Assert.Equal(first.Fingerprint, second.Fingerprint);
         Assert.Equal(first.ServerId, second.ServerId);
-        Assert.Equal(58, first.PairingString.Length);
         Assert.True(first.Certificate.HasPrivateKey);
         Assert.True(second.Certificate.HasPrivateKey);
     }
 
+    /// <summary>
+    /// Pairing tokens live in PairedDeviceStore now, one per device. The
+    /// identity store must not resurrect a single agent-wide token.
+    /// </summary>
     [Fact]
-    public void TokenIsNotStoredInPlaintextOnDisk()
+    public void TheIdentityStoreHoldsNoPairingToken()
     {
         var store = new IdentityStore(_directory);
-        var identity = store.LoadOrCreate();
+        store.LoadOrCreate();
 
-        var onDisk = File.ReadAllBytes(Path.Combine(_directory, "token.dpapi"));
-
-        Assert.True(onDisk.Length > identity.Token.Length);
-        Assert.False(ContainsSubsequence(onDisk, identity.Token), "the raw token is present in the protected file");
+        Assert.False(File.Exists(Path.Combine(_directory, "token.dpapi")));
+        Assert.Null(typeof(AgentIdentity).GetProperty("Token"));
+        Assert.Null(typeof(AgentIdentity).GetProperty("PairingString"));
     }
 
     [Fact]
@@ -3776,7 +4637,7 @@ public class IdentityTests : IDisposable
     }
 
     [Fact]
-    public void ResetForcesRegenerationOfANewTokenAndCertificate()
+    public void ResetForcesRegenerationOfANewCertificate()
     {
         var store = new IdentityStore(_directory);
         var first = store.LoadOrCreate();
@@ -3784,17 +4645,7 @@ public class IdentityTests : IDisposable
         store.Reset();
         var second = store.LoadOrCreate();
 
-        Assert.NotEqual(Convert.ToHexString(first.Token), Convert.ToHexString(second.Token));
         Assert.NotEqual(first.Fingerprint, second.Fingerprint);
-    }
-
-    [Fact]
-    public void PairingStringRoundTripsToTheStoredToken()
-    {
-        var store = new IdentityStore(_directory);
-        var identity = store.LoadOrCreate();
-
-        Assert.Equal(identity.Token, PairingToken.Decode(identity.PairingString));
     }
 
     private static bool ContainsSubsequence(byte[] haystack, byte[] needle)
@@ -3901,26 +4752,25 @@ public static class DeviceCertificate
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
-using SharedMic.Agent.Protocol;
 
 namespace SharedMic.Agent.Security;
 
 /// <summary>
-/// Everything the agent is: its server identifier, its 256-bit pairing token,
-/// and its device certificate. Never log any field except ServerId and
-/// Fingerprint.
+/// What the agent is, independent of who is paired with it: its server
+/// identifier and its device certificate. Never log any field except ServerId
+/// and Fingerprint.
+///
+/// There is deliberately no Token here. Pairing tokens are per device and live
+/// in PairedDeviceStore; an agent-wide token is exactly the assumption the
+/// multi-Mac design removes.
 /// </summary>
-public sealed record AgentIdentity(string ServerId, byte[] Token, X509Certificate2 Certificate, string Fingerprint)
-{
-    /// <summary>The base32 string the tray shows and the user retypes on the Mac.</summary>
-    public string PairingString => PairingToken.Encode(Token);
-}
+public sealed record AgentIdentity(string ServerId, X509Certificate2 Certificate, string Fingerprint);
 
 /// <summary>
 /// First-run generation and at-rest protection of the agent identity, per
-/// design spec section 7.1: the token and the certificate's private key are
-/// DPAPI-protected under the current user. Regenerating them is an explicit
-/// re-pair, never automatic.
+/// design spec section 7.1: the certificate's private key is DPAPI-protected
+/// under the current user. Regenerating it is explicit, never automatic — every
+/// paired Mac's pin breaks when it changes.
 /// </summary>
 public sealed class IdentityStore
 {
@@ -3934,8 +4784,6 @@ public sealed class IdentityStore
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "SharedMic");
 
-    private string TokenPath => Path.Combine(_directory, "token.dpapi");
-
     private string CertificatePath => Path.Combine(_directory, "device-cert.dpapi");
 
     private string ServerIdPath => Path.Combine(_directory, "server-id.txt");
@@ -3944,44 +4792,21 @@ public sealed class IdentityStore
     {
         Directory.CreateDirectory(_directory);
 
-        var token = LoadOrCreateToken();
         var certificate = LoadOrCreateCertificate();
         var serverId = LoadOrCreateServerId();
 
-        return new AgentIdentity(serverId, token, certificate, DeviceCertificate.Fingerprint(certificate));
+        return new AgentIdentity(serverId, certificate, DeviceCertificate.Fingerprint(certificate));
     }
 
     public void Reset()
     {
-        foreach (var path in new[] { TokenPath, CertificatePath, ServerIdPath })
+        foreach (var path in new[] { CertificatePath, ServerIdPath })
         {
             if (File.Exists(path))
             {
                 File.Delete(path);
             }
         }
-    }
-
-    private byte[] LoadOrCreateToken()
-    {
-        byte[] token;
-        if (File.Exists(TokenPath))
-        {
-            token = Unprotect(File.ReadAllBytes(TokenPath));
-        }
-        else
-        {
-            token = PairingToken.Generate();
-            WriteProtected(TokenPath, token);
-        }
-
-        if (token.Length != ProtocolConstants.TokenBytes)
-        {
-            throw new InvalidOperationException(
-                $"the stored pairing token is {token.Length} bytes, expected {ProtocolConstants.TokenBytes}");
-        }
-
-        return token;
     }
 
     private X509Certificate2 LoadOrCreateCertificate()
@@ -4053,18 +4878,543 @@ Run, from the repo's `windows` directory on Windows:
 dotnet test SharedMic.Windows.sln --filter "FullyQualifiedName~IdentityTests"
 ```
 
-Expected: PASS, 9 tests.
+Expected: PASS, 8 tests.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add windows/SharedMic.Agent/Security/DeviceCertificate.cs windows/SharedMic.Agent/Security/IdentityStore.cs windows/SharedMic.Agent.Tests/IdentityTests.cs
-git commit -m "Phase 1 Task 11: P-256 device certificate with SAN and DPAPI-protected identity store"
+git commit -m "Phase 1 Task 12: P-256 device certificate with SAN and DPAPI-protected identity store"
 ```
 
 ---
 
-### Task 12: Control connection — handshake, session lifecycle, heartbeat
+### Task 13: Paired-device store — many tokens, revocation, identify-by-proof
+
+The list of Macs allowed to connect, and the only thing that turns an HMAC proof into an identity.
+
+**The Python mock proves nothing here either.** `MockWindowsServer` holds a single `self._token` and compares against it. Nothing in `harness/tests` exercises a second token, a revoked token, or identification by proof. These xUnit tests are the entire evidence.
+
+**Files:**
+- Create: `windows/SharedMic.Agent/Security/PairedDeviceStore.cs`
+- Test: `windows/SharedMic.Agent.Tests/PairedDeviceStoreTests.cs`
+
+**Interfaces:**
+- Consumes: `ProtocolConstants.TokenBytes`; `PairingToken.Generate()`, `PairingToken.Encode(ReadOnlySpan<byte>)`, `PairingToken.Decode(string)`; `AuthProof.Verify(byte[], byte[], string?)`.
+- Produces: `sealed record PairedDevice(string DeviceId, string FriendlyName, byte[] Token, DateTimeOffset PairedAt)` with computed property `string PairingString`; `sealed class PairedDeviceStore` with constructor `PairedDeviceStore(string directory)`, and members `int Count`, `IReadOnlyList<PairedDevice> List()`, `PairedDevice Pair(string friendlyName)`, `bool Revoke(string deviceId)`, `PairedDevice? Identify(byte[] nonce, string? proof)`.
+
+Three properties this task exists to guarantee:
+
+1. **Every token is DPAPI-protected at rest**, not just the first one. The whole list is one protected blob, written atomically so a crash mid-write cannot lose every pairing at once.
+2. **`Identify` iterates every stored token and does not short-circuit.** `AuthProof.Verify` is constant-time for one token; this loop is what makes the *number* of HMAC evaluations independent of which device matched, or of whether any did. It has no `break` and no early `return`, deliberately.
+3. **Revocation is deletion.** There is no tombstone and no distinct "revoked" answer, so a proof from a revoked device produces exactly what a proof from a stranger produces: `null`, the same amount of work, and — at the caller — the same silent close and the same rate-limiter failure. A distinguishable response would tell an attacker that a token was once valid.
+
+**This task runs on Windows.** DPAPI is Windows-only.
+
+- [ ] **Step 1: Write the failing test**
+
+`windows/SharedMic.Agent.Tests/PairedDeviceStoreTests.cs`:
+
+```csharp
+using SharedMic.Agent.Protocol;
+using SharedMic.Agent.Security;
+using Xunit;
+
+namespace SharedMic.Agent.Tests;
+
+public class PairedDeviceStoreTests : IDisposable
+{
+    private readonly string _directory =
+        Path.Combine(Path.GetTempPath(), "sharedmic-devices-" + Guid.NewGuid().ToString("N"));
+
+    public void Dispose()
+    {
+        if (Directory.Exists(_directory))
+        {
+            Directory.Delete(_directory, recursive: true);
+        }
+    }
+
+    private static byte[] Nonce() => AuthProof.GenerateNonce();
+
+    [Fact]
+    public void AFreshAgentHasNoPairedDevices()
+    {
+        var store = new PairedDeviceStore(_directory);
+
+        Assert.Equal(0, store.Count);
+        Assert.Empty(store.List());
+        Assert.Null(store.Identify(Nonce(), new string('a', 64)));
+    }
+
+    [Fact]
+    public void PairingMintsAFullSizedTokenAndAUsablePairingString()
+    {
+        var store = new PairedDeviceStore(_directory);
+
+        var device = store.Pair("Mac Studio");
+
+        Assert.Equal(ProtocolConstants.TokenBytes, device.Token.Length);
+        Assert.Equal(58, device.PairingString.Length);
+        Assert.Equal(device.Token, PairingToken.Decode(device.PairingString));
+        Assert.Equal("Mac Studio", device.FriendlyName);
+        Assert.NotEmpty(device.DeviceId);
+        Assert.Equal(1, store.Count);
+    }
+
+    [Fact]
+    public void EveryDeviceGetsItsOwnFreshToken()
+    {
+        var store = new PairedDeviceStore(_directory);
+
+        var a = store.Pair("Mac Studio");
+        var b = store.Pair("MacBook Pro");
+        var c = store.Pair("Mac mini");
+
+        Assert.Equal(3, store.Count);
+        Assert.Equal(3, new HashSet<string>(new[] { a, b, c }.Select(d => Convert.ToHexString(d.Token))).Count);
+        Assert.Equal(3, new HashSet<string>(new[] { a, b, c }.Select(d => d.DeviceId)).Count);
+    }
+
+    [Fact]
+    public void ABlankFriendlyNameIsReplacedSoTheHolderFieldIsAlwaysUsable()
+    {
+        var store = new PairedDeviceStore(_directory);
+
+        Assert.Equal("Mac 1", store.Pair("").FriendlyName);
+        Assert.Equal("Mac 2", store.Pair("   ").FriendlyName);
+        Assert.Equal("Mac Studio", store.Pair("Mac Studio").FriendlyName);
+    }
+
+    [Fact]
+    public void DevicesPersistAcrossInstances()
+    {
+        var first = new PairedDeviceStore(_directory);
+        var paired = first.Pair("Mac Studio");
+
+        var second = new PairedDeviceStore(_directory);
+
+        Assert.Equal(1, second.Count);
+        Assert.Equal(paired.DeviceId, second.List()[0].DeviceId);
+        Assert.Equal(paired.Token, second.List()[0].Token);
+        Assert.Equal(paired.FriendlyName, second.List()[0].FriendlyName);
+    }
+
+    [Fact]
+    public void NoTokenIsStoredInPlaintextOnDisk()
+    {
+        var store = new PairedDeviceStore(_directory);
+        var a = store.Pair("Mac Studio");
+        var b = store.Pair("MacBook Pro");
+
+        var onDisk = File.ReadAllBytes(Path.Combine(_directory, "paired-devices.dpapi"));
+
+        Assert.False(ContainsSubsequence(onDisk, a.Token), "the first device's raw token is on disk");
+        Assert.False(ContainsSubsequence(onDisk, b.Token), "the second device's raw token is on disk");
+        Assert.DoesNotContain(
+            Convert.ToHexString(a.Token).ToLowerInvariant(),
+            System.Text.Encoding.Latin1.GetString(onDisk),
+            StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void IdentifyFindsTheDeviceWhoseTokenSignedTheProof()
+    {
+        var store = new PairedDeviceStore(_directory);
+        store.Pair("Mac Studio");
+        var target = store.Pair("MacBook Pro");
+        store.Pair("Mac mini");
+
+        var nonce = Nonce();
+        var identified = store.Identify(nonce, AuthProof.Compute(target.Token, nonce));
+
+        Assert.NotNull(identified);
+        Assert.Equal(target.DeviceId, identified!.DeviceId);
+        Assert.Equal("MacBook Pro", identified.FriendlyName);
+    }
+
+    /// <summary>
+    /// Position in the list must not matter: the loop checks every token.
+    /// </summary>
+    [Fact]
+    public void EveryDeviceIsIdentifiableWhateverItsPositionInTheList()
+    {
+        var store = new PairedDeviceStore(_directory);
+        var devices = Enumerable.Range(0, 50).Select(i => store.Pair($"Mac {i}")).ToList();
+
+        foreach (var device in devices)
+        {
+            var nonce = Nonce();
+            var identified = store.Identify(nonce, AuthProof.Compute(device.Token, nonce));
+
+            Assert.Equal(device.DeviceId, identified?.DeviceId);
+        }
+    }
+
+    [Fact]
+    public void IdentifyRejectsAnUnknownTokenAMalformedProofAndAMissingOne()
+    {
+        var store = new PairedDeviceStore(_directory);
+        var device = store.Pair("Mac Studio");
+        var nonce = Nonce();
+
+        Assert.Null(store.Identify(nonce, AuthProof.Compute(PairingToken.Generate(), nonce)));
+        Assert.Null(store.Identify(nonce, "not hex at all"));
+        Assert.Null(store.Identify(nonce, ""));
+        Assert.Null(store.Identify(nonce, null));
+        Assert.Null(store.Identify(Nonce(), AuthProof.Compute(device.Token, nonce)));
+    }
+
+    [Fact]
+    public void RevokingOneDeviceLeavesEveryOtherDeviceWorking()
+    {
+        var store = new PairedDeviceStore(_directory);
+        var revoked = store.Pair("Mac Studio");
+        var kept = store.Pair("MacBook Pro");
+
+        Assert.True(store.Revoke(revoked.DeviceId));
+
+        var nonce = Nonce();
+        Assert.Null(store.Identify(nonce, AuthProof.Compute(revoked.Token, nonce)));
+        Assert.Equal(kept.DeviceId, store.Identify(nonce, AuthProof.Compute(kept.Token, nonce))?.DeviceId);
+        Assert.Equal(1, store.Count);
+    }
+
+    /// <summary>
+    /// A revoked device must be indistinguishable from a stranger. Revocation is
+    /// deletion, so both produce the same null and the same silent close at the
+    /// caller — nothing tells an attacker that a token was once valid.
+    /// </summary>
+    [Fact]
+    public void ARevokedDeviceIsIndistinguishableFromOneThatNeverExisted()
+    {
+        var store = new PairedDeviceStore(_directory);
+        var revoked = store.Pair("Mac Studio");
+        store.Pair("MacBook Pro");
+        store.Revoke(revoked.DeviceId);
+
+        var nonce = Nonce();
+
+        Assert.Null(store.Identify(nonce, AuthProof.Compute(revoked.Token, nonce)));
+        Assert.Null(store.Identify(nonce, AuthProof.Compute(PairingToken.Generate(), nonce)));
+    }
+
+    [Fact]
+    public void RevocationPersistsAndAnUnknownIdIsRefusedWithoutThrowing()
+    {
+        var store = new PairedDeviceStore(_directory);
+        var revoked = store.Pair("Mac Studio");
+        store.Pair("MacBook Pro");
+
+        Assert.True(store.Revoke(revoked.DeviceId));
+        Assert.False(store.Revoke(revoked.DeviceId));
+        Assert.False(store.Revoke("dev-doesnotexist"));
+
+        Assert.Equal(1, new PairedDeviceStore(_directory).Count);
+    }
+
+    [Fact]
+    public void RevokingEveryDeviceLeavesAnAgentThatAuthenticatesNobody()
+    {
+        var store = new PairedDeviceStore(_directory);
+        var device = store.Pair("Mac Studio");
+        var nonce = Nonce();
+        var proof = AuthProof.Compute(device.Token, nonce);
+
+        Assert.NotNull(store.Identify(nonce, proof));
+        Assert.True(store.Revoke(device.DeviceId));
+
+        Assert.Equal(0, store.Count);
+        Assert.Null(store.Identify(nonce, proof));
+    }
+
+    [Fact]
+    public void ListIsOrderedByPairingTimeAndIsASnapshot()
+    {
+        var store = new PairedDeviceStore(_directory);
+        var first = store.Pair("Mac Studio");
+        var second = store.Pair("MacBook Pro");
+
+        var snapshot = store.List();
+        store.Pair("Mac mini");
+
+        Assert.Equal(new[] { first.DeviceId, second.DeviceId }, snapshot.Select(d => d.DeviceId).ToArray());
+        Assert.True(snapshot[0].PairedAt <= snapshot[1].PairedAt);
+        Assert.Equal(3, store.Count);
+    }
+
+    private static bool ContainsSubsequence(byte[] haystack, byte[] needle)
+    {
+        if (needle.Length == 0 || needle.Length > haystack.Length)
+        {
+            return false;
+        }
+
+        for (var i = 0; i <= haystack.Length - needle.Length; i++)
+        {
+            if (haystack.AsSpan(i, needle.Length).SequenceEqual(needle))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+}
+```
+
+- [ ] **Step 2: Run it and confirm it fails**
+
+Run, from the repo's `windows` directory on Windows:
+
+```powershell
+dotnet test SharedMic.Windows.sln --filter "FullyQualifiedName~PairedDeviceStoreTests"
+```
+
+Expected: FAIL with `CS0246: The type or namespace name 'PairedDeviceStore' could not be found`.
+
+- [ ] **Step 3: Implement**
+
+`windows/SharedMic.Agent/Security/PairedDeviceStore.cs`:
+
+```csharp
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using SharedMic.Agent.Protocol;
+
+namespace SharedMic.Agent.Security;
+
+/// <summary>
+/// One Mac that is allowed to connect. Never log Token, and never show it: the
+/// user sees PairingString, once, at pairing time.
+///
+/// FriendlyName is assigned by the Windows user when the device is paired. It is
+/// NOT the clientId the Mac sends in HELLO — that value arrives unauthenticated
+/// and is a display label only. This is the name that travels as the advisory
+/// "holder" field of a START_NACK, so it has to be one the owner chose.
+/// </summary>
+public sealed record PairedDevice(string DeviceId, string FriendlyName, byte[] Token, DateTimeOffset PairedAt)
+{
+    /// <summary>The base32 string the tray shows and the user retypes on that Mac.</summary>
+    public string PairingString => PairingToken.Encode(Token);
+}
+
+/// <summary>
+/// The list of paired devices, DPAPI-protected as a single blob under the
+/// current user (design spec section 7.1), and the identification path the
+/// section 6 handshake runs.
+///
+/// Identification is by PROOF ONLY. There is no lookup key: HELLO's clientId is
+/// unauthenticated, so using it to choose which token to check would let an
+/// attacker aim at a particular device. Identify() walks every stored token,
+/// and deliberately does not stop at the first match, so the amount of HMAC
+/// work does not depend on which device matched or on whether any did.
+///
+/// Revocation is deletion. A revoked device produces exactly what an unknown
+/// one produces — null — so nothing distinguishes "this token used to work"
+/// from "this token never worked".
+/// </summary>
+public sealed class PairedDeviceStore
+{
+    private static readonly byte[] Entropy = Encoding.UTF8.GetBytes("shared-mic/v1/paired-devices");
+
+    private sealed record StoredDevice(string DeviceId, string FriendlyName, string TokenHex, DateTimeOffset PairedAt);
+
+    private readonly string _directory;
+    private readonly object _gate = new();
+    private readonly List<PairedDevice> _devices = new();
+
+    public PairedDeviceStore(string directory)
+    {
+        _directory = directory;
+        Load();
+    }
+
+    private string StorePath => Path.Combine(_directory, "paired-devices.dpapi");
+
+    public int Count
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _devices.Count;
+            }
+        }
+    }
+
+    /// <summary>A snapshot, oldest pairing first. Callers may hold it while the list changes.</summary>
+    public IReadOnlyList<PairedDevice> List()
+    {
+        lock (_gate)
+        {
+            return _devices.ToArray();
+        }
+    }
+
+    /// <summary>
+    /// Mint a fresh 256-bit token for a new Mac and persist it. The returned
+    /// PairingString is the only time the token is displayable; it is not
+    /// recoverable in a form the user should ever see again except from this
+    /// same record.
+    /// </summary>
+    public PairedDevice Pair(string friendlyName)
+    {
+        lock (_gate)
+        {
+            var name = string.IsNullOrWhiteSpace(friendlyName)
+                ? $"Mac {_devices.Count + 1}"
+                : friendlyName.Trim();
+
+            var device = new PairedDevice(
+                "dev-" + Convert.ToHexString(RandomNumberGenerator.GetBytes(4)).ToLowerInvariant(),
+                name,
+                PairingToken.Generate(),
+                DateTimeOffset.UtcNow);
+
+            _devices.Add(device);
+            Save();
+            return device;
+        }
+    }
+
+    public bool Revoke(string deviceId)
+    {
+        lock (_gate)
+        {
+            var index = _devices.FindIndex(device =>
+                string.Equals(device.DeviceId, deviceId, StringComparison.Ordinal));
+            if (index < 0)
+            {
+                return false;
+            }
+
+            // Deliberately not ZeroMemory on the token array: Identify() may be
+            // walking a snapshot that shares it right now, and zeroing under a
+            // concurrent verify would corrupt that comparison. Dropping the
+            // reference is enough — Save() below is what actually removes the
+            // token from disk.
+            _devices.RemoveAt(index);
+            Save();
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// The section 6 verification: which paired device, if any, holds the token
+    /// that produced this proof over this nonce. Returns null for no match, for
+    /// a malformed proof, and for a revoked device — all three are the same
+    /// answer on purpose.
+    /// </summary>
+    public PairedDevice? Identify(byte[] nonce, string? proof)
+    {
+        PairedDevice[] snapshot;
+        lock (_gate)
+        {
+            snapshot = _devices.ToArray();
+        }
+
+        PairedDevice? matched = null;
+        foreach (var device in snapshot)
+        {
+            // No break, and no early return. Every stored token is evaluated on
+            // every attempt so the work done does not reveal which device
+            // matched, or that none did.
+            if (AuthProof.Verify(device.Token, nonce, proof))
+            {
+                matched ??= device;
+            }
+        }
+
+        return matched;
+    }
+
+    private void Load()
+    {
+        if (!File.Exists(StorePath))
+        {
+            return;
+        }
+
+        var plaintext = ProtectedData.Unprotect(
+            File.ReadAllBytes(StorePath), Entropy, DataProtectionScope.CurrentUser);
+        try
+        {
+            var stored = JsonSerializer.Deserialize<List<StoredDevice>>(plaintext) ?? new List<StoredDevice>();
+            foreach (var device in stored)
+            {
+                var token = Convert.FromHexString(device.TokenHex);
+                if (token.Length != ProtocolConstants.TokenBytes)
+                {
+                    throw new InvalidOperationException(
+                        $"paired device '{device.DeviceId}' has a {token.Length}-byte token, " +
+                        $"expected {ProtocolConstants.TokenBytes}");
+                }
+
+                _devices.Add(new PairedDevice(device.DeviceId, device.FriendlyName, token, device.PairedAt));
+            }
+
+            _devices.Sort((left, right) => left.PairedAt.CompareTo(right.PairedAt));
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(plaintext);
+        }
+    }
+
+    /// <summary>
+    /// Called under _gate. Writes to a temporary file and moves it into place,
+    /// so an interrupted write cannot leave every pairing lost at once.
+    /// </summary>
+    private void Save()
+    {
+        Directory.CreateDirectory(_directory);
+
+        var stored = _devices
+            .Select(device => new StoredDevice(
+                device.DeviceId,
+                device.FriendlyName,
+                Convert.ToHexString(device.Token).ToLowerInvariant(),
+                device.PairedAt))
+            .ToList();
+
+        var plaintext = JsonSerializer.SerializeToUtf8Bytes(stored);
+        try
+        {
+            var protectedBytes = ProtectedData.Protect(plaintext, Entropy, DataProtectionScope.CurrentUser);
+            var temporary = StorePath + ".tmp";
+            File.WriteAllBytes(temporary, protectedBytes);
+            File.Move(temporary, StorePath, overwrite: true);
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(plaintext);
+        }
+    }
+}
+```
+
+- [ ] **Step 4: Run and confirm it passes**
+
+Run, from the repo's `windows` directory on Windows:
+
+```powershell
+dotnet test SharedMic.Windows.sln --filter "FullyQualifiedName~PairedDeviceStoreTests"
+```
+
+Expected: PASS, 14 tests.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add windows/SharedMic.Agent/Security/PairedDeviceStore.cs windows/SharedMic.Agent.Tests/PairedDeviceStoreTests.cs
+git commit -m "Phase 1 Task 13: DPAPI-protected paired-device list with revocation and identify-by-proof"
+```
+
+---
+
+### Task 14: Control connection — handshake, session lifecycle, heartbeat
 
 **Files:**
 - Create: `windows/SharedMic.Agent/AgentOptions.cs`
@@ -4076,10 +5426,17 @@ git commit -m "Phase 1 Task 11: P-256 device certificate with SAN and DPAPI-prot
 - Test: `windows/SharedMic.Agent.Tests/ControlConnectionTests.cs`
 
 **Interfaces:**
-- Consumes: `FrameCodec`, `FrameType`, `ControlCodec`, `ControlMessages`, `ProtocolException`, `ProtocolConstants`; `FrameReader(Stream)` / `ReadFrameAsync(CancellationToken)`; `PrioritySendQueue`; `AuthProof.GenerateNonce()` / `AuthProof.Verify(byte[], byte[], string?)`; `AuthRateLimiter.TryBeginAttempt()` / `RecordFailure()` / `RecordSuccess()` / `IsLockedOut` / `LockoutRemaining`; `AgentIdentity(string ServerId, byte[] Token, X509Certificate2 Certificate, string Fingerprint)`; `SessionStateMachine.HandleStart(bool)` / `HandleStop(string)` / `Reset()`.
-- Produces: `enum AgentStatus { Disconnected, Idle, Error }`; `sealed class AgentOptions` (init-only properties listed below); `static class AgentLog` with `Info(string)`, `Warn(string)`, `Error(string)`; `sealed class AgentMetrics` with an `Increment*` method per counter and `AgentMetricsSnapshot Snapshot()`; `sealed record AgentMetricsSnapshot(...)`; `sealed class ControlConnection : IAsyncDisposable` with constructor `ControlConnection(Stream stream, AgentIdentity identity, AgentOptions options, AuthRateLimiter rateLimiter, AgentMetrics metrics)`, members `bool IsAuthenticated`, `string RemoteDescription { get; init; }`, `PrioritySendQueue SendQueue`, `SessionStateMachine Session`, `event Action<ControlConnection>? Authenticated`, `Task RunAsync(CancellationToken cancellationToken)`, `void Close()`, `ValueTask DisposeAsync()`.
+- Consumes: `FrameCodec`, `FrameType`, `ControlCodec`, `ControlMessages` (including `StartNack(string, string, string?)`), `ProtocolException`, `ProtocolConstants`; `FrameReader(Stream)` / `ReadFrameAsync(CancellationToken)`; `PrioritySendQueue`; `AuthProof.GenerateNonce()`; `PairedDevice`, `PairedDeviceStore.Identify(byte[], string?)`; `AuthRateLimiter.PeerKey(EndPoint?)` / `TryBeginAttempt(string)` / `RecordFailure(string)` / `RecordSuccess(string)` / `IsLockedOut(string)` / `LockoutRemaining(string)`; `AgentIdentity(string ServerId, X509Certificate2 Certificate, string Fingerprint)`; `SessionArbiter.Start(string, string, bool)` / `Stop(string, string)` / `EndSessionOwnedBy(string)` / `HolderName` / `SessionsStarted`.
+- Produces: `enum AgentStatus { Disconnected, Idle, Error }`; `sealed class AgentOptions` (init-only properties listed below); `static class AgentLog` with `Info(string)`, `Warn(string)`, `Error(string)`; `sealed class AgentMetrics` with an `Increment*` method per counter and `AgentMetricsSnapshot Snapshot()`; `sealed record AgentMetricsSnapshot(...)`; `sealed class ControlConnection : IAsyncDisposable` with constructor `ControlConnection(Stream stream, AgentIdentity identity, AgentOptions options, PairedDeviceStore devices, AuthRateLimiter rateLimiter, SessionArbiter sessions, AgentMetrics metrics)`, members `string ConnectionId`, `bool IsAuthenticated`, `PairedDevice? Device`, `string RemoteDescription { get; init; }`, `string PeerKey { get; init; }`, `PrioritySendQueue SendQueue`, `SessionArbiter Sessions`, `event Action<ControlConnection>? Authenticated`, `Task RunAsync(CancellationToken cancellationToken)`, `void Close()`, `ValueTask DisposeAsync()`.
 
-**This task runs on Windows.** Tests use a real loopback TCP socket pair, so no TLS is involved yet and the whole exchange is inspectable.
+Four things changed here from the single-Mac draft, and every one of them is invisible to the Python conformance suite:
+
+- **The connection no longer owns a session.** It owns a `ConnectionId` and shares one `SessionArbiter` with every other connection. `Session` (a `SessionStateMachine`) is gone from this type's surface; `Sessions` (the shared arbiter) replaces it.
+- **The connection no longer holds a token.** It calls `PairedDeviceStore.Identify` and gets back a `PairedDevice`, or null.
+- **`clientId` is logged and otherwise ignored.** It never chooses a token and never becomes the device's name.
+- **Every exit path releases the session** through `EndSessionOwnedBy(ConnectionId)` in `RunAsync`'s `finally`. `STOP`, a clean close, a socket error, a protocol violation, and dead-peer detection all arrive there, because dead-peer detection works by cancelling the read loop.
+
+**This task runs on Windows.** Tests use a real loopback TCP socket pair, so no TLS is involved yet and the whole exchange is inspectable. **They are also the only place the multi-connection rules are tested against real sockets** — the mock Windows server gives every connection its own session, so `harness/tests` would pass an implementation that gets all of this wrong.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -4232,7 +5589,7 @@ using Xunit;
 
 namespace SharedMic.Agent.Tests;
 
-public class ControlConnectionTests
+public class ControlConnectionTests : IDisposable
 {
     private static readonly TimeSpan Timeout = TimeSpan.FromSeconds(10);
 
@@ -4242,8 +5599,27 @@ public class ControlConnectionTests
     private static readonly System.Security.Cryptography.X509Certificates.X509Certificate2 SharedCertificate =
         DeviceCertificate.CreateSelfSigned();
 
-    private static AgentIdentity NewIdentity(byte[] token) =>
-        new("win-test", token, SharedCertificate, DeviceCertificate.Fingerprint(SharedCertificate));
+    private static readonly AgentIdentity Identity =
+        new("win-test", SharedCertificate, DeviceCertificate.Fingerprint(SharedCertificate));
+
+    private readonly string _root =
+        Path.Combine(Path.GetTempPath(), "sharedmic-connection-" + Guid.NewGuid().ToString("N"));
+
+    public void Dispose()
+    {
+        if (Directory.Exists(_root))
+        {
+            Directory.Delete(_root, recursive: true);
+        }
+    }
+
+    /// <summary>A paired-device list of its own, in a throwaway directory.</summary>
+    private PairedDeviceStore NewStore()
+    {
+        var directory = Path.Combine(_root, Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        return new PairedDeviceStore(directory);
+    }
 
     private static AgentOptions FastOptions(bool micPresent = true) => new()
     {
@@ -4292,20 +5668,25 @@ public class ControlConnectionTests
     }
 
     private static async Task<Fixture> StartAsync(
-        byte[] token,
+        PairedDeviceStore devices,
         AgentOptions options,
         AuthRateLimiter? limiter = null,
-        AgentMetrics? metrics = null)
+        SessionArbiter? sessions = null,
+        AgentMetrics? metrics = null,
+        string peerKey = "127.0.0.1")
     {
         var peer = await LoopbackPeer.CreateAsync();
         var connection = new ControlConnection(
             peer.ServerStream,
-            NewIdentity(token),
+            Identity,
             options,
+            devices,
             limiter ?? new AuthRateLimiter(),
+            sessions ?? new SessionArbiter(),
             metrics ?? new AgentMetrics())
         {
-            RemoteDescription = "loopback",
+            RemoteDescription = $"loopback[{peerKey}]",
+            PeerKey = peerKey,
         };
 
         var cancellation = new CancellationTokenSource();
@@ -4316,8 +5697,9 @@ public class ControlConnectionTests
     [Fact]
     public async Task SendsGreetingImmediatelyWithASixtyFourCharacterNonce()
     {
-        var token = PairingToken.Generate();
-        await using var fixture = await StartAsync(token, FastOptions());
+        var devices = NewStore();
+        devices.Pair("Mac Studio");
+        await using var fixture = await StartAsync(devices, FastOptions());
         using var cancellation = new CancellationTokenSource(Timeout);
 
         var greeting = await fixture.Peer.ReadControlAsync(cancellation.Token);
@@ -4332,11 +5714,12 @@ public class ControlConnectionTests
     [Fact]
     public async Task NonceIsFreshPerConnection()
     {
-        var token = PairingToken.Generate();
+        var devices = NewStore();
+        devices.Pair("Mac Studio");
         using var cancellation = new CancellationTokenSource(Timeout);
 
-        await using var first = await StartAsync(token, FastOptions());
-        await using var second = await StartAsync(token, FastOptions());
+        await using var first = await StartAsync(devices, FastOptions());
+        await using var second = await StartAsync(devices, FastOptions());
 
         var a = await first.Peer.ReadControlAsync(cancellation.Token);
         var b = await second.Peer.ReadControlAsync(cancellation.Token);
@@ -4347,11 +5730,12 @@ public class ControlConnectionTests
     [Fact]
     public async Task ValidHelloIsAnsweredWithHelloAck()
     {
-        var token = PairingToken.Generate();
-        await using var fixture = await StartAsync(token, FastOptions());
+        var devices = NewStore();
+        var mac = devices.Pair("Mac Studio");
+        await using var fixture = await StartAsync(devices, FastOptions());
         using var cancellation = new CancellationTokenSource(Timeout);
 
-        await fixture.Peer.AuthenticateAsync(token, cancellation.Token);
+        await fixture.Peer.AuthenticateAsync(mac.Token, cancellation.Token);
         var ack = await fixture.Peer.ReadControlAsync(cancellation.Token);
 
         Assert.Equal("HELLO_ACK", ack!["type"]);
@@ -4360,11 +5744,60 @@ public class ControlConnectionTests
         Assert.Equal("USB Microphone", ack["deviceLabel"]);
     }
 
+    /// <summary>
+    /// The proof, and only the proof, says which device this is. Several tokens
+    /// are stored and the connection presents the third one's.
+    /// </summary>
+    [Fact]
+    public async Task TheProofAloneIdentifiesWhichPairedDeviceConnected()
+    {
+        var devices = NewStore();
+        devices.Pair("Mac Studio");
+        devices.Pair("MacBook Pro");
+        var mini = devices.Pair("Mac mini");
+        await using var fixture = await StartAsync(devices, FastOptions());
+        using var cancellation = new CancellationTokenSource(Timeout);
+
+        await fixture.Peer.AuthenticateAsync(mini.Token, cancellation.Token);
+        await fixture.Peer.ReadControlAsync(cancellation.Token);
+
+        Assert.True(fixture.Connection.IsAuthenticated);
+        Assert.Equal(mini.DeviceId, fixture.Connection.Device?.DeviceId);
+        Assert.Equal("Mac mini", fixture.Connection.Device?.FriendlyName);
+    }
+
+    /// <summary>
+    /// clientId arrives unauthenticated. It must not select a token and must not
+    /// become the device's name — otherwise "call yourself Mac Studio" would be
+    /// an attack.
+    /// </summary>
+    [Fact]
+    public async Task ALyingClientIdChangesNothingAboutTheIdentifiedDevice()
+    {
+        var devices = NewStore();
+        var studio = devices.Pair("Mac Studio");
+        devices.Pair("MacBook Pro");
+        await using var fixture = await StartAsync(devices, FastOptions());
+        using var cancellation = new CancellationTokenSource(Timeout);
+
+        var greeting = await fixture.Peer.ReadControlAsync(cancellation.Token);
+        var nonce = Convert.FromHexString((string)greeting!["nonce"]!);
+        await fixture.Peer.SendControlAsync(
+            ControlMessages.Hello("MacBook Pro", AuthProof.Compute(studio.Token, nonce)),
+            cancellation.Token);
+        var ack = await fixture.Peer.ReadControlAsync(cancellation.Token);
+
+        Assert.Equal("HELLO_ACK", ack!["type"]);
+        Assert.Equal(studio.DeviceId, fixture.Connection.Device?.DeviceId);
+        Assert.Equal("Mac Studio", fixture.Connection.Device?.FriendlyName);
+    }
+
     [Fact]
     public async Task WrongProofClosesTheConnectionWithoutReplying()
     {
-        var token = PairingToken.Generate();
-        await using var fixture = await StartAsync(token, FastOptions());
+        var devices = NewStore();
+        devices.Pair("Mac Studio");
+        await using var fixture = await StartAsync(devices, FastOptions());
         using var cancellation = new CancellationTokenSource(Timeout);
 
         var greeting = await fixture.Peer.ReadControlAsync(cancellation.Token);
@@ -4376,13 +5809,36 @@ public class ControlConnectionTests
 
         Assert.True(await fixture.Peer.WaitForCloseAsync(TimeSpan.FromSeconds(5)));
         Assert.False(fixture.Connection.IsAuthenticated);
+        Assert.Null(fixture.Connection.Device);
+    }
+
+    /// <summary>
+    /// A revoked device gets exactly the stranger's treatment: closed without a
+    /// reply, nothing that says the token was ever valid.
+    /// </summary>
+    [Fact]
+    public async Task ARevokedDeviceIsRefusedExactlyLikeAStranger()
+    {
+        var devices = NewStore();
+        var revoked = devices.Pair("Old MacBook");
+        devices.Pair("Mac Studio");
+        devices.Revoke(revoked.DeviceId);
+
+        await using var fixture = await StartAsync(devices, FastOptions());
+        using var cancellation = new CancellationTokenSource(Timeout);
+
+        await fixture.Peer.AuthenticateAsync(revoked.Token, cancellation.Token);
+
+        Assert.True(await fixture.Peer.WaitForCloseAsync(TimeSpan.FromSeconds(5)));
+        Assert.False(fixture.Connection.IsAuthenticated);
     }
 
     [Fact]
     public async Task PingBeforeAuthenticationClosesTheConnection()
     {
-        var token = PairingToken.Generate();
-        await using var fixture = await StartAsync(token, FastOptions());
+        var devices = NewStore();
+        devices.Pair("Mac Studio");
+        await using var fixture = await StartAsync(devices, FastOptions());
         using var cancellation = new CancellationTokenSource(Timeout);
 
         await fixture.Peer.ReadControlAsync(cancellation.Token);
@@ -4394,11 +5850,12 @@ public class ControlConnectionTests
     [Fact]
     public async Task AudioFrameFromTheClientIsAProtocolViolationAtAnyPoint()
     {
-        var token = PairingToken.Generate();
-        await using var fixture = await StartAsync(token, FastOptions());
+        var devices = NewStore();
+        var mac = devices.Pair("Mac Studio");
+        await using var fixture = await StartAsync(devices, FastOptions());
         using var cancellation = new CancellationTokenSource(Timeout);
 
-        await fixture.Peer.AuthenticateAsync(token, cancellation.Token);
+        await fixture.Peer.AuthenticateAsync(mac.Token, cancellation.Token);
         await fixture.Peer.ReadControlAsync(cancellation.Token);
 
         var audio = FrameCodec.EncodeFrame(
@@ -4412,11 +5869,12 @@ public class ControlConnectionTests
     [Fact]
     public async Task UnknownEnvelopeTypeClosesTheConnection()
     {
-        var token = PairingToken.Generate();
-        await using var fixture = await StartAsync(token, FastOptions());
+        var devices = NewStore();
+        var mac = devices.Pair("Mac Studio");
+        await using var fixture = await StartAsync(devices, FastOptions());
         using var cancellation = new CancellationTokenSource(Timeout);
 
-        await fixture.Peer.AuthenticateAsync(token, cancellation.Token);
+        await fixture.Peer.AuthenticateAsync(mac.Token, cancellation.Token);
         await fixture.Peer.ReadControlAsync(cancellation.Token);
 
         await fixture.Peer.SendRawAsync(new byte[] { 7, 0, 0, 0, 0 }, cancellation.Token);
@@ -4427,11 +5885,12 @@ public class ControlConnectionTests
     [Fact]
     public async Task WrongProtocolVersionClosesTheConnection()
     {
-        var token = PairingToken.Generate();
-        await using var fixture = await StartAsync(token, FastOptions());
+        var devices = NewStore();
+        var mac = devices.Pair("Mac Studio");
+        await using var fixture = await StartAsync(devices, FastOptions());
         using var cancellation = new CancellationTokenSource(Timeout);
 
-        await fixture.Peer.AuthenticateAsync(token, cancellation.Token);
+        await fixture.Peer.AuthenticateAsync(mac.Token, cancellation.Token);
         await fixture.Peer.ReadControlAsync(cancellation.Token);
 
         var payload = System.Text.Encoding.UTF8.GetBytes("{\"seq\":1,\"type\":\"PING\",\"v\":2}");
@@ -4443,8 +5902,9 @@ public class ControlConnectionTests
     [Fact]
     public async Task IdleConnectionIsClosedAtThePreAuthDeadline()
     {
-        var token = PairingToken.Generate();
-        await using var fixture = await StartAsync(token, FastOptions());
+        var devices = NewStore();
+        devices.Pair("Mac Studio");
+        await using var fixture = await StartAsync(devices, FastOptions());
         using var cancellation = new CancellationTokenSource(Timeout);
 
         var greeting = await fixture.Peer.ReadControlAsync(cancellation.Token);
@@ -4456,11 +5916,12 @@ public class ControlConnectionTests
     [Fact]
     public async Task PingIsAnsweredWithAMatchingPong()
     {
-        var token = PairingToken.Generate();
-        await using var fixture = await StartAsync(token, FastOptions());
+        var devices = NewStore();
+        var mac = devices.Pair("Mac Studio");
+        await using var fixture = await StartAsync(devices, FastOptions());
         using var cancellation = new CancellationTokenSource(Timeout);
 
-        await fixture.Peer.AuthenticateAsync(token, cancellation.Token);
+        await fixture.Peer.AuthenticateAsync(mac.Token, cancellation.Token);
         await fixture.Peer.ReadControlAsync(cancellation.Token);
 
         foreach (var seq in new long[] { 1, 2, 99 })
@@ -4476,11 +5937,13 @@ public class ControlConnectionTests
     [Fact]
     public async Task DuplicateStartReturnsTheSameSessionIdAndStreamsNothing()
     {
-        var token = PairingToken.Generate();
-        await using var fixture = await StartAsync(token, FastOptions());
+        var devices = NewStore();
+        var mac = devices.Pair("Mac Studio");
+        var sessions = new SessionArbiter();
+        await using var fixture = await StartAsync(devices, FastOptions(), sessions: sessions);
         using var cancellation = new CancellationTokenSource(Timeout);
 
-        await fixture.Peer.AuthenticateAsync(token, cancellation.Token);
+        await fixture.Peer.AuthenticateAsync(mac.Token, cancellation.Token);
         await fixture.Peer.ReadControlAsync(cancellation.Token);
 
         await fixture.Peer.SendControlAsync(ControlMessages.Start("req-0001"), cancellation.Token);
@@ -4495,17 +5958,192 @@ public class ControlConnectionTests
         Assert.Equal("req-0002", second["requestId"]);
         Assert.Equal(first["sessionId"], second["sessionId"]);
         Assert.True(ControlCodec.DeepEquals(ControlCodec.Normalize(ControlMessages.AudioFormat), first["format"]));
-        Assert.Equal(1, fixture.Connection.Session.SessionsStarted);
+        Assert.Equal(1, sessions.SessionsStarted);
+    }
+
+    /// <summary>
+    /// Two paired Macs, two live connections, one session. The mock Windows
+    /// server would hand both of them a START_ACK, so this is the only place the
+    /// rule is checked over a real socket.
+    /// </summary>
+    [Fact]
+    public async Task ASecondConnectionIsNackedWithSessionInUseAndTheHolderName()
+    {
+        var devices = NewStore();
+        var studio = devices.Pair("Mac Studio");
+        var laptop = devices.Pair("MacBook Pro");
+        var sessions = new SessionArbiter();
+        using var cancellation = new CancellationTokenSource(Timeout);
+
+        await using var holder = await StartAsync(devices, FastOptions(), sessions: sessions);
+        await using var other = await StartAsync(devices, FastOptions(), sessions: sessions);
+
+        await holder.Peer.AuthenticateAsync(studio.Token, cancellation.Token);
+        await holder.Peer.ReadControlAsync(cancellation.Token);
+        await other.Peer.AuthenticateAsync(laptop.Token, cancellation.Token);
+        await other.Peer.ReadControlAsync(cancellation.Token);
+
+        await holder.Peer.SendControlAsync(ControlMessages.Start("req-h"), cancellation.Token);
+        var granted = await holder.Peer.ReadControlAsync(cancellation.Token);
+
+        await other.Peer.SendControlAsync(ControlMessages.Start("req-o"), cancellation.Token);
+        var refused = await other.Peer.ReadControlAsync(cancellation.Token);
+
+        Assert.Equal("START_ACK", granted!["type"]);
+        Assert.Equal("START_NACK", refused!["type"]);
+        Assert.Equal("req-o", refused["requestId"]);
+        Assert.Equal("SESSION_IN_USE", refused["reason"]);
+        Assert.Equal("Mac Studio", refused["holder"]);
+        Assert.Equal(1, sessions.SessionsStarted);
+    }
+
+    [Fact]
+    public async Task ARefusedSecondConnectionStaysHealthyAndDoesNotDisturbTheHolder()
+    {
+        var devices = NewStore();
+        var studio = devices.Pair("Mac Studio");
+        var laptop = devices.Pair("MacBook Pro");
+        var sessions = new SessionArbiter();
+        using var cancellation = new CancellationTokenSource(Timeout);
+
+        await using var holder = await StartAsync(devices, FastOptions(), sessions: sessions);
+        await using var other = await StartAsync(devices, FastOptions(), sessions: sessions);
+
+        await holder.Peer.AuthenticateAsync(studio.Token, cancellation.Token);
+        await holder.Peer.ReadControlAsync(cancellation.Token);
+        await other.Peer.AuthenticateAsync(laptop.Token, cancellation.Token);
+        await other.Peer.ReadControlAsync(cancellation.Token);
+
+        await holder.Peer.SendControlAsync(ControlMessages.Start("req-h"), cancellation.Token);
+        var granted = await holder.Peer.ReadControlAsync(cancellation.Token);
+        await other.Peer.SendControlAsync(ControlMessages.Start("req-o"), cancellation.Token);
+        await other.Peer.ReadControlAsync(cancellation.Token);
+
+        // The refused connection is still a good connection.
+        await other.Peer.SendControlAsync(ControlMessages.Ping(7), cancellation.Token);
+        var pong = await other.Peer.ReadControlAsync(cancellation.Token);
+        Assert.Equal("PONG", pong!["type"]);
+        Assert.Equal(7L, pong["seq"]);
+
+        // And the holder still holds exactly what it was given.
+        await holder.Peer.SendControlAsync(ControlMessages.Start("req-h2"), cancellation.Token);
+        var again = await holder.Peer.ReadControlAsync(cancellation.Token);
+        Assert.Equal("START_ACK", again!["type"]);
+        Assert.Equal(granted!["sessionId"], again["sessionId"]);
+    }
+
+    /// <summary>
+    /// Otherwise any paired Mac could end another's session with one message.
+    /// </summary>
+    [Fact]
+    public async Task StopFromANonHolderIsAckedButEndsNothing()
+    {
+        var devices = NewStore();
+        var studio = devices.Pair("Mac Studio");
+        var laptop = devices.Pair("MacBook Pro");
+        var sessions = new SessionArbiter();
+        using var cancellation = new CancellationTokenSource(Timeout);
+
+        await using var holder = await StartAsync(devices, FastOptions(), sessions: sessions);
+        await using var other = await StartAsync(devices, FastOptions(), sessions: sessions);
+
+        await holder.Peer.AuthenticateAsync(studio.Token, cancellation.Token);
+        await holder.Peer.ReadControlAsync(cancellation.Token);
+        await other.Peer.AuthenticateAsync(laptop.Token, cancellation.Token);
+        await other.Peer.ReadControlAsync(cancellation.Token);
+
+        await holder.Peer.SendControlAsync(ControlMessages.Start("req-h"), cancellation.Token);
+        var granted = await holder.Peer.ReadControlAsync(cancellation.Token);
+        var sessionId = (string)granted!["sessionId"]!;
+
+        await other.Peer.SendControlAsync(ControlMessages.Stop("req-o", sessionId), cancellation.Token);
+        var ack = await other.Peer.ReadControlAsync(cancellation.Token);
+
+        Assert.Equal("STOP_ACK", ack!["type"]);
+        Assert.Equal(sessionId, sessions.ActiveSessionId);
+        Assert.Equal(holder.Connection.ConnectionId, sessions.HolderId);
+    }
+
+    /// <summary>
+    /// THE load-bearing test of the multi-Mac design. A Mac that crashes never
+    /// sends STOP. If the session survived its connection, every other Mac would
+    /// be locked out until the 45-second dead-peer timer — and if only STOP ever
+    /// released it, forever.
+    /// </summary>
+    [Fact]
+    public async Task ClosingTheOwningConnectionReleasesTheSessionForEveryoneElse()
+    {
+        var devices = NewStore();
+        var studio = devices.Pair("Mac Studio");
+        var laptop = devices.Pair("MacBook Pro");
+        var sessions = new SessionArbiter();
+        var metrics = new AgentMetrics();
+        using var cancellation = new CancellationTokenSource(Timeout);
+
+        await using var other = await StartAsync(devices, FastOptions(), sessions: sessions, metrics: metrics);
+        await other.Peer.AuthenticateAsync(laptop.Token, cancellation.Token);
+        await other.Peer.ReadControlAsync(cancellation.Token);
+
+        var holder = await StartAsync(devices, FastOptions(), sessions: sessions, metrics: metrics);
+        await holder.Peer.AuthenticateAsync(studio.Token, cancellation.Token);
+        await holder.Peer.ReadControlAsync(cancellation.Token);
+        await holder.Peer.SendControlAsync(ControlMessages.Start("req-h"), cancellation.Token);
+        await holder.Peer.ReadControlAsync(cancellation.Token);
+        Assert.NotNull(sessions.ActiveSessionId);
+
+        // The holder vanishes without a STOP.
+        await holder.DisposeAsync();
+
+        await WaitUntilAsync(() => sessions.ActiveSessionId is null, TimeSpan.FromSeconds(5));
+
+        Assert.Null(sessions.ActiveSessionId);
+        Assert.Null(sessions.HolderId);
+        Assert.Equal(1, metrics.Snapshot().SessionsEndedByDisconnect);
+
+        await other.Peer.SendControlAsync(ControlMessages.Start("req-o"), cancellation.Token);
+        var granted = await other.Peer.ReadControlAsync(cancellation.Token);
+
+        Assert.Equal("START_ACK", granted!["type"]);
+    }
+
+    /// <summary>
+    /// Same rule, reached the other way: the peer stops talking and the 45 s
+    /// dead-peer rule (600 ms here) closes it. The release must not depend on a
+    /// clean disconnect.
+    /// </summary>
+    [Fact]
+    public async Task DeadPeerDetectionAlsoReleasesTheSession()
+    {
+        var devices = NewStore();
+        var studio = devices.Pair("Mac Studio");
+        var sessions = new SessionArbiter();
+        var metrics = new AgentMetrics();
+        await using var fixture = await StartAsync(devices, FastOptions(), sessions: sessions, metrics: metrics);
+        using var cancellation = new CancellationTokenSource(Timeout);
+
+        await fixture.Peer.AuthenticateAsync(studio.Token, cancellation.Token);
+        await fixture.Peer.ReadControlAsync(cancellation.Token);
+        await fixture.Peer.SendControlAsync(ControlMessages.Start("req-h"), cancellation.Token);
+        await fixture.Peer.ReadControlAsync(cancellation.Token);
+        Assert.NotNull(sessions.ActiveSessionId);
+
+        Assert.True(await fixture.Peer.WaitForCloseAsync(TimeSpan.FromSeconds(5)));
+        await WaitUntilAsync(() => sessions.ActiveSessionId is null, TimeSpan.FromSeconds(5));
+
+        Assert.Null(sessions.ActiveSessionId);
+        Assert.Equal(1, metrics.Snapshot().DeadPeerDisconnects);
+        Assert.Equal(1, metrics.Snapshot().SessionsEndedByDisconnect);
     }
 
     [Fact]
     public async Task NoAudioIsSentWhileASessionIsActiveBecausePhase1HasNoCapturePath()
     {
-        var token = PairingToken.Generate();
-        await using var fixture = await StartAsync(token, FastOptions());
+        var devices = NewStore();
+        var mac = devices.Pair("Mac Studio");
+        await using var fixture = await StartAsync(devices, FastOptions());
         using var cancellation = new CancellationTokenSource(Timeout);
 
-        await fixture.Peer.AuthenticateAsync(token, cancellation.Token);
+        await fixture.Peer.AuthenticateAsync(mac.Token, cancellation.Token);
         await fixture.Peer.ReadControlAsync(cancellation.Token);
         await fixture.Peer.SendControlAsync(ControlMessages.Start("req-0001"), cancellation.Token);
         await fixture.Peer.ReadControlAsync(cancellation.Token);
@@ -4524,11 +6162,12 @@ public class ControlConnectionTests
     [Fact]
     public async Task StopWithoutStartStillReturnsStopAckEchoingTheRequestedSessionId()
     {
-        var token = PairingToken.Generate();
-        await using var fixture = await StartAsync(token, FastOptions());
+        var devices = NewStore();
+        var mac = devices.Pair("Mac Studio");
+        await using var fixture = await StartAsync(devices, FastOptions());
         using var cancellation = new CancellationTokenSource(Timeout);
 
-        await fixture.Peer.AuthenticateAsync(token, cancellation.Token);
+        await fixture.Peer.AuthenticateAsync(mac.Token, cancellation.Token);
         await fixture.Peer.ReadControlAsync(cancellation.Token);
 
         await fixture.Peer.SendControlAsync(ControlMessages.Stop("req-0003", ""), cancellation.Token);
@@ -4542,11 +6181,12 @@ public class ControlConnectionTests
     [Fact]
     public async Task DuplicateStopSucceedsAndAStaleSessionIdIsNotRejected()
     {
-        var token = PairingToken.Generate();
-        await using var fixture = await StartAsync(token, FastOptions());
+        var devices = NewStore();
+        var mac = devices.Pair("Mac Studio");
+        await using var fixture = await StartAsync(devices, FastOptions());
         using var cancellation = new CancellationTokenSource(Timeout);
 
-        await fixture.Peer.AuthenticateAsync(token, cancellation.Token);
+        await fixture.Peer.AuthenticateAsync(mac.Token, cancellation.Token);
         await fixture.Peer.ReadControlAsync(cancellation.Token);
 
         await fixture.Peer.SendControlAsync(ControlMessages.Start("req-0001"), cancellation.Token);
@@ -4568,11 +6208,13 @@ public class ControlConnectionTests
     [Fact]
     public async Task StartAfterStopOpensANewSession()
     {
-        var token = PairingToken.Generate();
-        await using var fixture = await StartAsync(token, FastOptions());
+        var devices = NewStore();
+        var mac = devices.Pair("Mac Studio");
+        var sessions = new SessionArbiter();
+        await using var fixture = await StartAsync(devices, FastOptions(), sessions: sessions);
         using var cancellation = new CancellationTokenSource(Timeout);
 
-        await fixture.Peer.AuthenticateAsync(token, cancellation.Token);
+        await fixture.Peer.AuthenticateAsync(mac.Token, cancellation.Token);
         await fixture.Peer.ReadControlAsync(cancellation.Token);
 
         await fixture.Peer.SendControlAsync(ControlMessages.Start("r1"), cancellation.Token);
@@ -4583,17 +6225,18 @@ public class ControlConnectionTests
         var second = await fixture.Peer.ReadControlAsync(cancellation.Token);
 
         Assert.NotEqual(first["sessionId"], second!["sessionId"]);
-        Assert.Equal(2, fixture.Connection.Session.SessionsStarted);
+        Assert.Equal(2, sessions.SessionsStarted);
     }
 
     [Fact]
-    public async Task StartIsNackedWithMicUnavailableWhenNoMicIsConfigured()
+    public async Task StartIsNackedWithMicUnavailableAndNoHolderWhenNoMicIsConfigured()
     {
-        var token = PairingToken.Generate();
-        await using var fixture = await StartAsync(token, FastOptions(micPresent: false));
+        var devices = NewStore();
+        var mac = devices.Pair("Mac Studio");
+        await using var fixture = await StartAsync(devices, FastOptions(micPresent: false));
         using var cancellation = new CancellationTokenSource(Timeout);
 
-        await fixture.Peer.AuthenticateAsync(token, cancellation.Token);
+        await fixture.Peer.AuthenticateAsync(mac.Token, cancellation.Token);
         var ack = await fixture.Peer.ReadControlAsync(cancellation.Token);
         Assert.Equal(false, ack!["micPresent"]);
 
@@ -4603,17 +6246,19 @@ public class ControlConnectionTests
         Assert.Equal("START_NACK", nack!["type"]);
         Assert.Equal("req-0002", nack["requestId"]);
         Assert.Equal("MIC_UNAVAILABLE", nack["reason"]);
+        Assert.False(nack.ContainsKey("holder"));
     }
 
     [Fact]
     public async Task ASilentAuthenticatedPeerIsDeclaredDead()
     {
-        var token = PairingToken.Generate();
+        var devices = NewStore();
+        var mac = devices.Pair("Mac Studio");
         var metrics = new AgentMetrics();
-        await using var fixture = await StartAsync(token, FastOptions(), metrics: metrics);
+        await using var fixture = await StartAsync(devices, FastOptions(), metrics: metrics);
         using var cancellation = new CancellationTokenSource(Timeout);
 
-        await fixture.Peer.AuthenticateAsync(token, cancellation.Token);
+        await fixture.Peer.AuthenticateAsync(mac.Token, cancellation.Token);
         await fixture.Peer.ReadControlAsync(cancellation.Token);
 
         Assert.True(await fixture.Peer.WaitForCloseAsync(TimeSpan.FromSeconds(5)));
@@ -4623,11 +6268,12 @@ public class ControlConnectionTests
     [Fact]
     public async Task HeartbeatTrafficKeepsTheConnectionAlivePastTheDeadPeerTimeout()
     {
-        var token = PairingToken.Generate();
-        await using var fixture = await StartAsync(token, FastOptions());
+        var devices = NewStore();
+        var mac = devices.Pair("Mac Studio");
+        await using var fixture = await StartAsync(devices, FastOptions());
         using var cancellation = new CancellationTokenSource(Timeout);
 
-        await fixture.Peer.AuthenticateAsync(token, cancellation.Token);
+        await fixture.Peer.AuthenticateAsync(mac.Token, cancellation.Token);
         await fixture.Peer.ReadControlAsync(cancellation.Token);
 
         for (var seq = 1; seq <= 6; seq++)
@@ -4640,15 +6286,16 @@ public class ControlConnectionTests
     }
 
     [Fact]
-    public async Task FiveFailedAttemptsLockOutEvenACorrectToken()
+    public async Task FiveFailedAttemptsFromOneAddressLockOutEvenACorrectToken()
     {
-        var token = PairingToken.Generate();
+        var devices = NewStore();
+        var mac = devices.Pair("Mac Studio");
         var limiter = new AuthRateLimiter(lockoutDuration: TimeSpan.FromSeconds(30));
         using var cancellation = new CancellationTokenSource(Timeout);
 
         for (var attempt = 0; attempt < 5; attempt++)
         {
-            await using var bad = await StartAsync(token, FastOptions(), limiter);
+            await using var bad = await StartAsync(devices, FastOptions(), limiter, peerKey: "192.168.1.66");
             await bad.Peer.ReadControlAsync(cancellation.Token);
             await bad.Peer.SendControlAsync(
                 ControlMessages.Hello("mock-mac", new string('b', 64)),
@@ -4656,32 +6303,80 @@ public class ControlConnectionTests
             Assert.True(await bad.Peer.WaitForCloseAsync(TimeSpan.FromSeconds(5)));
         }
 
-        Assert.True(limiter.IsLockedOut);
+        Assert.True(limiter.IsLockedOut("192.168.1.66"));
 
-        await using var good = await StartAsync(token, FastOptions(), limiter);
-        await good.Peer.AuthenticateAsync(token, cancellation.Token);
+        await using var good = await StartAsync(devices, FastOptions(), limiter, peerKey: "192.168.1.66");
+        await good.Peer.AuthenticateAsync(mac.Token, cancellation.Token);
 
         Assert.True(await good.Peer.WaitForCloseAsync(TimeSpan.FromSeconds(5)));
         Assert.False(good.Connection.IsAuthenticated);
     }
 
+    /// <summary>
+    /// The point of keying the limiter: one attacker's lockout must not take the
+    /// other paired Macs down with it.
+    /// </summary>
+    [Fact]
+    public async Task AnAttackerLockedOutAtOneAddressDoesNotBlockAPairedMacAtAnother()
+    {
+        var devices = NewStore();
+        var mac = devices.Pair("Mac Studio");
+        var limiter = new AuthRateLimiter(lockoutDuration: TimeSpan.FromSeconds(30));
+        using var cancellation = new CancellationTokenSource(Timeout);
+
+        for (var attempt = 0; attempt < 5; attempt++)
+        {
+            await using var bad = await StartAsync(devices, FastOptions(), limiter, peerKey: "192.168.1.66");
+            await bad.Peer.ReadControlAsync(cancellation.Token);
+            await bad.Peer.SendControlAsync(
+                ControlMessages.Hello("attacker", new string('b', 64)),
+                cancellation.Token);
+            Assert.True(await bad.Peer.WaitForCloseAsync(TimeSpan.FromSeconds(5)));
+        }
+
+        Assert.True(limiter.IsLockedOut("192.168.1.66"));
+
+        await using var good = await StartAsync(devices, FastOptions(), limiter, peerKey: "192.168.1.10");
+        await good.Peer.AuthenticateAsync(mac.Token, cancellation.Token);
+        var ack = await good.Peer.ReadControlAsync(cancellation.Token);
+
+        Assert.Equal("HELLO_ACK", ack!["type"]);
+        Assert.True(good.Connection.IsAuthenticated);
+    }
+
     [Fact]
     public async Task ThePreAuthDeadlineCountsAsAFailedAttempt()
     {
-        var token = PairingToken.Generate();
+        var devices = NewStore();
+        devices.Pair("Mac Studio");
         var limiter = new AuthRateLimiter();
-        await using var fixture = await StartAsync(token, FastOptions(), limiter);
+        await using var fixture = await StartAsync(devices, FastOptions(), limiter, peerKey: "192.168.1.66");
         using var cancellation = new CancellationTokenSource(Timeout);
 
         await fixture.Peer.ReadControlAsync(cancellation.Token);
         Assert.True(await fixture.Peer.WaitForCloseAsync(TimeSpan.FromSeconds(5)));
 
-        Assert.Equal(1, limiter.ConsecutiveFailures);
+        Assert.Equal(1, limiter.ConsecutiveFailures("192.168.1.66"));
+    }
+
+    /// <summary>Poll a condition that a background task satisfies, without sleeping a fixed time.</summary>
+    private static async Task WaitUntilAsync(Func<bool> condition, TimeSpan timeout)
+    {
+        var deadline = DateTimeOffset.UtcNow + timeout;
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            if (condition())
+            {
+                return;
+            }
+
+            await Task.Delay(25);
+        }
     }
 }
 ```
 
-Teardown discard counting is proved in Task 9 against `PrioritySendQueue` directly rather than here: with no capture path, the only way to put audio in the queue on a live connection is to enqueue it from the test, and the writer loop drains it before `STOP` can be sent, so the assertion would be a race rather than a check.
+Teardown discard counting is proved in Task 10 against `PrioritySendQueue` directly rather than here: with no capture path, the only way to put audio in the queue on a live connection is to enqueue it from the test, and the writer loop drains it before `STOP` can be sent, so the assertion would be a race rather than a check.
 
 - [ ] **Step 2: Run it and confirm it fails**
 
@@ -4743,6 +6438,17 @@ public sealed class AgentOptions
 
     public bool Headless { get; init; }
 
+    /// <summary>
+    /// Friendly names to pair at startup, one per --pair flag. Each mints a
+    /// fresh 256-bit token and prints its pairing string. This is how a headless
+    /// run adds a second, third or fourth Mac; the tray does the same job with a
+    /// dialog.
+    /// </summary>
+    public IReadOnlyList<string> PairDevices { get; init; } = Array.Empty<string>();
+
+    /// <summary>The device id given to --revoke, if any.</summary>
+    public string? RevokeDeviceId { get; init; }
+
     /// <summary>Bind only 127.0.0.1 instead of every private interface. Used by tests.</summary>
     public bool LoopbackOnly { get; init; }
 
@@ -4800,6 +6506,8 @@ public sealed record AgentMetricsSnapshot(
     long ControlMessagesReceived,
     long PingsReceived,
     long SessionsStarted,
+    long SessionsRefusedAsInUse,
+    long SessionsEndedByDisconnect,
     long DeadPeerDisconnects,
     long UnexpectedControlMessages,
     long AudioFramesSent);
@@ -4808,6 +6516,11 @@ public sealed record AgentMetricsSnapshot(
 /// The subset of design spec section 11's counters that Phase 1 can produce.
 /// Per-connection audio queue counters (offered, evicted, discarded) live on
 /// PrioritySendQueue and are read from there.
+///
+/// SessionsRefusedAsInUse and SessionsEndedByDisconnect exist because with
+/// several paired Macs those two events are the ones a user asks about: "why
+/// did my Start do nothing" and "did the other Mac's session actually get
+/// released when it went away".
 /// </summary>
 public sealed class AgentMetrics
 {
@@ -4819,6 +6532,8 @@ public sealed class AgentMetrics
     private long _controlMessagesReceived;
     private long _pingsReceived;
     private long _sessionsStarted;
+    private long _sessionsRefusedAsInUse;
+    private long _sessionsEndedByDisconnect;
     private long _deadPeerDisconnects;
     private long _unexpectedControlMessages;
     private long _audioFramesSent;
@@ -4839,6 +6554,10 @@ public sealed class AgentMetrics
 
     public void IncrementSessionsStarted() => Interlocked.Increment(ref _sessionsStarted);
 
+    public void IncrementSessionsRefusedAsInUse() => Interlocked.Increment(ref _sessionsRefusedAsInUse);
+
+    public void IncrementSessionsEndedByDisconnect() => Interlocked.Increment(ref _sessionsEndedByDisconnect);
+
     public void IncrementDeadPeerDisconnects() => Interlocked.Increment(ref _deadPeerDisconnects);
 
     public void IncrementUnexpectedControlMessages() => Interlocked.Increment(ref _unexpectedControlMessages);
@@ -4854,6 +6573,8 @@ public sealed class AgentMetrics
         Interlocked.Read(ref _controlMessagesReceived),
         Interlocked.Read(ref _pingsReceived),
         Interlocked.Read(ref _sessionsStarted),
+        Interlocked.Read(ref _sessionsRefusedAsInUse),
+        Interlocked.Read(ref _sessionsEndedByDisconnect),
         Interlocked.Read(ref _deadPeerDisconnects),
         Interlocked.Read(ref _unexpectedControlMessages),
         Interlocked.Read(ref _audioFramesSent));
@@ -4863,6 +6584,7 @@ public sealed class AgentMetrics
 `windows/SharedMic.Agent/Net/ControlConnection.cs`:
 
 ```csharp
+using System.Security.Cryptography;
 using SharedMic.Agent.Diagnostics;
 using SharedMic.Agent.Protocol;
 using SharedMic.Agent.Security;
@@ -4876,21 +6598,33 @@ namespace SharedMic.Agent.Net;
 /// tests). Owns the section 6 handshake, the section 7 session lifecycle, the
 /// section 8 dead-peer rule, and the section 9 writer loop.
 ///
+/// Several of these run at once — one per connected paired Mac. What is NOT
+/// per-connection is the session: every instance shares one SessionArbiter and
+/// at most one of them holds the microphone at a time.
+///
+/// The session is released in RunAsync's finally, through
+/// EndSessionOwnedBy(ConnectionId). That is the single point every exit path
+/// funnels through — STOP, a clean close, a socket error, a protocol violation,
+/// dead-peer detection, and agent shutdown — which is what makes "a session
+/// ends when its connection ends" true rather than aspirational.
+///
 /// Phase 1 has no capture path, so nothing ever calls SendQueue.EnqueueAudio on
 /// a live connection and an active session carries zero audio bytes.
 ///
-/// Threading: every control message is handled on the single read loop, which
-/// is why SessionStateMachine does not need to be thread-safe. The writer runs
-/// on its own task and touches only the queue and the stream.
+/// Threading: every control message for THIS connection is handled on its own
+/// single read loop. The shared arbiter and the shared rate limiter both take
+/// their own locks, because other connections' read loops reach them too. The
+/// writer runs on its own task and touches only the queue and the stream.
 /// </summary>
 public sealed class ControlConnection : IAsyncDisposable
 {
     private readonly Stream _stream;
     private readonly AgentIdentity _identity;
     private readonly AgentOptions _options;
+    private readonly PairedDeviceStore _devices;
     private readonly AuthRateLimiter _rateLimiter;
+    private readonly SessionArbiter _sessions;
     private readonly AgentMetrics _metrics;
-    private readonly SessionStateMachine _session = new();
     private readonly PrioritySendQueue _queue = new();
     private readonly CancellationTokenSource _closing = new();
     private readonly byte[] _nonce = AuthProof.GenerateNonce();
@@ -4901,26 +6635,44 @@ public sealed class ControlConnection : IAsyncDisposable
         Stream stream,
         AgentIdentity identity,
         AgentOptions options,
+        PairedDeviceStore devices,
         AuthRateLimiter rateLimiter,
+        SessionArbiter sessions,
         AgentMetrics metrics)
     {
         _stream = stream;
         _identity = identity;
         _options = options;
+        _devices = devices;
         _rateLimiter = rateLimiter;
+        _sessions = sessions;
         _metrics = metrics;
     }
 
-    /// <summary>Raised once HELLO_ACK has been queued, so the listener can supersede an older connection.</summary>
+    /// <summary>Raised once HELLO_ACK has been queued, so the listener can refresh its status.</summary>
     public event Action<ControlConnection>? Authenticated;
+
+    /// <summary>
+    /// Identifies this connection to the arbiter. Not the device: one Mac may
+    /// hold two connections, and only the one that got the START_ACK owns the
+    /// session.
+    /// </summary>
+    public string ConnectionId { get; } =
+        "conn-" + Convert.ToHexString(RandomNumberGenerator.GetBytes(4)).ToLowerInvariant();
 
     public bool IsAuthenticated { get; private set; }
 
+    /// <summary>The paired device the proof identified, or null before authentication.</summary>
+    public PairedDevice? Device { get; private set; }
+
     public string RemoteDescription { get; init; } = "unknown";
+
+    /// <summary>The rate-limiter key: the peer's address, without its port.</summary>
+    public string PeerKey { get; init; } = "unknown";
 
     public PrioritySendQueue SendQueue => _queue;
 
-    public SessionStateMachine Session => _session;
+    public SessionArbiter Sessions => _sessions;
 
     public async Task RunAsync(CancellationToken cancellationToken)
     {
@@ -4940,7 +6692,19 @@ public sealed class ControlConnection : IAsyncDisposable
         finally
         {
             Close();
-            _session.Reset();
+
+            // A session ends when its connection ends — not only on STOP. This
+            // one line is what stops a crashed or unplugged Mac from locking
+            // every other paired Mac out. Dead-peer detection arrives here too,
+            // because it works by cancelling this read loop.
+            if (_sessions.EndSessionOwnedBy(ConnectionId))
+            {
+                _metrics.IncrementSessionsEndedByDisconnect();
+                AgentLog.Info(
+                    $"{RemoteDescription} went away while holding the session; " +
+                    "the session is released and another paired Mac may take it");
+            }
+
             _queue.DiscardAudio();
 
             try
@@ -5113,12 +6877,13 @@ public sealed class ControlConnection : IAsyncDisposable
 
     private bool TryAuthenticate(IReadOnlyDictionary<string, object?> message)
     {
-        if (!_rateLimiter.TryBeginAttempt())
+        if (!_rateLimiter.TryBeginAttempt(PeerKey))
         {
             _metrics.IncrementAuthRefusedByLockout();
             AgentLog.Warn(
-                $"authentication from {RemoteDescription} refused: locked out for another " +
-                $"{_rateLimiter.LockoutRemaining.TotalSeconds:F0} s after 5 consecutive failures");
+                $"authentication from {RemoteDescription} refused: {PeerKey} is locked out for another " +
+                $"{_rateLimiter.LockoutRemaining(PeerKey).TotalSeconds:F0} s after " +
+                $"{ProtocolConstants.MaxAuthFailures} consecutive failures");
             return false;
         }
 
@@ -5129,31 +6894,43 @@ public sealed class ControlConnection : IAsyncDisposable
             return false;
         }
 
-        if (message["mac"] is not string mac || !AuthProof.Verify(_identity.Token, _nonce, mac))
+        // clientId is a DISPLAY LABEL and nothing else. It arrives before any
+        // proof has been checked, so it must not choose which token to test and
+        // must not become the device's name. The proof identifies the device;
+        // this string only ever reaches a log line.
+        var claimedName = message.GetValueOrDefault("clientId") as string ?? "(unnamed)";
+
+        var device = _devices.Identify(_nonce, message["mac"] as string);
+        if (device is null)
         {
-            FailAuthentication("the HMAC proof did not verify");
+            // Identical treatment for a wrong token, a malformed proof, and a
+            // revoked device. Nothing here reveals which of the three it was.
+            FailAuthentication("no paired device's token produced this proof");
             return false;
         }
 
-        _rateLimiter.RecordSuccess();
+        _rateLimiter.RecordSuccess(PeerKey);
+        Device = device;
         IsAuthenticated = true;
         _metrics.IncrementConnectionsAuthenticated();
 
         // Queue HELLO_ACK before flipping any observable state, so nothing can
         // slip ahead of it on the control queue.
         SendControl(ControlMessages.HelloAck(_identity.ServerId, _options.MicPresent, _options.DeviceLabel));
-        AgentLog.Info($"authenticated client '{message.GetValueOrDefault("clientId")}' from {RemoteDescription}");
+        AgentLog.Info(
+            $"authenticated paired device '{device.FriendlyName}' ({device.DeviceId}) from " +
+            $"{RemoteDescription}; it called itself '{claimedName}' (untrusted, display only)");
         Authenticated?.Invoke(this);
         return true;
     }
 
     private void FailAuthentication(string reason)
     {
-        _rateLimiter.RecordFailure();
+        _rateLimiter.RecordFailure(PeerKey);
         _metrics.IncrementAuthFailures();
 
-        var lockout = _rateLimiter.IsLockedOut
-            ? $" — the agent is now locked out for {_rateLimiter.LockoutRemaining.TotalSeconds:F0} s"
+        var lockout = _rateLimiter.IsLockedOut(PeerKey)
+            ? $" — {PeerKey} is now locked out for {_rateLimiter.LockoutRemaining(PeerKey).TotalSeconds:F0} s"
             : string.Empty;
         AgentLog.Warn($"authentication from {RemoteDescription} failed: {reason}{lockout}");
     }
@@ -5181,25 +6958,41 @@ public sealed class ControlConnection : IAsyncDisposable
                     break;
                 }
 
-                var outcome = _session.HandleStart(_options.MicPresent);
-                if (!outcome.Accepted)
+                var grant = _sessions.Start(ConnectionId, Device?.FriendlyName ?? string.Empty, _options.MicPresent);
+                if (!grant.Accepted)
                 {
-                    AgentLog.Info($"START {requestId} rejected: {outcome.Reason}");
-                    SendControl(ControlMessages.StartNack(requestId, outcome.Reason!));
+                    if (grant.Reason == SessionArbiter.SessionInUse)
+                    {
+                        _metrics.IncrementSessionsRefusedAsInUse();
+                        AgentLog.Info(
+                            $"START {requestId} from '{Device?.FriendlyName}' refused: " +
+                            $"'{grant.HolderName}' holds the session");
+                    }
+                    else
+                    {
+                        AgentLog.Info($"START {requestId} rejected: {grant.Reason}");
+                    }
+
+                    // The holder name is advisory and is omitted by
+                    // ControlMessages.StartNack when it is null or blank, which
+                    // is exactly the MIC_UNAVAILABLE case.
+                    SendControl(ControlMessages.StartNack(requestId, grant.Reason!, grant.HolderName));
                     break;
                 }
 
-                if (outcome.StartedNewSession)
+                if (grant.StartedNewSession)
                 {
                     _metrics.IncrementSessionsStarted();
-                    AgentLog.Info($"session {outcome.SessionId} started (Phase 1: no capture, no audio will be sent)");
+                    AgentLog.Info(
+                        $"session {grant.SessionId} started by '{Device?.FriendlyName}' " +
+                        "(Phase 1: no capture, no audio will be sent)");
                 }
                 else
                 {
-                    AgentLog.Info($"duplicate START {requestId} returned the existing session {outcome.SessionId}");
+                    AgentLog.Info($"duplicate START {requestId} returned the existing session {grant.SessionId}");
                 }
 
-                SendControl(ControlMessages.StartAck(requestId, outcome.SessionId));
+                SendControl(ControlMessages.StartAck(requestId, grant.SessionId));
                 break;
             }
 
@@ -5212,14 +7005,18 @@ public sealed class ControlConnection : IAsyncDisposable
                 }
 
                 var requested = message["sessionId"] as string ?? string.Empty;
-                var outcome = _session.HandleStop(requested);
+
+                // A STOP from a connection that does not hold the session ends
+                // nothing and still succeeds. Anything else would let any paired
+                // Mac cancel another's session with one message.
+                var release = _sessions.Stop(ConnectionId, requested);
                 var discarded = _queue.DiscardAudio();
-                if (outcome.EndedSession)
+                if (release.EndedSession)
                 {
-                    AgentLog.Info($"session {outcome.SessionId} ended; discarded {discarded} queued audio frames");
+                    AgentLog.Info($"session {release.SessionId} ended; discarded {discarded} queued audio frames");
                 }
 
-                SendControl(ControlMessages.StopAck(requestId, outcome.SessionId));
+                SendControl(ControlMessages.StopAck(requestId, release.SessionId));
                 break;
             }
 
@@ -5311,18 +7108,18 @@ Run, from the repo's `windows` directory on Windows:
 dotnet test SharedMic.Windows.sln --filter "FullyQualifiedName~ControlConnectionTests"
 ```
 
-Expected: PASS, 20 tests.
+Expected: PASS, 29 tests. The five that matter most here are `ASecondConnectionIsNackedWithSessionInUseAndTheHolderName`, `StopFromANonHolderIsAckedButEndsNothing`, `ClosingTheOwningConnectionReleasesTheSessionForEveryoneElse`, `DeadPeerDetectionAlsoReleasesTheSession` and `AnAttackerLockedOutAtOneAddressDoesNotBlockAPairedMacAtAnother` — none of which has any equivalent in the Python conformance suite.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add windows/SharedMic.Agent/AgentOptions.cs windows/SharedMic.Agent/AgentStatus.cs windows/SharedMic.Agent/Diagnostics windows/SharedMic.Agent/Net/ControlConnection.cs windows/SharedMic.Agent.Tests/LoopbackPeer.cs windows/SharedMic.Agent.Tests/ControlConnectionTests.cs
-git commit -m "Phase 1 Task 12: control connection with handshake, idempotent sessions, dead-peer detection"
+git commit -m "Phase 1 Task 14: control connection with handshake, arbitrated sessions, dead-peer detection"
 ```
 
 ---
 
-### Task 13: TLS 1.3 listener bound to private interfaces
+### Task 15: TLS 1.3 listener bound to private interfaces
 
 **Files:**
 - Create: `windows/SharedMic.Agent/Net/PrivateAddress.cs`
@@ -5331,10 +7128,12 @@ git commit -m "Phase 1 Task 12: control connection with handshake, idempotent se
 - Test: `windows/SharedMic.Agent.Tests/TlsListenerTests.cs`
 
 **Interfaces:**
-- Consumes: `AgentIdentity`, `AgentOptions`, `AuthRateLimiter`, `AgentMetrics`, `AgentStatus`, `AgentLog`, `ControlConnection(Stream, AgentIdentity, AgentOptions, AuthRateLimiter, AgentMetrics)` with `RunAsync`, `Close`, `DisposeAsync`, and the `Authenticated` event.
-- Produces: `static class PrivateAddress` with `bool IsPrivate(IPAddress address)` and `IReadOnlyList<IPAddress> Enumerate()`; `sealed class TlsListener : IAsyncDisposable` with constructor `TlsListener(AgentIdentity identity, AgentOptions options, AuthRateLimiter rateLimiter, AgentMetrics metrics, Action<AgentStatus, string?> onStatus)`, members `IReadOnlyList<IPEndPoint> Endpoints`, `void Start()`, `ValueTask DisposeAsync()`.
+- Consumes: `AgentIdentity`, `AgentOptions`, `PairedDeviceStore`, `AuthRateLimiter.PeerKey(EndPoint?)`, `SessionArbiter.HolderName`, `AgentMetrics`, `AgentStatus`, `AgentLog`, `ControlConnection(Stream, AgentIdentity, AgentOptions, PairedDeviceStore, AuthRateLimiter, SessionArbiter, AgentMetrics)` with `ConnectionId`, `PeerKey`, `Device`, `RunAsync`, `Close`, `DisposeAsync`, and the `Authenticated` event.
+- Produces: `static class PrivateAddress` with `bool IsPrivate(IPAddress address)` and `IReadOnlyList<IPAddress> Enumerate()`; `sealed class TlsListener : IAsyncDisposable` with constructor `TlsListener(AgentIdentity identity, AgentOptions options, PairedDeviceStore devices, AuthRateLimiter rateLimiter, SessionArbiter sessions, AgentMetrics metrics, Action<AgentStatus, string?> onStatus)`, members `IReadOnlyList<IPEndPoint> Endpoints`, `int AuthenticatedConnections`, `void Start()`, `ValueTask DisposeAsync()`.
 
-**This task runs on Windows.**
+**Supersession is gone.** The previous draft closed the older connection as soon as a new one authenticated, on the theory that there was only ever one Mac. There are several, they are all trusted, and they all stay connected; the microphone is arbitrated by `SessionArbiter`, not by hanging up on people. What the listener keeps is the rule that made supersession safe in the first place: **nothing observable happens until a connection authenticates**, so an unauthenticated peer still cannot affect anyone.
+
+**This task runs on Windows.** Its tests are the only ones in the plan that put two authenticated Macs on real TLS at the same time.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -5462,16 +7261,61 @@ public class TlsListenerTests : IDisposable
         return ssl;
     }
 
+    /// <summary>A connected, authenticated Mac: the TLS stream plus the reader that owns its buffer.</summary>
+    private sealed class Client : IAsyncDisposable
+    {
+        public Client(SslStream stream)
+        {
+            Stream = stream;
+            Reader = new FrameReader(stream);
+        }
+
+        public SslStream Stream { get; }
+
+        public FrameReader Reader { get; }
+
+        public async Task SendAsync(IReadOnlyDictionary<string, object?> message, CancellationToken cancellationToken)
+        {
+            var frame = FrameCodec.EncodeFrame(FrameType.Control, ControlCodec.Encode(message));
+            await Stream.WriteAsync(frame, cancellationToken);
+            await Stream.FlushAsync(cancellationToken);
+        }
+
+        public async Task<Dictionary<string, object?>> ReadAsync(CancellationToken cancellationToken)
+        {
+            var frame = await Reader.ReadFrameAsync(cancellationToken)
+                        ?? throw new InvalidOperationException("the agent closed the connection");
+            return ControlCodec.Decode(frame.Payload);
+        }
+
+        public async Task<bool> IsClosedAsync(CancellationToken cancellationToken)
+        {
+            try
+            {
+                return await Reader.ReadFrameAsync(cancellationToken) is null;
+            }
+            catch (Exception exception) when (exception is IOException or ProtocolException or ObjectDisposedException)
+            {
+                return true;
+            }
+        }
+
+        public async ValueTask DisposeAsync() => await Stream.DisposeAsync();
+    }
+
     [Fact]
     public async Task AcceptsAPinnedTls13ConnectionAndCompletesTheHandshake()
     {
         var identity = new IdentityStore(_directory).LoadOrCreate();
-        var options = LoopbackOptions(port: 0);
+        var devices = new PairedDeviceStore(_directory);
+        var mac = devices.Pair("Mac Studio");
         var statuses = new List<AgentStatus>();
         await using var listener = new TlsListener(
             identity,
-            options,
+            LoopbackOptions(port: 0),
+            devices,
             new AuthRateLimiter(),
+            new SessionArbiter(),
             new AgentMetrics(),
             (status, _) => statuses.Add(status));
 
@@ -5493,7 +7337,7 @@ public class TlsListenerTests : IDisposable
         var nonce = Convert.FromHexString((string)greeting["nonce"]!);
         var hello = FrameCodec.EncodeFrame(
             FrameType.Control,
-            ControlCodec.Encode(ControlMessages.Hello("mock-mac", AuthProof.Compute(identity.Token, nonce))));
+            ControlCodec.Encode(ControlMessages.Hello("mock-mac", AuthProof.Compute(mac.Token, nonce))));
         await ssl.WriteAsync(hello, cancellation.Token);
         await ssl.FlushAsync(cancellation.Token);
 
@@ -5512,7 +7356,9 @@ public class TlsListenerTests : IDisposable
         await using var listener = new TlsListener(
             identity,
             LoopbackOptions(port),
+            new PairedDeviceStore(_directory),
             new AuthRateLimiter(),
+            new SessionArbiter(),
             new AgentMetrics(),
             (_, _) => { });
 
@@ -5523,14 +7369,23 @@ public class TlsListenerTests : IDisposable
         Assert.Equal(IPAddress.Loopback, listener.Endpoints[0].Address);
     }
 
+    /// <summary>
+    /// The rule the old draft had backwards. Two paired Macs connect, both
+    /// authenticate, and BOTH stay up. No supersession.
+    /// </summary>
     [Fact]
-    public async Task ANewlyAuthenticatedConnectionSupersedesTheOlderOne()
+    public async Task TwoPairedMacsStayAuthenticatedAtTheSameTime()
     {
         var identity = new IdentityStore(_directory).LoadOrCreate();
+        var devices = new PairedDeviceStore(_directory);
+        var studio = devices.Pair("Mac Studio");
+        var laptop = devices.Pair("MacBook Pro");
         await using var listener = new TlsListener(
             identity,
             LoopbackOptions(port: 0),
+            devices,
             new AuthRateLimiter(),
+            new SessionArbiter(),
             new AgentMetrics(),
             (_, _) => { });
 
@@ -5538,25 +7393,100 @@ public class TlsListenerTests : IDisposable
         var endpoint = listener.Endpoints.Single();
         using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(20));
 
-        var first = await AuthenticateAsync(endpoint, identity, cancellation.Token);
-        var second = await AuthenticateAsync(endpoint, identity, cancellation.Token);
+        await using var first = await AuthenticateAsync(endpoint, identity, studio.Token, cancellation.Token);
+        await using var second = await AuthenticateAsync(endpoint, identity, laptop.Token, cancellation.Token);
 
-        // The first connection must be torn down once the second authenticates.
-        var firstReader = new FrameReader(first);
-        var closed = false;
-        try
-        {
-            closed = await firstReader.ReadFrameAsync(cancellation.Token) is null;
-        }
-        catch (Exception exception) when (exception is IOException or ProtocolException or ObjectDisposedException)
-        {
-            closed = true;
-        }
+        // Both connections are still alive and still answering.
+        await first.SendAsync(ControlMessages.Ping(1), cancellation.Token);
+        Assert.Equal("PONG", (await first.ReadAsync(cancellation.Token))["type"]);
+        await second.SendAsync(ControlMessages.Ping(2), cancellation.Token);
+        Assert.Equal("PONG", (await second.ReadAsync(cancellation.Token))["type"]);
 
-        Assert.True(closed, "the superseded connection was not closed");
+        Assert.Equal(2, listener.AuthenticatedConnections);
+    }
 
-        await second.DisposeAsync();
-        await first.DisposeAsync();
+    [Fact]
+    public async Task OnlyOneOfTwoConnectedMacsGetsTheSession()
+    {
+        var identity = new IdentityStore(_directory).LoadOrCreate();
+        var devices = new PairedDeviceStore(_directory);
+        var studio = devices.Pair("Mac Studio");
+        var laptop = devices.Pair("MacBook Pro");
+        var sessions = new SessionArbiter();
+        await using var listener = new TlsListener(
+            identity,
+            LoopbackOptions(port: 0),
+            devices,
+            new AuthRateLimiter(),
+            sessions,
+            new AgentMetrics(),
+            (_, _) => { });
+
+        listener.Start();
+        var endpoint = listener.Endpoints.Single();
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+
+        await using var holder = await AuthenticateAsync(endpoint, identity, studio.Token, cancellation.Token);
+        await using var other = await AuthenticateAsync(endpoint, identity, laptop.Token, cancellation.Token);
+
+        await holder.SendAsync(ControlMessages.Start("req-h"), cancellation.Token);
+        var granted = await holder.ReadAsync(cancellation.Token);
+
+        await other.SendAsync(ControlMessages.Start("req-o"), cancellation.Token);
+        var refused = await other.ReadAsync(cancellation.Token);
+
+        Assert.Equal("START_ACK", granted["type"]);
+        Assert.Equal("START_NACK", refused["type"]);
+        Assert.Equal("SESSION_IN_USE", refused["reason"]);
+        Assert.Equal("Mac Studio", refused["holder"]);
+        Assert.Equal(1, sessions.SessionsStarted);
+        Assert.Equal(studio.DeviceId, listener.SessionHolderDeviceId);
+        Assert.Equal(2, listener.AuthenticatedConnections);
+    }
+
+    /// <summary>
+    /// Over real TLS this time: the holder's socket goes away without a STOP and
+    /// the other Mac can take the session.
+    /// </summary>
+    [Fact]
+    public async Task WhenTheHolderDisconnectsTheOtherMacCanTakeTheSession()
+    {
+        var identity = new IdentityStore(_directory).LoadOrCreate();
+        var devices = new PairedDeviceStore(_directory);
+        var studio = devices.Pair("Mac Studio");
+        var laptop = devices.Pair("MacBook Pro");
+        var sessions = new SessionArbiter();
+        await using var listener = new TlsListener(
+            identity,
+            LoopbackOptions(port: 0),
+            devices,
+            new AuthRateLimiter(),
+            sessions,
+            new AgentMetrics(),
+            (_, _) => { });
+
+        listener.Start();
+        var endpoint = listener.Endpoints.Single();
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+
+        var holder = await AuthenticateAsync(endpoint, identity, studio.Token, cancellation.Token);
+        await using var other = await AuthenticateAsync(endpoint, identity, laptop.Token, cancellation.Token);
+
+        await holder.SendAsync(ControlMessages.Start("req-h"), cancellation.Token);
+        Assert.Equal("START_ACK", (await holder.ReadAsync(cancellation.Token))["type"]);
+
+        await other.SendAsync(ControlMessages.Start("req-o1"), cancellation.Token);
+        Assert.Equal("START_NACK", (await other.ReadAsync(cancellation.Token))["type"]);
+
+        // No STOP: just a dead socket, the way a crash or a closed lid looks.
+        await holder.DisposeAsync();
+        await WaitUntilAsync(() => sessions.ActiveSessionId is null, TimeSpan.FromSeconds(10));
+
+        await other.SendAsync(ControlMessages.Start("req-o2"), cancellation.Token);
+        var granted = await other.ReadAsync(cancellation.Token);
+
+        Assert.Equal("START_ACK", granted["type"]);
+        Assert.Equal(2, sessions.SessionsStarted);
     }
 
     [Fact]
@@ -5567,7 +7497,9 @@ public class TlsListenerTests : IDisposable
         await using var listener = new TlsListener(
             identity,
             LoopbackOptions(port: 0),
+            new PairedDeviceStore(_directory),
             limiter,
+            new SessionArbiter(),
             new AgentMetrics(),
             (_, _) => { });
 
@@ -5576,40 +7508,45 @@ public class TlsListenerTests : IDisposable
         using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(20));
 
         await using var ssl = await ConnectPinnedAsync(endpoint, identity.Fingerprint);
-        var reader = new FrameReader(ssl);
-        await reader.ReadFrameAsync(cancellation.Token);
+        var client = new Client(ssl);
+        await client.Reader.ReadFrameAsync(cancellation.Token);
 
-        var closed = false;
-        try
-        {
-            closed = await reader.ReadFrameAsync(cancellation.Token) is null;
-        }
-        catch (Exception exception) when (exception is IOException or ProtocolException or ObjectDisposedException)
-        {
-            closed = true;
-        }
+        Assert.True(await client.IsClosedAsync(cancellation.Token));
 
-        Assert.True(closed);
-        Assert.Equal(1, limiter.ConsecutiveFailures);
+        // The connection came from loopback, so that is the key it was counted
+        // under. AuthRateLimiter.PeerKey drops the source port.
+        Assert.Equal(1, limiter.ConsecutiveFailures("127.0.0.1"));
     }
 
-    private static async Task<SslStream> AuthenticateAsync(
+    private static async Task<Client> AuthenticateAsync(
         IPEndPoint endpoint,
         AgentIdentity identity,
+        byte[] token,
         CancellationToken cancellationToken)
     {
-        var ssl = await ConnectPinnedAsync(endpoint, identity.Fingerprint);
-        var reader = new FrameReader(ssl);
-        var greeting = ControlCodec.Decode((await reader.ReadFrameAsync(cancellationToken))!.Value.Payload);
+        var client = new Client(await ConnectPinnedAsync(endpoint, identity.Fingerprint));
+        var greeting = await client.ReadAsync(cancellationToken);
         var nonce = Convert.FromHexString((string)greeting["nonce"]!);
-        var hello = FrameCodec.EncodeFrame(
-            FrameType.Control,
-            ControlCodec.Encode(ControlMessages.Hello("mock-mac", AuthProof.Compute(identity.Token, nonce))));
-        await ssl.WriteAsync(hello, cancellationToken);
-        await ssl.FlushAsync(cancellationToken);
-        var ack = ControlCodec.Decode((await reader.ReadFrameAsync(cancellationToken))!.Value.Payload);
+        await client.SendAsync(
+            ControlMessages.Hello("mock-mac", AuthProof.Compute(token, nonce)),
+            cancellationToken);
+        var ack = await client.ReadAsync(cancellationToken);
         Assert.Equal("HELLO_ACK", ack["type"]);
-        return ssl;
+        return client;
+    }
+
+    private static async Task WaitUntilAsync(Func<bool> condition, TimeSpan timeout)
+    {
+        var deadline = DateTimeOffset.UtcNow + timeout;
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            if (condition())
+            {
+                return;
+            }
+
+            await Task.Delay(25);
+        }
     }
 
     private static int FreeLoopbackPort()
@@ -5717,6 +7654,7 @@ using System.Security.Authentication;
 using System.Security.Cryptography.X509Certificates;
 using SharedMic.Agent.Diagnostics;
 using SharedMic.Agent.Security;
+using SharedMic.Agent.Session;
 
 namespace SharedMic.Agent.Net;
 
@@ -5726,39 +7664,85 @@ namespace SharedMic.Agent.Net;
 /// immediately, with Windows as the TLS server. There is no CA: the certificate
 /// exists only so the Mac can pin the SHA-256 of its DER encoding.
 ///
-/// A newly authenticated connection supersedes an older one. The swap happens
-/// only AFTER the new connection authenticates, so an unauthenticated attacker
-/// cannot kick a live session by opening a socket.
+/// Every paired Mac may be connected at once. There is NO supersession: a newly
+/// authenticated connection does not displace an older one, because the thing
+/// they contend over is the microphone session, and SessionArbiter arbitrates
+/// that without anyone being hung up on.
+///
+/// What survives from the superseding design is the rule that made it safe:
+/// nothing observable happens until a connection authenticates, so opening a
+/// socket buys an attacker nothing.
 /// </summary>
 public sealed class TlsListener : IAsyncDisposable
 {
     private readonly AgentIdentity _identity;
     private readonly AgentOptions _options;
+    private readonly PairedDeviceStore _devices;
     private readonly AuthRateLimiter _rateLimiter;
+    private readonly SessionArbiter _sessions;
     private readonly AgentMetrics _metrics;
     private readonly Action<AgentStatus, string?> _onStatus;
     private readonly List<TcpListener> _listeners = new();
     private readonly List<Task> _acceptLoops = new();
     private readonly CancellationTokenSource _stopping = new();
     private readonly object _gate = new();
-
-    private ControlConnection? _current;
+    private readonly List<ControlConnection> _authenticated = new();
 
     public TlsListener(
         AgentIdentity identity,
         AgentOptions options,
+        PairedDeviceStore devices,
         AuthRateLimiter rateLimiter,
+        SessionArbiter sessions,
         AgentMetrics metrics,
         Action<AgentStatus, string?> onStatus)
     {
         _identity = identity;
         _options = options;
+        _devices = devices;
         _rateLimiter = rateLimiter;
+        _sessions = sessions;
         _metrics = metrics;
         _onStatus = onStatus;
     }
 
     public IReadOnlyList<IPEndPoint> Endpoints { get; private set; } = Array.Empty<IPEndPoint>();
+
+    /// <summary>How many paired Macs are authenticated right now.</summary>
+    public int AuthenticatedConnections
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _authenticated.Count;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Which PAIRED DEVICE holds the session, or null when nobody does. The
+    /// arbiter tracks the owning CONNECTION; this resolves that connection to
+    /// the device behind it, which is what the tray needs to mark a row.
+    /// </summary>
+    public string? SessionHolderDeviceId
+    {
+        get
+        {
+            if (_sessions.HolderId is not { } holderId)
+            {
+                return null;
+            }
+
+            lock (_gate)
+            {
+                return _authenticated
+                    .FirstOrDefault(connection =>
+                        string.Equals(connection.ConnectionId, holderId, StringComparison.Ordinal))
+                    ?.Device?.DeviceId;
+            }
+        }
+    }
 
     public void Start()
     {
@@ -5813,14 +7797,17 @@ public sealed class TlsListener : IAsyncDisposable
             }
         }
 
-        ControlConnection? current;
+        ControlConnection[] live;
         lock (_gate)
         {
-            current = _current;
-            _current = null;
+            live = _authenticated.ToArray();
+            _authenticated.Clear();
         }
 
-        current?.Close();
+        foreach (var connection in live)
+        {
+            connection.Close();
+        }
 
         foreach (var loop in _acceptLoops)
         {
@@ -5885,9 +7872,11 @@ public sealed class TlsListener : IAsyncDisposable
 
             AgentLog.Info($"TLS handshake with {remote} negotiated {ssl.SslProtocol}");
 
-            connection = new ControlConnection(ssl, _identity, _options, _rateLimiter, _metrics)
+            connection = new ControlConnection(
+                ssl, _identity, _options, _devices, _rateLimiter, _sessions, _metrics)
             {
                 RemoteDescription = remote,
+                PeerKey = AuthRateLimiter.PeerKey(client.Client.RemoteEndPoint),
             };
             connection.Authenticated += Adopt;
 
@@ -5906,10 +7895,7 @@ public sealed class TlsListener : IAsyncDisposable
                 connection.Authenticated -= Adopt;
                 lock (_gate)
                 {
-                    if (ReferenceEquals(_current, connection))
-                    {
-                        _current = null;
-                    }
+                    _authenticated.Remove(connection);
                 }
 
                 await connection.DisposeAsync().ConfigureAwait(false);
@@ -5925,33 +7911,49 @@ public sealed class TlsListener : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Record a connection that has authenticated. It joins the others; it does
+    /// not replace them.
+    /// </summary>
     private void Adopt(ControlConnection connection)
     {
-        ControlConnection? previous;
+        int count;
         lock (_gate)
         {
-            previous = _current;
-            _current = connection;
+            if (!_authenticated.Contains(connection))
+            {
+                _authenticated.Add(connection);
+            }
+
+            count = _authenticated.Count;
         }
 
-        if (previous is not null && !ReferenceEquals(previous, connection))
-        {
-            AgentLog.Info("a newer authenticated connection superseded the previous one");
-            previous.Close();
-        }
-
+        AgentLog.Info(
+            $"'{connection.Device?.FriendlyName}' authenticated from {connection.RemoteDescription}; " +
+            $"{count} paired Mac(s) now connected");
         PublishStatus();
     }
 
     private void PublishStatus()
     {
-        bool connected;
+        int count;
         lock (_gate)
         {
-            connected = _current is not null;
+            count = _authenticated.Count;
         }
 
-        _onStatus(connected ? AgentStatus.Idle : AgentStatus.Disconnected, null);
+        if (count == 0)
+        {
+            _onStatus(AgentStatus.Disconnected, null);
+            return;
+        }
+
+        var holder = _sessions.HolderName;
+        var detail = string.IsNullOrWhiteSpace(holder)
+            ? $"{count} connected"
+            : $"{count} connected, {holder} active";
+
+        _onStatus(AgentStatus.Idle, detail);
     }
 }
 ```
@@ -5964,7 +7966,7 @@ Run, from the repo's `windows` directory on Windows:
 dotnet test SharedMic.Windows.sln --filter "FullyQualifiedName~PrivateAddressTests|FullyQualifiedName~TlsListenerTests"
 ```
 
-Expected: PASS, 22 tests (17 `PrivateAddress` theory cases plus 1 fact, and 4 listener facts).
+Expected: PASS, 24 tests (17 `PrivateAddress` theory cases plus 1 fact, and 6 listener facts).
 
 If `AcceptsAPinnedTls13ConnectionAndCompletesTheHandshake` fails with `AuthenticationException: The client and server cannot communicate, because they do not possess a common algorithm`, the Windows host's Schannel does not support TLS 1.3 as a server. That is an OS-version finding (TLS 1.3 server support needs Windows 11 or Windows Server 2022). Report it; do not lower `EnabledSslProtocols`, because protocol-v1.md section 2 makes TLS 1.3 part of the contract.
 
@@ -5972,12 +7974,12 @@ If `AcceptsAPinnedTls13ConnectionAndCompletesTheHandshake` fails with `Authentic
 
 ```bash
 git add windows/SharedMic.Agent/Net/PrivateAddress.cs windows/SharedMic.Agent/Net/TlsListener.cs windows/SharedMic.Agent.Tests/PrivateAddressTests.cs windows/SharedMic.Agent.Tests/TlsListenerTests.cs
-git commit -m "Phase 1 Task 13: TLS 1.3 listener on port 47800, private interfaces only"
+git commit -m "Phase 1 Task 15: TLS 1.3 listener on port 47800, private interfaces only, concurrent Macs"
 ```
 
 ---
 
-### Task 14: Runnable headless host and Python interoperability
+### Task 16: Runnable headless host and Python interoperability
 
 This is the first task whose deliverable is a program a person runs. It is also the first evidence that the C# agent and the Python reference implementation actually interoperate, rather than each matching the document separately.
 
@@ -6009,6 +8011,8 @@ public class ProgramArgumentTests
         Assert.False(options.LoopbackOnly);
         Assert.Equal(TimeSpan.FromSeconds(5), options.HelloDeadline);
         Assert.Equal(TimeSpan.FromSeconds(45), options.PeerDeadTimeout);
+        Assert.Empty(options.PairDevices);
+        Assert.Null(options.RevokeDeviceId);
     }
 
     [Fact]
@@ -6022,6 +8026,7 @@ public class ProgramArgumentTests
             "--data-dir", @"C:\temp\sharedmic",
             "--headless",
             "--loopback-only",
+            "--revoke", "dev-0badcafe",
         });
 
         Assert.Equal(47999, options.Port);
@@ -6030,6 +8035,23 @@ public class ProgramArgumentTests
         Assert.Equal(@"C:\temp\sharedmic", options.DataDirectory);
         Assert.True(options.Headless);
         Assert.True(options.LoopbackOnly);
+        Assert.Equal("dev-0badcafe", options.RevokeDeviceId);
+    }
+
+    /// <summary>
+    /// Several Macs means several pairings, so --pair repeats. Order is kept so
+    /// the printed pairing strings line up with the names the user gave.
+    /// </summary>
+    [Fact]
+    public void PairFlagRepeatsOncePerMac()
+    {
+        var options = SharedMic.Agent.Program.ParseArguments(new[]
+        {
+            "--pair", "Mac Studio",
+            "--pair", "MacBook Pro",
+        });
+
+        Assert.Equal(new[] { "Mac Studio", "MacBook Pro" }, options.PairDevices.ToArray());
     }
 
     [Fact]
@@ -6062,6 +8084,8 @@ dotnet test SharedMic.Windows.sln --filter "FullyQualifiedName~ProgramArgumentTe
 
 Expected: FAIL with `CS0234: The type or namespace name 'Program' does not exist in the namespace 'SharedMic.Agent'`.
 
+`ProjectSetupTests.cs` needs `using System.Linq;` if `ImplicitUsings` has been turned off for any reason; with the `.csproj` from Task 1 it is already implicit.
+
 - [ ] **Step 3: Implement**
 
 `windows/SharedMic.Agent/Program.cs`:
@@ -6070,6 +8094,7 @@ Expected: FAIL with `CS0234: The type or namespace name 'Program' does not exist
 using SharedMic.Agent.Diagnostics;
 using SharedMic.Agent.Net;
 using SharedMic.Agent.Security;
+using SharedMic.Agent.Session;
 
 namespace SharedMic.Agent;
 
@@ -6083,6 +8108,8 @@ public static class Program
         var dataDirectory = IdentityStore.DefaultDirectory;
         var headless = false;
         var loopbackOnly = false;
+        var pairDevices = new List<string>();
+        string? revokeDeviceId = null;
 
         for (var i = 0; i < args.Length; i++)
         {
@@ -6108,6 +8135,12 @@ public static class Program
                 case "--loopback-only":
                     loopbackOnly = true;
                     break;
+                case "--pair":
+                    pairDevices.Add(Next(args, ref i, "--pair"));
+                    break;
+                case "--revoke":
+                    revokeDeviceId = Next(args, ref i, "--revoke");
+                    break;
                 default:
                     throw new ArgumentException($"unknown argument '{args[i]}'");
             }
@@ -6121,6 +8154,8 @@ public static class Program
             DataDirectory = dataDirectory,
             Headless = headless,
             LoopbackOnly = loopbackOnly,
+            PairDevices = pairDevices,
+            RevokeDeviceId = revokeDeviceId,
         };
     }
 
@@ -6137,20 +8172,25 @@ public static class Program
             Console.Error.WriteLine(exception.Message);
             Console.Error.WriteLine(
                 "usage: SharedMic.Agent [--port N] [--no-mic] [--device-label TEXT] " +
-                "[--data-dir PATH] [--headless] [--loopback-only]");
+                "[--data-dir PATH] [--headless] [--loopback-only] [--pair NAME]... [--revoke DEVICE_ID]");
             return 2;
         }
 
         var identity = new IdentityStore(options.DataDirectory).LoadOrCreate();
+        var devices = new PairedDeviceStore(options.DataDirectory);
         var metrics = new AgentMetrics();
         var rateLimiter = new AuthRateLimiter();
+        var sessions = new SessionArbiter();
 
-        PrintBanner(identity, options);
+        ApplyDeviceCommands(devices, options);
+        PrintBanner(identity, devices, options);
 
         var listener = new TlsListener(
             identity,
             options,
+            devices,
             rateLimiter,
+            sessions,
             metrics,
             (status, detail) => AgentLog.Info($"status: {status}{(detail is null ? string.Empty : $" ({detail})")}"));
 
@@ -6179,10 +8219,40 @@ public static class Program
         return 0;
     }
 
-    private static void PrintBanner(AgentIdentity identity, AgentOptions options)
+    /// <summary>
+    /// --revoke first, then --pair, then the first-run default. Revoking before
+    /// pairing means "--revoke old --pair new" in one invocation does what it
+    /// reads like.
+    /// </summary>
+    private static void ApplyDeviceCommands(PairedDeviceStore devices, AgentOptions options)
     {
-        // Never print the token itself. The pairing string is meant for the
-        // user's eyes and the fingerprint is public by construction.
+        if (options.RevokeDeviceId is { } deviceId)
+        {
+            AgentLog.Info(devices.Revoke(deviceId)
+                ? $"revoked paired device {deviceId}; it can no longer authenticate"
+                : $"no paired device has id '{deviceId}'; nothing was revoked");
+        }
+
+        foreach (var name in options.PairDevices)
+        {
+            var device = devices.Pair(name);
+            AgentLog.Info($"paired '{device.FriendlyName}' as {device.DeviceId}");
+        }
+
+        if (devices.Count == 0)
+        {
+            var device = devices.Pair("Mac 1");
+            AgentLog.Info(
+                $"no paired devices found, so '{device.FriendlyName}' ({device.DeviceId}) was created " +
+                "for the first Mac. Use --pair NAME to add more.");
+        }
+    }
+
+    private static void PrintBanner(AgentIdentity identity, PairedDeviceStore devices, AgentOptions options)
+    {
+        // Never print a raw token. A pairing string is the same secret in base32
+        // and is meant for the user's eyes; the fingerprint is public by
+        // construction.
         Console.WriteLine("shared-mic Windows agent, Phase 1 (transport and security only, no audio capture)");
         Console.WriteLine($"  serverId:       {identity.ServerId}");
         Console.WriteLine($"  port:           {options.Port}");
@@ -6190,7 +8260,15 @@ public static class Program
         Console.WriteLine($"  deviceLabel:    {options.DeviceLabel}");
         Console.WriteLine($"  data directory: {options.DataDirectory}");
         Console.WriteLine($"  fingerprint:    {identity.Fingerprint}");
-        Console.WriteLine($"  pairing string: {identity.PairingString}");
+        Console.WriteLine($"  paired devices: {devices.Count} (one session at a time across all of them)");
+
+        foreach (var device in devices.List())
+        {
+            Console.WriteLine(
+                $"    {device.DeviceId}  {device.FriendlyName,-20}  paired {device.PairedAt:yyyy-MM-dd}");
+            Console.WriteLine($"      pairing string: {device.PairingString}");
+        }
+
         Console.WriteLine();
     }
 
@@ -6229,6 +8307,18 @@ Modes:
     nack     assert START is answered with START_NACK (run the agent with --no-mic)
     lockout  five bad-token attempts, then assert even the correct token is
              refused, then assert it is accepted again after 30 seconds
+    multi    two paired Macs at once: both authenticate, only one gets the
+             session, the other is refused with SESSION_IN_USE, and the session
+             is released when the holder's socket goes away. Needs a second
+             pairing string via --second-pairing.
+
+A caution about what this tool can and cannot prove. `MockMacClient` is a
+faithful CLIENT, so `--mode multi` really does exercise the Windows agent's
+arbitration. What it cannot check is the advisory `holder` field: the client
+raises `SessionRejected(reason)` and drops the rest of the message. The holder
+name is asserted by the C# tests instead. And nothing here can be replaced by
+the conformance suite in `harness/tests` — `MockWindowsServer` gives every
+connection its own session, so it would happily agree with a wrong agent.
 """
 
 import argparse
@@ -6348,13 +8438,76 @@ def run_lockout(args, token):
     print("\nPASS lockout checks")
 
 
+def run_multi(args, token, second_token):
+    """Two paired Macs, one session.
+
+    The Windows agent must keep both connections authenticated, grant the
+    session to exactly one of them, refuse the other with SESSION_IN_USE, and
+    release the session when the holder's socket goes away without a STOP.
+    """
+    holder, holder_ack = connect(args, token, client_id="mock-mac-holder")
+    other, other_ack = connect(args, second_token, client_id="mock-mac-other")
+    try:
+        print(f"both authenticated   ok (serverId={holder_ack['serverId']}, {other_ack['serverId']})")
+
+        granted = holder.start_session()
+        print(f"first START          ok (sessionId={granted['sessionId']})")
+
+        try:
+            other.start_session()
+        except SessionRejected as rejected:
+            if rejected.reason != "SESSION_IN_USE":
+                raise SystemExit(
+                    f"FAIL second START was refused with {rejected.reason!r}, expected SESSION_IN_USE"
+                )
+            print(f"second START         refused ({rejected.reason})  <- expected")
+        else:
+            raise SystemExit("FAIL two Macs were both given a session; there is only one microphone")
+
+        holder.ping()
+        other.ping()
+        print("both still healthy   ok (a refusal does not close either connection)")
+
+        # No STOP. This is what a crashed or sleeping Mac looks like.
+        holder.close()
+        print("holder disconnected  (no STOP sent, socket simply closed)")
+
+        deadline = time.monotonic() + 10.0
+        while True:
+            try:
+                taken = other.start_session()
+                break
+            except SessionRejected as rejected:
+                if time.monotonic() > deadline:
+                    raise SystemExit(
+                        "FAIL the session was never released after the holder disconnected "
+                        f"(still {rejected.reason})"
+                    )
+                time.sleep(0.25)
+
+        if taken["sessionId"] == granted["sessionId"]:
+            raise SystemExit("FAIL the second Mac was handed the first Mac's session id")
+        print(f"second START retried ok (sessionId={taken['sessionId']})")
+
+        other.stop_session()
+    finally:
+        other.close()
+        holder.close()
+
+    print("\nPASS multi-device checks")
+
+
 def main(argv):
     parser = argparse.ArgumentParser(description="Drive a Windows shared-mic agent from the mock Mac client.")
     parser.add_argument("--host", required=True, help="the Windows host's address")
     parser.add_argument("--port", type=int, default=47800)
     parser.add_argument("--pairing", required=True, help="the pairing string the agent printed or the tray shows")
+    parser.add_argument(
+        "--second-pairing",
+        help="a second paired device's pairing string; required for --mode multi",
+    )
     parser.add_argument("--fingerprint", required=True, help="the 64-character lowercase hex fingerprint")
-    parser.add_argument("--mode", choices=("session", "nack", "lockout"), default="session")
+    parser.add_argument("--mode", choices=("session", "nack", "lockout", "multi"), default="session")
     parser.add_argument("--timeout", type=float, default=5.0)
     args = parser.parse_args(argv)
 
@@ -6365,6 +8518,13 @@ def main(argv):
         run_session(args, token)
     elif args.mode == "nack":
         run_nack(args, token)
+    elif args.mode == "multi":
+        if not args.second_pairing:
+            parser.error("--mode multi needs --second-pairing (pair a second Mac with --pair on the agent)")
+        second_token = decode_pairing_string(args.second_pairing)
+        if second_token == token:
+            parser.error("--second-pairing must be a different device's pairing string")
+        run_multi(args, token, second_token)
     else:
         run_lockout(args, token)
 
@@ -6383,15 +8543,17 @@ First the C# tests, from the repo's `windows` directory on Windows:
 dotnet test SharedMic.Windows.sln --filter "FullyQualifiedName~ProgramArgumentTests"
 ```
 
-Expected: PASS, 5 tests.
+Expected: PASS, 6 tests.
 
-Then the interoperability run. **On Windows**, start the agent and leave it running:
+Then the interoperability run. **On Windows**, start the agent with two paired Macs and leave it running:
 
 ```powershell
-dotnet run --project SharedMic.Agent -- --headless --device-label "USB Microphone"
+dotnet run --project SharedMic.Agent -- --headless --device-label "USB Microphone" --pair "Mac Studio" --pair "MacBook Pro"
 ```
 
-Expected: a banner listing `serverId`, `port: 47800`, the 64-character `fingerprint`, and a 58-character `pairing string`, then one `listening on <address>:47800 (private interfaces only)` line per private interface. Copy the fingerprint and the pairing string, and note one of the listed non-loopback addresses.
+Expected: a banner listing `serverId`, `port: 47800`, the 64-character `fingerprint`, `paired devices: 2`, and for each device a `dev-XXXXXXXX` id, its name, and its 58-character pairing string — then one `listening on <address>:47800 (private interfaces only)` line per private interface. Copy the fingerprint and both pairing strings, and note one of the listed non-loopback addresses.
+
+Note that `--pair` mints a device every time it runs. Pass it once per Mac, then restart the agent without it; the banner reprints the stored devices.
 
 **On the Mac**, from `harness/`, run all three modes. Replace `<host>`, `<pairing>` and `<fingerprint>` with the values from the banner:
 
@@ -6422,7 +8584,20 @@ cd harness
 .venv/bin/python tools/drive_windows_agent.py --host <host> --port 47800 --pairing <pairing> --fingerprint <fingerprint> --mode lockout
 ```
 
-Expected: five `bad attempt N refused` lines, one `correct token refused during lockout` line, and `PASS lockout checks`. On the agent's console, expect five `authentication ... failed: the HMAC proof did not verify` lines with the fifth carrying `the agent is now locked out for 30 s`, then one `authentication ... refused: locked out for another N s`.
+Expected: five `bad attempt N refused` lines, one `correct token refused during lockout` line, and `PASS lockout checks`. On the agent's console, expect five `authentication ... failed: no paired device's token produced this proof` lines with the fifth carrying `<mac-address> is now locked out for 30 s`, then one `authentication ... refused: <mac-address> is locked out for another N s`. The address in those lines is the Mac's, not the agent's — that is the per-source keying working.
+
+Then the multi-device run, which is the interoperability evidence for the whole one-session rule. Use **both** pairing strings from the banner:
+
+```sh
+cd harness
+.venv/bin/python tools/drive_windows_agent.py --host <host> --port 47800 \
+    --pairing <first-pairing> --second-pairing <second-pairing> \
+    --fingerprint <fingerprint> --mode multi
+```
+
+Expected: `both authenticated ok`, `first START ok`, `second START refused (SESSION_IN_USE)`, `both still healthy ok`, `holder disconnected`, `second START retried ok` with a **different** `sessionId`, and `PASS multi-device checks`. On the agent's console, expect a `START ... refused: 'Mac Studio' holds the session` line and, after the holder's socket closes, `went away while holding the session; the session is released and another paired Mac may take it`.
+
+If the retry loop times out with `FAIL the session was never released after the holder disconnected`, the connection-close teardown in Task 14 is not wired up — that is the exact bug this mode exists to catch, and no test in `harness/tests` would have caught it.
 
 Finally, prove the pin is the trust anchor by running with a deliberately wrong fingerprint:
 
@@ -6446,12 +8621,12 @@ Expected: 101 passed.
 
 ```bash
 git add windows/SharedMic.Agent/Program.cs windows/SharedMic.Agent.Tests/ProjectSetupTests.cs harness/tools/drive_windows_agent.py
-git commit -m "Phase 1 Task 14: headless agent host and Python interoperability driver"
+git commit -m "Phase 1 Task 16: headless agent host and Python interoperability driver"
 ```
 
 ---
 
-### Task 15: Tray UI and project documentation
+### Task 17: Tray UI and project documentation
 
 **Files:**
 - Create: `windows/SharedMic.Agent/Ui/TrayApp.cs`
@@ -6460,10 +8635,12 @@ git commit -m "Phase 1 Task 14: headless agent host and Python interoperability 
 - Test: `windows/SharedMic.Agent.Tests/TrayAppTests.cs`
 
 **Interfaces:**
-- Consumes: `AgentStatus`, `AgentIdentity.PairingString` / `.ServerId` / `.Fingerprint`, `AgentOptions`, `TlsListener`, `AgentLog`, `AgentMetrics`, `AuthRateLimiter`, `IdentityStore`.
-- Produces: `sealed class TrayApp : ApplicationContext` with constructor `TrayApp(AgentIdentity identity, AgentOptions options, Func<Task> onQuitAsync)`, members `static string FormatStatus(AgentStatus status, string? detail)`, `void SetStatus(AgentStatus status, string? detail)`; `Program.Main` updated to run the tray unless `--headless`.
+- Consumes: `AgentStatus`, `AgentIdentity.ServerId` / `.Fingerprint`, `AgentOptions`, `PairedDevice`, `PairedDeviceStore.List()` / `Pair(string)` / `Revoke(string)` / `Count`, `TlsListener.SessionHolderDeviceId`, `AgentLog`, `AgentMetrics`, `AuthRateLimiter`, `IdentityStore`, `SessionArbiter`.
+- Produces: `sealed class TrayApp : ApplicationContext` with constructor `TrayApp(AgentIdentity identity, PairedDeviceStore devices, Func<string?> sessionHolderDeviceId, AgentOptions options, Func<Task> onQuitAsync)`, members `static string FormatStatus(AgentStatus status, string? detail)`, `static string FormatDevice(PairedDevice device, string? holderDeviceId)`, `void SetStatus(AgentStatus status, string? detail)`, `void RefreshDevices()`; `Program.Main` updated to run the tray unless `--headless`.
 
-**This task runs on Windows.** The last step is a manual visual check, because a `NotifyIcon` cannot be asserted on meaningfully in a headless test run.
+The tray is where "several paired Macs" becomes visible to a person: it lists every paired device, marks the one holding the session, offers each device's pairing string, revokes any of them, and pairs a new one.
+
+**This task runs on Windows.** The last step is a manual visual check, because a `NotifyIcon` cannot be asserted on meaningfully in a headless test run — so the two pure formatting functions carry the automated coverage.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -6471,6 +8648,7 @@ git commit -m "Phase 1 Task 14: headless agent host and Python interoperability 
 
 ```csharp
 using SharedMic.Agent;
+using SharedMic.Agent.Security;
 using SharedMic.Agent.Ui;
 using Xunit;
 
@@ -6478,6 +8656,34 @@ namespace SharedMic.Agent.Tests;
 
 public class TrayAppTests
 {
+    private static PairedDevice Device(string id, string name) =>
+        new(id, name, new byte[32], new DateTimeOffset(2026, 8, 10, 12, 0, 0, TimeSpan.Zero));
+
+    [Fact]
+    public void MarksTheDeviceThatHoldsTheSession()
+    {
+        var studio = Device("dev-aaaaaaaa", "Mac Studio");
+        var laptop = Device("dev-bbbbbbbb", "MacBook Pro");
+
+        Assert.Equal("Mac Studio  — using the mic", TrayApp.FormatDevice(studio, "dev-aaaaaaaa"));
+        Assert.Equal("MacBook Pro", TrayApp.FormatDevice(laptop, "dev-aaaaaaaa"));
+        Assert.Equal("Mac Studio", TrayApp.FormatDevice(studio, null));
+    }
+
+    /// <summary>
+    /// Two Macs can share a friendly name; the mark follows the device id, not
+    /// the label, so only one row is ever marked.
+    /// </summary>
+    [Fact]
+    public void TheHolderMarkFollowsTheDeviceIdNotTheName()
+    {
+        var first = Device("dev-aaaaaaaa", "Mac");
+        var second = Device("dev-bbbbbbbb", "Mac");
+
+        Assert.Equal("Mac  — using the mic", TrayApp.FormatDevice(first, "dev-aaaaaaaa"));
+        Assert.Equal("Mac", TrayApp.FormatDevice(second, "dev-aaaaaaaa"));
+    }
+
     [Fact]
     public void FormatsTheThreeStatusesPhase1CanReach()
     {
@@ -6494,8 +8700,8 @@ public class TrayAppTests
             TrayApp.FormatStatus(AgentStatus.Error, "no private interface accepted a bind on port 47800"));
 
         Assert.Equal(
-            "Status: Idle (192.168.1.9)",
-            TrayApp.FormatStatus(AgentStatus.Idle, "192.168.1.9"));
+            "Status: Idle (2 connected, Mac Studio active)",
+            TrayApp.FormatStatus(AgentStatus.Idle, "2 connected, Mac Studio active"));
     }
 
     [Fact]
@@ -6541,13 +8747,13 @@ using SharedMic.Agent.Security;
 namespace SharedMic.Agent.Ui;
 
 /// <summary>
-/// The minimal Phase 1 tray: current status, the pairing string the user
-/// retypes on the Mac, and a way to quit. Design spec section 11's full status
-/// list and diagnostics view arrive with the audio path and automatic demand;
-/// there is no device picker or level meter here because there is no capture
-/// path to feed one.
+/// The minimal Phase 1 tray: current status, the paired Macs and which of them
+/// is using the microphone, each one's pairing string, revoke, pair-a-new-one,
+/// and quit. Design spec section 11's full status list and diagnostics view
+/// arrive with the audio path and automatic demand; there is no device picker
+/// or level meter here because there is no capture path to feed one.
 ///
-/// Never show or copy the raw token, only the pairing string.
+/// Never show or copy a raw token, only a pairing string.
 /// </summary>
 public sealed class TrayApp : ApplicationContext
 {
@@ -6555,21 +8761,27 @@ public sealed class TrayApp : ApplicationContext
 
     private readonly NotifyIcon _icon;
     private readonly ToolStripMenuItem _statusItem;
+    private readonly ToolStripMenuItem _devicesItem;
+    private readonly PairedDeviceStore _devices;
+    private readonly Func<string?> _sessionHolderDeviceId;
     private readonly Func<Task> _onQuitAsync;
 
-    public TrayApp(AgentIdentity identity, AgentOptions options, Func<Task> onQuitAsync)
+    public TrayApp(
+        AgentIdentity identity,
+        PairedDeviceStore devices,
+        Func<string?> sessionHolderDeviceId,
+        AgentOptions options,
+        Func<Task> onQuitAsync)
     {
+        _devices = devices;
+        _sessionHolderDeviceId = sessionHolderDeviceId;
         _onQuitAsync = onQuitAsync;
 
         _statusItem = new ToolStripMenuItem(FormatStatus(AgentStatus.Disconnected, null)) { Enabled = false };
+        _devicesItem = new ToolStripMenuItem("Paired Macs");
 
-        var pairingHeader = new ToolStripMenuItem("Pairing string (click to copy)") { Enabled = false };
-        var pairingValue = new ToolStripMenuItem(identity.PairingString);
-        pairingValue.Click += (_, _) =>
-        {
-            Clipboard.SetText(identity.PairingString);
-            AgentLog.Info("pairing string copied to the clipboard");
-        };
+        var pairNew = new ToolStripMenuItem("Pair a new Mac...");
+        pairNew.Click += (_, _) => PairNewDevice();
 
         var fingerprintHeader = new ToolStripMenuItem("Certificate fingerprint (click to copy)") { Enabled = false };
         var fingerprintValue = new ToolStripMenuItem(identity.Fingerprint);
@@ -6585,13 +8797,17 @@ public sealed class TrayApp : ApplicationContext
         var menu = new ContextMenuStrip();
         menu.Items.Add(_statusItem);
         menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add(pairingHeader);
-        menu.Items.Add(pairingValue);
+        menu.Items.Add(_devicesItem);
+        menu.Items.Add(pairNew);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(fingerprintHeader);
         menu.Items.Add(fingerprintValue);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(quit);
+
+        // Rebuild the device list every time the menu opens, so the "using the
+        // mic" mark is current without polling.
+        menu.Opening += (_, _) => RefreshDevices();
 
         _icon = new NotifyIcon
         {
@@ -6600,8 +8816,12 @@ public sealed class TrayApp : ApplicationContext
             ContextMenuStrip = menu,
             Visible = true,
             BalloonTipTitle = "shared-mic",
-            BalloonTipText = $"Listening on port {options.Port}. Pair the Mac with the string in this menu.",
+            BalloonTipText =
+                $"Listening on port {options.Port}. Pair each Mac from this menu; " +
+                "one of them uses the microphone at a time.",
         };
+
+        RefreshDevices();
     }
 
     /// <summary>
@@ -6620,6 +8840,139 @@ public sealed class TrayApp : ApplicationContext
         }
 
         return text;
+    }
+
+    /// <summary>
+    /// One row of the paired-Macs submenu. The holder mark is matched on device
+    /// id, not on the friendly name, because two Macs may share a name.
+    /// </summary>
+    public static string FormatDevice(PairedDevice device, string? holderDeviceId) =>
+        string.Equals(device.DeviceId, holderDeviceId, StringComparison.Ordinal)
+            ? $"{device.FriendlyName}  — using the mic"
+            : device.FriendlyName;
+
+    /// <summary>Rebuild the paired-Macs submenu from the store. UI thread only.</summary>
+    public void RefreshDevices()
+    {
+        var holder = _sessionHolderDeviceId();
+
+        _devicesItem.DropDownItems.Clear();
+
+        var paired = _devices.List();
+        if (paired.Count == 0)
+        {
+            _devicesItem.DropDownItems.Add(new ToolStripMenuItem("(none yet)") { Enabled = false });
+            return;
+        }
+
+        foreach (var device in paired)
+        {
+            var row = new ToolStripMenuItem(FormatDevice(device, holder));
+
+            var copyPairing = new ToolStripMenuItem("Copy pairing string");
+            copyPairing.Click += (_, _) =>
+            {
+                Clipboard.SetText(device.PairingString);
+                AgentLog.Info($"pairing string for '{device.FriendlyName}' copied to the clipboard");
+            };
+
+            var revoke = new ToolStripMenuItem("Revoke this Mac...");
+            revoke.Click += (_, _) => RevokeDevice(device);
+
+            row.DropDownItems.Add(new ToolStripMenuItem($"Paired {device.PairedAt:yyyy-MM-dd HH:mm}") { Enabled = false });
+            row.DropDownItems.Add(new ToolStripMenuItem(device.DeviceId) { Enabled = false });
+            row.DropDownItems.Add(new ToolStripSeparator());
+            row.DropDownItems.Add(copyPairing);
+            row.DropDownItems.Add(revoke);
+
+            _devicesItem.DropDownItems.Add(row);
+        }
+    }
+
+    private void PairNewDevice()
+    {
+        var name = PromptForName();
+        if (name is null)
+        {
+            return;
+        }
+
+        var device = _devices.Pair(name);
+        RefreshDevices();
+        Clipboard.SetText(device.PairingString);
+        AgentLog.Info($"paired '{device.FriendlyName}' as {device.DeviceId}");
+
+        MessageBox.Show(
+            $"Paired '{device.FriendlyName}'.\n\nPairing string (already copied to the clipboard):\n\n" +
+            $"{device.PairingString}\n\nType it into that Mac's SharedMic menu.",
+            "shared-mic",
+            MessageBoxButtons.OK,
+            MessageBoxIcon.Information);
+    }
+
+    private void RevokeDevice(PairedDevice device)
+    {
+        var confirmed = MessageBox.Show(
+            $"Revoke '{device.FriendlyName}'?\n\nThat Mac will no longer be able to connect, and " +
+            "pairing it again means a new pairing string.",
+            "shared-mic",
+            MessageBoxButtons.YesNo,
+            MessageBoxIcon.Warning);
+
+        if (confirmed != DialogResult.Yes)
+        {
+            return;
+        }
+
+        if (_devices.Revoke(device.DeviceId))
+        {
+            AgentLog.Info($"revoked '{device.FriendlyName}' ({device.DeviceId})");
+        }
+
+        RefreshDevices();
+    }
+
+    /// <summary>
+    /// WinForms has no input box, and a whole dialog class for one field would
+    /// be worse than this. Returns null when the user cancels or enters nothing.
+    /// </summary>
+    private static string? PromptForName()
+    {
+        using var form = new Form
+        {
+            Text = "Pair a new Mac",
+            FormBorderStyle = FormBorderStyle.FixedDialog,
+            StartPosition = FormStartPosition.CenterScreen,
+            ClientSize = new Size(360, 120),
+            MinimizeBox = false,
+            MaximizeBox = false,
+        };
+
+        var label = new Label
+        {
+            Text = "Name for this Mac (shown when it is using the mic):",
+            AutoSize = true,
+            Location = new Point(12, 15),
+        };
+
+        var input = new TextBox { Location = new Point(12, 40), Width = 336 };
+        var ok = new Button { Text = "Pair", DialogResult = DialogResult.OK, Location = new Point(192, 75), Width = 75 };
+        var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Location = new Point(273, 75), Width = 75 };
+
+        form.Controls.Add(label);
+        form.Controls.Add(input);
+        form.Controls.Add(ok);
+        form.Controls.Add(cancel);
+        form.AcceptButton = ok;
+        form.CancelButton = cancel;
+
+        if (form.ShowDialog() != DialogResult.OK)
+        {
+            return null;
+        }
+
+        var name = input.Text.Trim();
+        return name.Length == 0 ? null : name;
     }
 
     /// <summary>Safe to call from any thread; marshals onto the UI thread when needed.</summary>
@@ -6671,6 +9024,7 @@ using System.Windows.Forms;
 using SharedMic.Agent.Diagnostics;
 using SharedMic.Agent.Net;
 using SharedMic.Agent.Security;
+using SharedMic.Agent.Session;
 using SharedMic.Agent.Ui;
 
 namespace SharedMic.Agent;
@@ -6685,6 +9039,8 @@ public static class Program
         var dataDirectory = IdentityStore.DefaultDirectory;
         var headless = false;
         var loopbackOnly = false;
+        var pairDevices = new List<string>();
+        string? revokeDeviceId = null;
 
         for (var i = 0; i < args.Length; i++)
         {
@@ -6710,6 +9066,12 @@ public static class Program
                 case "--loopback-only":
                     loopbackOnly = true;
                     break;
+                case "--pair":
+                    pairDevices.Add(Next(args, ref i, "--pair"));
+                    break;
+                case "--revoke":
+                    revokeDeviceId = Next(args, ref i, "--revoke");
+                    break;
                 default:
                     throw new ArgumentException($"unknown argument '{args[i]}'");
             }
@@ -6723,6 +9085,8 @@ public static class Program
             DataDirectory = dataDirectory,
             Headless = headless,
             LoopbackOnly = loopbackOnly,
+            PairDevices = pairDevices,
+            RevokeDeviceId = revokeDeviceId,
         };
     }
 
@@ -6739,21 +9103,26 @@ public static class Program
             Console.Error.WriteLine(exception.Message);
             Console.Error.WriteLine(
                 "usage: SharedMic.Agent [--port N] [--no-mic] [--device-label TEXT] " +
-                "[--data-dir PATH] [--headless] [--loopback-only]");
+                "[--data-dir PATH] [--headless] [--loopback-only] [--pair NAME]... [--revoke DEVICE_ID]");
             return 2;
         }
 
         var identity = new IdentityStore(options.DataDirectory).LoadOrCreate();
+        var devices = new PairedDeviceStore(options.DataDirectory);
         var metrics = new AgentMetrics();
         var rateLimiter = new AuthRateLimiter();
+        var sessions = new SessionArbiter();
 
-        PrintBanner(identity, options);
+        ApplyDeviceCommands(devices, options);
+        PrintBanner(identity, devices, options);
 
         TrayApp? tray = null;
         var listener = new TlsListener(
             identity,
             options,
+            devices,
             rateLimiter,
+            sessions,
             metrics,
             (status, detail) =>
             {
@@ -6787,11 +9156,16 @@ public static class Program
         else
         {
             ApplicationConfiguration.Initialize();
-            tray = new TrayApp(identity, options, async () =>
-            {
-                AgentLog.Info($"final counters: {metrics.Snapshot()}");
-                await listener.DisposeAsync();
-            });
+            tray = new TrayApp(
+                identity,
+                devices,
+                () => listener.SessionHolderDeviceId,
+                options,
+                async () =>
+                {
+                    AgentLog.Info($"final counters: {metrics.Snapshot()}");
+                    await listener.DisposeAsync();
+                });
             tray.SetStatus(AgentStatus.Disconnected, $"port {options.Port}");
 
             AgentLog.Info("running with a tray icon. Use the tray menu to quit.");
@@ -6804,10 +9178,40 @@ public static class Program
         return 0;
     }
 
-    private static void PrintBanner(AgentIdentity identity, AgentOptions options)
+    /// <summary>
+    /// --revoke first, then --pair, then the first-run default. Revoking before
+    /// pairing means "--revoke old --pair new" in one invocation does what it
+    /// reads like.
+    /// </summary>
+    private static void ApplyDeviceCommands(PairedDeviceStore devices, AgentOptions options)
     {
-        // Never print the token itself. The pairing string is meant for the
-        // user's eyes and the fingerprint is public by construction.
+        if (options.RevokeDeviceId is { } deviceId)
+        {
+            AgentLog.Info(devices.Revoke(deviceId)
+                ? $"revoked paired device {deviceId}; it can no longer authenticate"
+                : $"no paired device has id '{deviceId}'; nothing was revoked");
+        }
+
+        foreach (var name in options.PairDevices)
+        {
+            var device = devices.Pair(name);
+            AgentLog.Info($"paired '{device.FriendlyName}' as {device.DeviceId}");
+        }
+
+        if (devices.Count == 0)
+        {
+            var device = devices.Pair("Mac 1");
+            AgentLog.Info(
+                $"no paired devices found, so '{device.FriendlyName}' ({device.DeviceId}) was created " +
+                "for the first Mac. Use --pair NAME or the tray to add more.");
+        }
+    }
+
+    private static void PrintBanner(AgentIdentity identity, PairedDeviceStore devices, AgentOptions options)
+    {
+        // Never print a raw token. A pairing string is the same secret in base32
+        // and is meant for the user's eyes; the fingerprint is public by
+        // construction.
         Console.WriteLine("shared-mic Windows agent, Phase 1 (transport and security only, no audio capture)");
         Console.WriteLine($"  serverId:       {identity.ServerId}");
         Console.WriteLine($"  port:           {options.Port}");
@@ -6815,7 +9219,15 @@ public static class Program
         Console.WriteLine($"  deviceLabel:    {options.DeviceLabel}");
         Console.WriteLine($"  data directory: {options.DataDirectory}");
         Console.WriteLine($"  fingerprint:    {identity.Fingerprint}");
-        Console.WriteLine($"  pairing string: {identity.PairingString}");
+        Console.WriteLine($"  paired devices: {devices.Count} (one session at a time across all of them)");
+
+        foreach (var device in devices.List())
+        {
+            Console.WriteLine(
+                $"    {device.DeviceId}  {device.FriendlyName,-20}  paired {device.PairedAt:yyyy-MM-dd}");
+            Console.WriteLine($"      pairing string: {device.PairingString}");
+        }
+
         Console.WriteLine();
     }
 
@@ -6845,9 +9257,15 @@ protocol harness, both Phase 0 probes, and the Phase 1 Windows agent exist now.
 ```powershell
 dotnet build SharedMic.Windows.sln
 dotnet test SharedMic.Windows.sln
-dotnet run --project SharedMic.Agent                 # tray icon plus a console log
-dotnet run --project SharedMic.Agent -- --headless   # console only, Ctrl+C to quit
+dotnet run --project SharedMic.Agent                             # tray icon plus a console log
+dotnet run --project SharedMic.Agent -- --headless               # console only, Ctrl+C to quit
+dotnet run --project SharedMic.Agent -- --pair "Mac Studio"      # add a Mac and print its pairing string
+dotnet run --project SharedMic.Agent -- --revoke dev-0badcafe    # remove one Mac; the others keep working
 ```
+
+Several Macs can be paired and connected at once; **one of them holds the microphone session at a
+time**, and a `START` from any other is answered `START_NACK{reason:"SESSION_IN_USE"}`. A session
+ends when its connection ends, so a Mac that crashes does not lock the others out.
 
 The `.csproj` files are XML: **never put a doubled hyphen inside an XML comment.** It is illegal
 XML and fails the build with `MSB4025`.
@@ -6866,7 +9284,12 @@ cd harness
 
 `drive_windows_agent.py` points the mock Mac client at a running Windows agent. Its `--mode` values
 are `session` (handshake, heartbeat, idempotent START/STOP, zero audio bytes), `nack` (run the agent
-with `--no-mic`), and `lockout` (five bad-token attempts then the 30-second refusal).
+with `--no-mic`), `lockout` (five bad-token attempts then the 30-second refusal), and `multi` (two
+paired Macs, one session, release on disconnect — needs `--second-pairing`).
+
+**The conformance suite does not cover multi-device behaviour.** `MockWindowsServer` keeps one token
+and gives every connection its own session, so paired-device identification, `SESSION_IN_USE`, and
+release-on-disconnect are covered by the C# tests and by `--mode multi`, not by `pytest`.
 
 **macOS demand-detection probe (from `probes/macos-demand/`).** Built and run on the target Mac
 (macOS 26.6.1); see `docs/superpowers/probes/2026-08-08-macos-demand-findings.md`:
@@ -6895,7 +9318,7 @@ Run, from the repo's `windows` directory on Windows:
 dotnet test SharedMic.Windows.sln --filter "FullyQualifiedName~TrayAppTests"
 ```
 
-Expected: PASS, 4 tests.
+Expected: PASS, 6 tests.
 
 Then the full suite, which is the end-of-batch build and test for the whole phase:
 
@@ -6904,7 +9327,7 @@ dotnet build SharedMic.Windows.sln
 dotnet test SharedMic.Windows.sln
 ```
 
-Expected: `Build succeeded. 0 Warning(s) 0 Error(s)`, then all tests passing — 2 + 11 + 7 + 17 + 32 + 15 + 8 + 12 + 12 + 7 + 9 + 20 + 22 + 5 + 4 = **183 tests**.
+Expected: `Build succeeded. 0 Warning(s) 0 Error(s)`, then all tests passing — 2 (Task 1) + 11 (2) + 7 (3) + 21 (4) + 32 (5) + 15 (6) + 14 (7) + 12 (8) + 18 (9) + 12 (10) + 7 (11) + 8 (12) + 14 (13) + 29 (14) + 24 (15) + 6 (16) + 6 (17) = **238 tests**.
 
 Then the manual tray check, on Windows:
 
@@ -6916,11 +9339,13 @@ Confirm each of the following by looking at the screen, and record the result:
 
 1. A tray icon appears in the notification area.
 2. Hovering it shows `Status: Disconnected (port 47800)`.
-3. Right-clicking shows: a disabled status line, the pairing string, the certificate fingerprint, and `Quit`.
-4. The pairing string shown in the menu is 58 characters and identical to the one the console banner printed.
-5. Clicking the pairing string copies it; paste it somewhere to confirm, and confirm the console logs `pairing string copied to the clipboard`.
-6. With the agent still running, complete a `--mode session` run from the Mac (command in Task 14). While it is connected, the tray hover text changes to `Status: Idle`; after the driver exits it returns to `Status: Disconnected`.
-7. `Quit` removes the icon and exits the process; the console prints `final counters:` with a non-zero `ConnectionsAuthenticated`.
+3. Right-clicking shows: a disabled status line, a `Paired Macs` submenu, `Pair a new Mac...`, the certificate fingerprint, and `Quit`.
+4. `Paired Macs` lists every device the console banner printed, by the name it was given.
+5. `Pair a new Mac...` asks for a name, then shows the new 58-character pairing string and copies it to the clipboard. The device appears in `Paired Macs` immediately, and the console logs `paired '<name>' as dev-XXXXXXXX`.
+6. Opening a device's submenu offers `Copy pairing string` and `Revoke this Mac...`. Copy one and paste it somewhere to confirm it matches the banner.
+7. With the agent still running, complete a `--mode multi` run from the Mac (command in Task 16). While both clients are connected the tray hover text reads `Status: Idle (2 connected, ...)`, and while one holds the session that device's row is marked `— using the mic`. After the driver exits it returns to `Status: Disconnected`.
+8. `Revoke this Mac...` asks for confirmation, removes the row, and logs `revoked '<name>'`. Re-running the driver with that device's pairing string now fails to authenticate.
+9. `Quit` removes the icon and exits the process; the console prints `final counters:` with a non-zero `ConnectionsAuthenticated` and a non-zero `SessionsRefusedAsInUse`.
 
 Finally confirm the harness suite is untouched, from the Mac:
 
@@ -6935,7 +9360,7 @@ Expected: 101 passed.
 
 ```bash
 git add windows/SharedMic.Agent/Ui/TrayApp.cs windows/SharedMic.Agent/Program.cs windows/SharedMic.Agent.Tests/TrayAppTests.cs CLAUDE.md
-git commit -m "Phase 1 Task 15: tray UI with status, pairing string and quit; document Phase 1 commands"
+git commit -m "Phase 1 Task 17: tray UI with paired devices, session holder, revoke and pair; document Phase 1 commands"
 ```
 
 ---
@@ -6946,23 +9371,28 @@ Each item of the Phase 1 scope list and the task that implements it:
 
 | Scope item | Task |
 |---|---|
-| TLS 1.3 listener on TCP 47800, private interfaces only | 13 (`TlsListener`, `PrivateAddress`) |
-| Self-signed P-256 device certificate at first run, SAN required | 11 (`DeviceCertificate`) |
-| Private key DPAPI-protected | 11 (`IdentityStore`) |
-| 256-bit pairing token generated and persisted | 11 (`IdentityStore.LoadOrCreate`), 6 (`PairingToken.Generate`) |
-| Pairing string displayed | 6 (encoding), 14 (console banner), 15 (tray menu) |
-| `GREETING` → `HELLO` → `HELLO_ACK` with HMAC-SHA256 challenge-response | 12 (`ControlConnection.TryAuthenticate`), 6 (`AuthProof`) |
-| 5-second pre-auth deadline | 12 (`ReadLoopAsync`) |
-| 5-attempt / 30-second lockout | 7 (`AuthRateLimiter`), 12 (wired in and counted), 14 (`--mode lockout`) |
+| TLS 1.3 listener on TCP 47800, private interfaces only | 15 (`TlsListener`, `PrivateAddress`) |
+| Self-signed P-256 device certificate at first run, SAN required | 12 (`DeviceCertificate`) |
+| Private key DPAPI-protected | 12 (`IdentityStore`) |
+| 256-bit pairing token per paired device, generated and persisted | 13 (`PairedDeviceStore`), 6 (`PairingToken.Generate`) |
+| Every token DPAPI-protected at rest | 13 (`PairedDeviceStore.Save`) |
+| Several paired Macs, individually revocable | 13 (`Pair`, `Revoke`), 16 (`--pair`, `--revoke`), 17 (tray) |
+| Identification by proof alone, no lookup key, `clientId` untrusted | 13 (`Identify`), 14 (`TryAuthenticate`) |
+| Pairing string displayed | 6 (encoding), 16 (console banner), 17 (tray menu, per device) |
+| `GREETING` → `HELLO` → `HELLO_ACK` with HMAC-SHA256 challenge-response | 14 (`ControlConnection.TryAuthenticate`), 6 (`AuthProof`) |
+| 5-second pre-auth deadline | 14 (`ReadLoopAsync`) |
+| 5-attempt / 30-second lockout, keyed per source address | 7 (`AuthRateLimiter`), 14 (wired in and counted), 16 (`--mode lockout`) |
 | Frame envelope codec byte-matching the vectors | 2, 5 |
 | Control-message codec byte-matching the vectors | 4, 5 |
 | Audio payload codec byte-matching the vectors | 3, 5 |
-| Priority send queue: unbounded control, 25-frame drop-oldest audio | 9, 12 (teardown discard) |
-| Session state machine, idempotent `START`/`STOP` | 8, 12 |
-| Heartbeat: `PONG` with matching `seq` | 12 |
-| Dead-peer detection at 45 s | 12 (`LivenessLoopAsync`) |
-| Minimal tray: status, pairing string, quit | 15 |
-| Verifiable against `MockMacClient` | 14 (all three modes plus the fingerprint-mismatch check) |
+| Priority send queue: unbounded control, 25-frame drop-oldest audio | 10, 14 (teardown discard) |
+| Session state machine, idempotent `START`/`STOP` | 8, 14 |
+| One session across all connections, `SESSION_IN_USE` with the holder's name | 9 (`SessionArbiter`), 4 (`StartNack` advisory field), 14, 15 |
+| A session ends when its connection ends, including on dead-peer | 9 (`EndSessionOwnedBy`), 14 (`RunAsync` finally) |
+| Heartbeat: `PONG` with matching `seq` | 14 |
+| Dead-peer detection at 45 s | 14 (`LivenessLoopAsync`) |
+| Tray: status, paired Macs, session holder, pair, revoke, quit | 17 |
+| Verifiable against `MockMacClient` | 16 (`session`, `nack`, `lockout`, `multi`, plus the fingerprint-mismatch check) |
 
 ## Explicitly out of scope for Phase 1
 
@@ -6970,6 +9400,8 @@ Stated here so a reviewer does not read an omission as an oversight:
 
 - **All audio capture.** No WASAPI, no `MicCaptureService`, no `PcmNormalizer`, no `DeviceManager`, no device enumeration, no level meter. `AudioPayloadCodec` and `PrioritySendQueue.EnqueueAudio` exist and are tested, but nothing calls them on a live connection. A `START` returns `START_ACK` and streams nothing.
 - **Device selection.** `micPresent` and `deviceLabel` are configuration flags (`--no-mic`, `--device-label`), not device queries.
+- **Telling a refused Mac when the session frees up.** A `START_NACK{SESSION_IN_USE}` is a one-shot answer; there is no queue and no push notification when the holder releases. The refused Mac retries. Phase 2's `STATUS` is the natural carrier for "the mic is free now", and this plan deliberately does not invent a twelfth message type for it.
+- **Renaming a paired device.** Names are set at pairing time. Renaming is a tray convenience, not a Phase 1 requirement; revoke and re-pair achieves it.
 - **`STATUS` emission.** The message type, its factory and its vector coverage all exist, but Phase 1 has no device watcher to trigger a hot-unplug or replug, so the agent never sends one.
 - **Launch at login**, the **diagnostics view**, and **mDNS/Bonjour discovery** — Phase 4.
 - **The macOS agent.** Phase 1 of the design spec covers both ends; this plan is the Windows half. The Mac's `START`/`STOP` response timers (2 s / 1 s), reconnect with exponential backoff, and Keychain storage are Mac-side and are not implemented here.
@@ -6985,7 +9417,15 @@ Points in `protocol/protocol-v1.md` that a reader must resolve before implementi
 3. **The contract does not say what to do with a well-formed but wrong-direction control message after authentication** — for example a `GREETING` or a `START_ACK` arriving from the Mac. The reference `MockWindowsServer._handle` silently ignores anything that is not `PING`/`START`/`STOP`. This plan matches that (log, count, do not close) rather than closing, to avoid an interoperability hazard over behavior the contract does not specify. §11.4's counter and §3's close rules are unaffected.
 4. **§7's `STOP_ACK{sessionId}` is ambiguous when no session is active.** "the session that was ended" has no referent. The reference server sends `ended or msg["sessionId"]`, i.e. it echoes the request's `sessionId`. This plan does the same, and `SessionStateMachine.HandleStop` takes the requested identifier for exactly that reason.
 5. **§11.4 does not say whether the lockout window resets the consecutive-failure count or extends on further attempts.** This plan resets the count when the lockout is applied and refuses attempts without counting them while locked out, so a persistent attacker gets 30-second windows rather than an ever-growing one. Either reading satisfies the stated `MUST`; the choice is recorded because two implementations could differ observably here.
+
+   **§11.4's "per Windows agent, not per source address" does not survive several paired Macs, and this plan deviates from it deliberately.** A single global counter means one host that can reach port 47800 can keep every paired Mac permanently unable to authenticate, five failures at a time. This plan keys the counter on the source **address** with the source **port excluded**, which preserves the stated concern (a new source port must not reset the count) while confining the refusal to the offending host. Agent-wide totals are still kept and surfaced, but as an alarm rather than as a gate. See Task 7 for the full argument, and `OneLockedOutPeerDoesNotLockOutAnyOtherPeer` for the test that pins it.
 6. **§11.3's validity row says "3,650 days, starting 5 minutes in the past".** Read literally that is a 3,650-day span ending 5 minutes before `now + 3650 days`. The reference implementation uses `now - 5 min` to `now + 3650 days`, a span of 3,650 days plus 5 minutes. This plan matches the reference; the `IdentityTests` assertion allows the ±0.1-day slack that difference implies.
 7. **§4's "sequence resets to 0 at the start of each session" is `[CARRIED]` and untested anywhere.** Phase 1 never emits audio, so nothing here can prove it either. Phase 2 must add the test the harness lacks: assert a second session's first frame carries `sequence == 0`.
 8. **§2 requires binding "private interfaces only" but does not define the set.** This plan takes it as RFC 1918 (`10/8`, `172.16/12`, `192.168/16`), loopback (`127/8`, `::1`), IPv4 link-local (`169.254/16`), and IPv6 link-local and unique-local. `PrivateAddressTests` pins that reading so a future disagreement is a visible test change.
-9. **Nothing in the contract says what a Windows agent should do when a second Mac connects.** This plan supersedes: the newer connection wins, but only once it has authenticated, so an unauthenticated peer cannot displace a live session.
+9. **A second Mac connecting is now answered, and the answer is not supersession.** An earlier draft of §7 said a newly authenticated connection supersedes the older one. With several paired Macs that is wrong: all of them stay connected, and the microphone is arbitrated instead. A `START` from a device that does not hold the session is refused with `START_NACK{reason:"SESSION_IN_USE", holder}`; the connection is not touched. What carries over from the superseding design is the rule that made it safe — nothing observable happens until a connection has authenticated.
+
+10. **§7's "`STOP` means make sure no session is active" needed a scope it did not have.** With one Mac the sentence was unambiguous. With several, taken literally it lets any paired Mac end any other's session with one message. This plan reads it as **"make sure no session is active *on this connection*"**: a `STOP` from a non-holder still returns `STOP_ACK` (§7 never rejects a `STOP`) and ends nothing. `SessionArbiter.Stop` takes the owner id for exactly that reason, and `StopFromANonHolderEndsNothingButStillSucceeds` pins it.
+
+11. **`START_NACK` gains the protocol's first optional field.** `holder` is present only with `reason: "SESSION_IN_USE"`, and is omitted rather than sent blank. Both codecs already tolerate unknown fields — `ControlCodec.Validate` checks that required fields are present and says nothing about extras, and the Python reference does the same — so this needs no version bump. A receiver that ignores it still works; the macOS plan specifies what to show when it is absent.
+
+12. **The conformance harness cannot see any of §7's multi-connection rules.** `MockWindowsServer` gives every connection its own `_session_id` and holds one token, so it would agree with an implementation that has no device list, no arbitration and no release-on-disconnect. Tasks 9, 13, 14 and 15 carry that weight in C#, and `drive_windows_agent.py --mode multi` is the only end-to-end check. This is stated in each of those tasks, because "the suite is green" is otherwise a misleading signal here.
