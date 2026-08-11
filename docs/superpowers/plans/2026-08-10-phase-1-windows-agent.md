@@ -56,7 +56,7 @@ Audio header is **12 bytes**; audio payload length MUST be exactly **1,932** byt
 | `HELLO_ACK` | `serverId` (string), `micPresent` (bool), `deviceLabel` (string) |
 | `START` | `requestId` (string), `preferredFormat` (object) |
 | `START_ACK` | `requestId`, `sessionId` (string), `format` (object) |
-| `START_NACK` | `requestId`, `reason` (string). **Plus one optional advisory field, `holder` (string)** — the friendly name of the paired device that currently holds the session. It is emitted only when `reason` is `"SESSION_IN_USE"`, it is advisory (a receiver must work without it), and it is omitted entirely rather than sent as `null` or `""` when the holder has no usable name. |
+| `START_NACK` | `requestId`, `reason` (string). **Plus one optional advisory field, `holderName` (string)** — the friendly name of the paired device that currently holds the session. It is emitted only when `reason` is `"SESSION_IN_USE"`, it is advisory (a receiver must work without it), and it is omitted entirely rather than sent as `null` or `""` when the holder has no usable name. |
 | `STOP` | `requestId`, `sessionId` |
 | `STOP_ACK` | `requestId`, `sessionId` |
 | `STATUS` | `micPresent` (bool), `active` (bool), `deviceLabel` (string) — these three fields are the whole message, there is no `errors` field |
@@ -74,7 +74,7 @@ Audio header is **12 bytes**; audio payload length MUST be exactly **1,932** byt
 - Windows keeps a **list of paired devices**. Each has its own fresh 256-bit token, an owner-assigned friendly name, and a paired-at timestamp. Devices are **individually revocable**; revoking one must not disturb any other.
 - **Several paired Macs may be connected and authenticated at the same time.** There is no supersession: a newly authenticated connection never displaces an older one. (An earlier draft of the contract said the opposite. It is wrong and must not be implemented.)
 - **At most one session exists across all connections.** The connection that received the `START_ACK` owns it.
-- A `START` from any other connection while the session is held is answered `START_NACK{requestId, reason: "SESSION_IN_USE", holder}` — refused, but the connection stays up and healthy.
+- A `START` from any other connection while the session is held is answered `START_NACK{requestId, reason: "SESSION_IN_USE", holderName}` — refused, but the connection stays up and healthy.
 - **A session ends when its owning control connection closes, not only on `STOP`.** This is load-bearing: without it, a Mac that crashes or has its cable pulled locks every other Mac out until the 45-second dead-peer timer fires. **Dead-peer detection must end that peer's session too**, by the same path.
 - A `STOP` from a connection that does not hold the session ends nothing and still returns `STOP_ACK`. Anything else would let any paired Mac cancel another's session by sending one message.
 
@@ -1028,7 +1028,7 @@ git commit -m "Phase 1 Task 3: audio payload codec, strict 1932-byte receiver, l
 
 **Interfaces:**
 - Consumes: `ProtocolConstants.ProtocolVersion`, `ProtocolConstants.SampleRate`, `ProtocolConstants.Channels`, `ProtocolConstants.SampleFormat`, `ProtocolException(string)`.
-- Produces: `static class ControlCodec` with `IReadOnlyDictionary<string, string[]> RequiredFields`, `byte[] Encode(IReadOnlyDictionary<string, object?> message)`, `Dictionary<string, object?> Decode(ReadOnlySpan<byte> payload)`, `Dictionary<string, object?> Normalize(IReadOnlyDictionary<string, object?> message)`, `void Validate(IReadOnlyDictionary<string, object?> message)`, `Dictionary<string, object?> FromJsonElement(JsonElement element)`, `bool DeepEquals(object? left, object? right)`; `static class ControlMessages` with `IReadOnlyDictionary<string, object?> AudioFormat` and factories `Greeting(string serverId, string nonceHex)`, `Hello(string clientId, string mac)`, `HelloAck(string serverId, bool micPresent, string deviceLabel)`, `Start(string requestId)`, `StartAck(string requestId, string sessionId)`, `StartNack(string requestId, string reason, string? holder = null)`, `Stop(string requestId, string sessionId)`, `StopAck(string requestId, string sessionId)`, `Status(bool micPresent, bool active, string deviceLabel)`, `Ping(long seq)`, `Pong(long seq)` — each returning `Dictionary<string, object?>`.
+- Produces: `static class ControlCodec` with `IReadOnlyDictionary<string, string[]> RequiredFields`, `byte[] Encode(IReadOnlyDictionary<string, object?> message)`, `Dictionary<string, object?> Decode(ReadOnlySpan<byte> payload)`, `Dictionary<string, object?> Normalize(IReadOnlyDictionary<string, object?> message)`, `void Validate(IReadOnlyDictionary<string, object?> message)`, `Dictionary<string, object?> FromJsonElement(JsonElement element)`, `bool DeepEquals(object? left, object? right)`; `static class ControlMessages` with `IReadOnlyDictionary<string, object?> AudioFormat` and factories `Greeting(string serverId, string nonceHex)`, `Hello(string clientId, string mac)`, `HelloAck(string serverId, bool micPresent, string deviceLabel)`, `Start(string requestId)`, `StartAck(string requestId, string sessionId)`, `StartNack(string requestId, string reason, string? holderName = null)`, `Stop(string requestId, string sessionId)`, `StopAck(string requestId, string sessionId)`, `Status(bool micPresent, bool active, string deviceLabel)`, `Ping(long seq)`, `Pong(long seq)` — each returning `Dictionary<string, object?>`.
 
 The message model is a dictionary rather than eleven record types on purpose: it lets the golden-vector test in Task 5 iterate the committed fixtures generically instead of hand-copying cases, and it makes the canonical sorted-key encoder a pure function of message content.
 
@@ -1210,7 +1210,7 @@ public class ControlCodecTests
     {
         var plain = ControlMessages.StartNack("req-0002", "MIC_UNAVAILABLE");
 
-        Assert.False(plain.ContainsKey("holder"));
+        Assert.False(plain.ContainsKey("holderName"));
         Assert.Equal(
             "{\"reason\":\"MIC_UNAVAILABLE\",\"requestId\":\"req-0002\",\"type\":\"START_NACK\",\"v\":1}",
             Encoding.UTF8.GetString(ControlCodec.Encode(plain)));
@@ -1221,9 +1221,9 @@ public class ControlCodecTests
     {
         var busy = ControlMessages.StartNack("req-0002", "SESSION_IN_USE", "Mac Studio");
 
-        Assert.Equal("Mac Studio", busy["holder"]);
+        Assert.Equal("Mac Studio", busy["holderName"]);
         Assert.Equal(
-            "{\"holder\":\"Mac Studio\",\"reason\":\"SESSION_IN_USE\"," +
+            "{\"holderName\":\"Mac Studio\",\"reason\":\"SESSION_IN_USE\"," +
             "\"requestId\":\"req-0002\",\"type\":\"START_NACK\",\"v\":1}",
             Encoding.UTF8.GetString(ControlCodec.Encode(busy)));
     }
@@ -1233,9 +1233,9 @@ public class ControlCodecTests
     {
         // A blank advisory field is worse than no advisory field: the Mac would
         // render "In use by " with nothing after it. Omission is the contract.
-        Assert.False(ControlMessages.StartNack("r", "SESSION_IN_USE", "").ContainsKey("holder"));
-        Assert.False(ControlMessages.StartNack("r", "SESSION_IN_USE", "   ").ContainsKey("holder"));
-        Assert.False(ControlMessages.StartNack("r", "SESSION_IN_USE", null).ContainsKey("holder"));
+        Assert.False(ControlMessages.StartNack("r", "SESSION_IN_USE", "").ContainsKey("holderName"));
+        Assert.False(ControlMessages.StartNack("r", "SESSION_IN_USE", "   ").ContainsKey("holderName"));
+        Assert.False(ControlMessages.StartNack("r", "SESSION_IN_USE", null).ContainsKey("holderName"));
     }
 
     [Fact]
@@ -1246,7 +1246,7 @@ public class ControlCodecTests
         var decoded = ControlCodec.Decode(ControlCodec.Encode(busy));
 
         Assert.True(ControlCodec.DeepEquals(ControlCodec.Normalize(busy), decoded));
-        Assert.Equal("Mac Studio", decoded["holder"]);
+        Assert.Equal("Mac Studio", decoded["holderName"]);
     }
 
     [Fact]
@@ -1305,7 +1305,7 @@ namespace SharedMic.Agent.Protocol;
 /// surface as a loud local failure rather than as bytes the far end has to
 /// guess about. Validation checks that every REQUIRED field is present; it does
 /// not reject additional fields, which is what lets START_NACK carry the
-/// optional advisory "holder" name without a protocol version change, and what
+/// optional advisory "holderName" name without a protocol version change, and what
 /// lets this decoder accept a future peer that adds one.
 ///
 /// Messages are modelled as Dictionary&lt;string, object?&gt; with values
@@ -1601,13 +1601,13 @@ public static class ControlMessages
         };
 
     /// <summary>
-    /// `holder` is the ONE optional field in version 1: the friendly name of the
+    /// `holderName` is the ONE optional field in version 1: the friendly name of the
     /// paired device that currently holds the session, sent only alongside
     /// reason "SESSION_IN_USE". It is advisory — the Mac must render a sensible
     /// message without it — so a null, empty or whitespace name is omitted from
     /// the object entirely rather than encoded as null or "".
     /// </summary>
-    public static Dictionary<string, object?> StartNack(string requestId, string reason, string? holder = null)
+    public static Dictionary<string, object?> StartNack(string requestId, string reason, string? holderName = null)
     {
         var message = new Dictionary<string, object?>(StringComparer.Ordinal)
         {
@@ -1617,9 +1617,9 @@ public static class ControlMessages
             ["reason"] = reason,
         };
 
-        if (!string.IsNullOrWhiteSpace(holder))
+        if (!string.IsNullOrWhiteSpace(holderName))
         {
-            message["holder"] = holder;
+            message["holderName"] = holderName;
         }
 
         return message;
@@ -3279,7 +3279,7 @@ There is one microphone, so there is one session; there are several paired Macs,
 - Consumes: `SessionState`, `SessionStateMachine(Func<string>?)`, `SessionStateMachine.HandleStart(bool)`, `SessionStateMachine.HandleStop(string)`, `SessionStateMachine.Reset()`, `SessionStateMachine.State`, `SessionStateMachine.SessionId`, `SessionStateMachine.SessionsStarted` (Task 8).
 - Produces: `readonly record struct SessionGrant(bool Accepted, string SessionId, string? Reason, string? HolderName, bool StartedNewSession)`; `readonly record struct SessionRelease(string SessionId, bool EndedSession)`; `sealed class SessionArbiter` with constants `const string MicUnavailable = "MIC_UNAVAILABLE"` and `const string SessionInUse = "SESSION_IN_USE"`, constructor `SessionArbiter(Func<string>? sessionIdFactory = null)`, and members `string? ActiveSessionId`, `string? HolderId`, `string? HolderName`, `long SessionsStarted`, `SessionGrant Start(string ownerId, string ownerName, bool micPresent)`, `SessionRelease Stop(string ownerId, string requestedSessionId)`, `bool EndSessionOwnedBy(string ownerId)`, `void Reset()`.
 
-`ownerId` is the **connection's** identifier, not the device's: one paired Mac may hold two connections open, and only the one that received the `START_ACK` owns the session. `ownerName` is the owner-assigned friendly name of the paired device behind that connection — the value that travels as the advisory `holder` field in a `START_NACK`.
+`ownerId` is the **connection's** identifier, not the device's: one paired Mac may hold two connections open, and only the one that received the `START_ACK` owns the session. `ownerName` is the owner-assigned friendly name of the paired device behind that connection — the value that travels as the advisory `holderName` field in a `START_NACK`.
 
 **This task runs on Windows.** It is pure — no sockets, no timers — so it is the cheapest place to get the multi-device rules right.
 
@@ -3534,10 +3534,10 @@ public class SessionArbiterTests
         Assert.False(ControlMessagesHolderPresent(refused.HolderName));
     }
 
-    private static bool ControlMessagesHolderPresent(string? holder) =>
+    private static bool ControlMessagesHolderPresent(string? holderName) =>
         SharedMic.Agent.Protocol.ControlMessages
-            .StartNack("r", SessionArbiter.SessionInUse, holder)
-            .ContainsKey("holder");
+            .StartNack("r", SessionArbiter.SessionInUse, holderName)
+            .ContainsKey("holderName");
 
     /// <summary>
     /// Unlike SessionStateMachine, this type is reached from every connection's
@@ -5192,7 +5192,7 @@ namespace SharedMic.Agent.Security;
 /// FriendlyName is assigned by the Windows user when the device is paired. It is
 /// NOT the clientId the Mac sends in HELLO — that value arrives unauthenticated
 /// and is a display label only. This is the name that travels as the advisory
-/// "holder" field of a START_NACK, so it has to be one the owner chose.
+/// "holderName" field of a START_NACK, so it has to be one the owner chose.
 /// </summary>
 public sealed record PairedDevice(string DeviceId, string FriendlyName, byte[] Token, DateTimeOffset PairedAt)
 {
@@ -5993,7 +5993,7 @@ public class ControlConnectionTests : IDisposable
         Assert.Equal("START_NACK", refused!["type"]);
         Assert.Equal("req-o", refused["requestId"]);
         Assert.Equal("SESSION_IN_USE", refused["reason"]);
-        Assert.Equal("Mac Studio", refused["holder"]);
+        Assert.Equal("Mac Studio", refused["holderName"]);
         Assert.Equal(1, sessions.SessionsStarted);
     }
 
@@ -6246,7 +6246,7 @@ public class ControlConnectionTests : IDisposable
         Assert.Equal("START_NACK", nack!["type"]);
         Assert.Equal("req-0002", nack["requestId"]);
         Assert.Equal("MIC_UNAVAILABLE", nack["reason"]);
-        Assert.False(nack.ContainsKey("holder"));
+        Assert.False(nack.ContainsKey("holderName"));
     }
 
     [Fact]
@@ -7438,7 +7438,7 @@ public class TlsListenerTests : IDisposable
         Assert.Equal("START_ACK", granted["type"]);
         Assert.Equal("START_NACK", refused["type"]);
         Assert.Equal("SESSION_IN_USE", refused["reason"]);
-        Assert.Equal("Mac Studio", refused["holder"]);
+        Assert.Equal("Mac Studio", refused["holderName"]);
         Assert.Equal(1, sessions.SessionsStarted);
         Assert.Equal(studio.DeviceId, listener.SessionHolderDeviceId);
         Assert.Equal(2, listener.AuthenticatedConnections);
@@ -8314,7 +8314,7 @@ Modes:
 
 A caution about what this tool can and cannot prove. `MockMacClient` is a
 faithful CLIENT, so `--mode multi` really does exercise the Windows agent's
-arbitration. What it cannot check is the advisory `holder` field: the client
+arbitration. What it cannot check is the advisory `holderName` field: the client
 raises `SessionRejected(reason)` and drops the rest of the message. The holder
 name is asserted by the C# tests instead. And nothing here can be replaced by
 the conformance suite in `harness/tests` — `MockWindowsServer` gives every
@@ -9422,10 +9422,10 @@ Points in `protocol/protocol-v1.md` that a reader must resolve before implementi
 6. **§11.3's validity row says "3,650 days, starting 5 minutes in the past".** Read literally that is a 3,650-day span ending 5 minutes before `now + 3650 days`. The reference implementation uses `now - 5 min` to `now + 3650 days`, a span of 3,650 days plus 5 minutes. This plan matches the reference; the `IdentityTests` assertion allows the ±0.1-day slack that difference implies.
 7. **§4's "sequence resets to 0 at the start of each session" is `[CARRIED]` and untested anywhere.** Phase 1 never emits audio, so nothing here can prove it either. Phase 2 must add the test the harness lacks: assert a second session's first frame carries `sequence == 0`.
 8. **§2 requires binding "private interfaces only" but does not define the set.** This plan takes it as RFC 1918 (`10/8`, `172.16/12`, `192.168/16`), loopback (`127/8`, `::1`), IPv4 link-local (`169.254/16`), and IPv6 link-local and unique-local. `PrivateAddressTests` pins that reading so a future disagreement is a visible test change.
-9. **A second Mac connecting is now answered, and the answer is not supersession.** An earlier draft of §7 said a newly authenticated connection supersedes the older one. With several paired Macs that is wrong: all of them stay connected, and the microphone is arbitrated instead. A `START` from a device that does not hold the session is refused with `START_NACK{reason:"SESSION_IN_USE", holder}`; the connection is not touched. What carries over from the superseding design is the rule that made it safe — nothing observable happens until a connection has authenticated.
+9. **A second Mac connecting is now answered, and the answer is not supersession.** An earlier draft of §7 said a newly authenticated connection supersedes the older one. With several paired Macs that is wrong: all of them stay connected, and the microphone is arbitrated instead. A `START` from a device that does not hold the session is refused with `START_NACK{reason:"SESSION_IN_USE", holderName}`; the connection is not touched. What carries over from the superseding design is the rule that made it safe — nothing observable happens until a connection has authenticated.
 
 10. **§7's "`STOP` means make sure no session is active" needed a scope it did not have.** With one Mac the sentence was unambiguous. With several, taken literally it lets any paired Mac end any other's session with one message. This plan reads it as **"make sure no session is active *on this connection*"**: a `STOP` from a non-holder still returns `STOP_ACK` (§7 never rejects a `STOP`) and ends nothing. `SessionArbiter.Stop` takes the owner id for exactly that reason, and `StopFromANonHolderEndsNothingButStillSucceeds` pins it.
 
-11. **`START_NACK` gains the protocol's first optional field.** `holder` is present only with `reason: "SESSION_IN_USE"`, and is omitted rather than sent blank. Both codecs already tolerate unknown fields — `ControlCodec.Validate` checks that required fields are present and says nothing about extras, and the Python reference does the same — so this needs no version bump. A receiver that ignores it still works; the macOS plan specifies what to show when it is absent.
+11. **`START_NACK` gains the protocol's first optional field.** `holderName` is present only with `reason: "SESSION_IN_USE"`, and is omitted rather than sent blank. Both codecs already tolerate unknown fields — `ControlCodec.Validate` checks that required fields are present and says nothing about extras, and the Python reference does the same — so this needs no version bump. A receiver that ignores it still works; the macOS plan specifies what to show when it is absent.
 
 12. **The conformance harness cannot see any of §7's multi-connection rules.** `MockWindowsServer` gives every connection its own `_session_id` and holds one token, so it would agree with an implementation that has no device list, no arbitration and no release-on-disconnect. Tasks 9, 13, 14 and 15 carry that weight in C#, and `drive_windows_agent.py --mode multi` is the only end-to-end check. This is stated in each of those tasks, because "the suite is green" is otherwise a misleading signal here.

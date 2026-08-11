@@ -63,7 +63,7 @@ bytes   pcm                  // exactly 1,920 bytes of s16le PCM
 | `HELLO_ACK` | Win → Mac | `serverId` (string), `micPresent` (bool), `deviceLabel` (string) |
 | `START` | Mac → Win | `requestId` (string), `preferredFormat` (object, always `{"sampleRate":48000,"channels":1,"sampleFormat":"s16le"}`) |
 | `START_ACK` | Win → Mac | `requestId` (string), `sessionId` (string), `format` (object) |
-| `START_NACK` | Win → Mac | `requestId` (string), `reason` (string), **and one OPTIONAL advisory field, `holder` (string)** — the friendly name of the Mac that currently holds the session. Present only with `reason: "SESSION_IN_USE"`, and **may be absent even then**. |
+| `START_NACK` | Win → Mac | `requestId` (string), `reason` (string), **and one OPTIONAL advisory field, `holderName` (string)** — the friendly name of the Mac that currently holds the session. Present only with `reason: "SESSION_IN_USE"`, and **may be absent even then**. |
 | `STOP` | Mac → Win | `requestId` (string), `sessionId` (string) |
 | `STOP_ACK` | Win → Mac | `requestId` (string), `sessionId` (string) |
 | `STATUS` | Win → Mac | `micPresent` (bool), `active` (bool), `deviceLabel` (string) — **no `errors` field** |
@@ -83,7 +83,7 @@ bytes   pcm                  // exactly 1,920 bytes of s16le PCM
 **This Mac is not the only client.** Several Macs may be paired with one Windows agent and connected at the same time; the Windows host has one microphone, so **at most one of them holds the session at a time**. Three consequences for this plan, and they are the whole of the multi-Mac work on this side:
 
 1. **`START` can be refused because another Mac is using the microphone**, with `START_NACK{reason: "SESSION_IN_USE"}`. That is not an error and not a degraded connection: this Mac is still authenticated, still healthy, and still heartbeating. It just does not have the mic. It must be shown as "In use by ...", never as a generic failure.
-2. **The advisory `holder` name may be absent.** When it is, show `In use by another Mac` — never an empty name, a placeholder, or the raw reason string.
+2. **The advisory `holderName` name may be absent.** When it is, show `In use by another Mac` — never an empty name, a placeholder, or the raw reason string.
 3. **Nothing tells this Mac when the mic frees up.** There is no queue and no push notification in version 1; Windows sends one `START_NACK` and that is the end of the exchange. The Mac stays in its "in use" state until the user tries Start again (which retries) or the connection changes. Phase 2's `STATUS` is where a proper "the mic is free" signal belongs; do not invent a message type for it here.
 
 **Pairing does not change at all.** Each Mac gets its own 256-bit token from Windows and its own pairing string, in exactly the format §11.2 already specifies. Nothing in Tasks 6 or 7 needs to be different because the Windows side now holds a list instead of a single token — the Mac never sees the list.
@@ -823,8 +823,8 @@ EOF
 - Consumes: `ProtocolError` and `FrameCodec.encode(type:payload:)` (Task 2), `SharedMicProtocol.version` / `.sampleRate` / `.channels` / `.sampleFormat` (Task 1).
 - Produces:
   - `public struct AudioFormat: Equatable` — `init(sampleRate: Int, channels: Int, sampleFormat: String)`, `static let v1: AudioFormat`, `var jsonObject: [String: Any]`
-  - `public enum ControlMessage: Equatable` with the eleven cases `greeting(serverId:nonce:)`, `hello(clientId:mac:)`, `helloAck(serverId:micPresent:deviceLabel:)`, `start(requestId:preferredFormat:)`, `startAck(requestId:sessionId:format:)`, `startNack(requestId:reason:holder:)`, `stop(requestId:sessionId:)`, `stopAck(requestId:sessionId:)`, `status(micPresent:active:deviceLabel:)`, `ping(seq:)`, `pong(seq:)`; plus `var typeName: String`, `var jsonObject: [String: Any]`, `init(jsonObject: Any) throws`
-  - `startNack`'s `holder` is `String?` — the protocol's only optional field. It decodes to `nil` when absent and, when `nil`, is **omitted from `jsonObject` entirely** rather than encoded as `null`. That omission is what keeps the committed `START_NACK` golden vector (which has no `holder`) byte-identical through a decode/encode round trip in Task 5.
+  - `public enum ControlMessage: Equatable` with the eleven cases `greeting(serverId:nonce:)`, `hello(clientId:mac:)`, `helloAck(serverId:micPresent:deviceLabel:)`, `start(requestId:preferredFormat:)`, `startAck(requestId:sessionId:format:)`, `startNack(requestId:reason:holderName:)`, `stop(requestId:sessionId:)`, `stopAck(requestId:sessionId:)`, `status(micPresent:active:deviceLabel:)`, `ping(seq:)`, `pong(seq:)`; plus `var typeName: String`, `var jsonObject: [String: Any]`, `init(jsonObject: Any) throws`
+  - `startNack`'s `holderName` is `String?` — the protocol's only optional field. It decodes to `nil` when absent and, when `nil`, is **omitted from `jsonObject` entirely** rather than encoded as `null`. That omission is what keeps the committed `START_NACK` golden vector (which has no `holderName`) byte-identical through a decode/encode round trip in Task 5.
   - `public enum ControlCodec` — `static func encode(_ message: ControlMessage) throws -> Data` (payload bytes), `static func decode(_ payload: Data) throws -> ControlMessage`, `static func encodeFrame(_ message: ControlMessage) throws -> Data` (complete envelope)
 
 - [ ] **Step 1: Write the failing test**
@@ -871,7 +871,7 @@ final class ControlCodecTests: XCTestCase {
             .helloAck(serverId: "win-desktop", micPresent: true, deviceLabel: "USB Microphone"),
             .start(requestId: "req-0001", preferredFormat: .v1),
             .startAck(requestId: "req-0001", sessionId: "sess-0001", format: .v1),
-            .startNack(requestId: "req-0002", reason: "MIC_UNAVAILABLE", holder: nil),
+            .startNack(requestId: "req-0002", reason: "MIC_UNAVAILABLE", holderName: nil),
             .stop(requestId: "req-0003", sessionId: "sess-0001"),
             .stopAck(requestId: "req-0003", sessionId: "sess-0001"),
             .status(micPresent: false, active: false, deviceLabel: "USB Microphone"),
@@ -929,33 +929,33 @@ final class ControlCodecTests: XCTestCase {
         }
     }
 
-    /// protocol-v1 §5: `holder` is advisory and OPTIONAL. A START_NACK without
+    /// protocol-v1 §5: `holderName` is advisory and OPTIONAL. A START_NACK without
     /// it is completely valid — that is what every MIC_UNAVAILABLE refusal looks
     /// like — so decoding must yield nil rather than throwing.
     func testStartNackDecodesWithoutTheOptionalHolder() throws {
         let payload = Data(#"{"reason":"MIC_UNAVAILABLE","requestId":"req-0002","type":"START_NACK","v":1}"#.utf8)
         XCTAssertEqual(
             try ControlCodec.decode(payload),
-            .startNack(requestId: "req-0002", reason: "MIC_UNAVAILABLE", holder: nil)
+            .startNack(requestId: "req-0002", reason: "MIC_UNAVAILABLE", holderName: nil)
         )
     }
 
     func testStartNackCarriesTheHolderWhenTheSessionIsInUse() throws {
         let payload = Data(
-            #"{"holder":"Mac Studio","reason":"SESSION_IN_USE","requestId":"req-0002","type":"START_NACK","v":1}"#.utf8
+            #"{"holderName":"Mac Studio","reason":"SESSION_IN_USE","requestId":"req-0002","type":"START_NACK","v":1}"#.utf8
         )
         XCTAssertEqual(
             try ControlCodec.decode(payload),
-            .startNack(requestId: "req-0002", reason: "SESSION_IN_USE", holder: "Mac Studio")
+            .startNack(requestId: "req-0002", reason: "SESSION_IN_USE", holderName: "Mac Studio")
         )
     }
 
-    /// A nil holder must vanish from the object, not appear as `"holder":null`.
+    /// A nil holder must vanish from the object, not appear as `"holderName":null`.
     /// The committed START_NACK vector has no holder, so anything else would
     /// break the golden-vector round trip in Task 5.
     func testANilHolderIsOmittedFromTheEncodedObject() throws {
         let payload = try ControlCodec.encode(
-            .startNack(requestId: "req-0002", reason: "MIC_UNAVAILABLE", holder: nil)
+            .startNack(requestId: "req-0002", reason: "MIC_UNAVAILABLE", holderName: nil)
         )
         XCTAssertEqual(
             String(data: payload, encoding: .utf8),
@@ -963,23 +963,35 @@ final class ControlCodecTests: XCTestCase {
         )
 
         let withHolder = try ControlCodec.encode(
-            .startNack(requestId: "req-0002", reason: "SESSION_IN_USE", holder: "Mac Studio")
+            .startNack(requestId: "req-0002", reason: "SESSION_IN_USE", holderName: "Mac Studio")
         )
         XCTAssertEqual(
             String(data: withHolder, encoding: .utf8),
-            #"{"holder":"Mac Studio","reason":"SESSION_IN_USE","requestId":"req-0002","type":"START_NACK","v":1}"#
+            #"{"holderName":"Mac Studio","reason":"SESSION_IN_USE","requestId":"req-0002","type":"START_NACK","v":1}"#
         )
     }
 
-    /// A wrong-typed advisory field is a malformed message, not something to
-    /// silently treat as absent.
-    func testAHolderThatIsNotAStringIsRejected() {
-        let payload = Data(
-            #"{"holder":7,"reason":"SESSION_IN_USE","requestId":"r","type":"START_NACK","v":1}"#.utf8
+    /// protocol-v1 §5: a START_NACK MUST NOT be rejected for carrying
+    /// `holderName`, and the field is display-only. An unusable value is
+    /// therefore ignored — the refusal still has to reach the user.
+    func testAnUnusableHolderNameIsIgnoredRatherThanRejected() throws {
+        let wrongType = Data(
+            #"{"holderName":7,"reason":"SESSION_IN_USE","requestId":"r","type":"START_NACK","v":1}"#.utf8
         )
-        XCTAssertThrowsError(try ControlCodec.decode(payload)) { error in
-            XCTAssertEqual(error as? ProtocolError, .wrongFieldType(type: "START_NACK", field: "holder"))
-        }
+        XCTAssertEqual(
+            try ControlCodec.decode(wrongType),
+            .startNack(requestId: "r", reason: "SESSION_IN_USE", holderName: nil)
+        )
+
+        // ...and carrying it alongside some other reason is also well-formed;
+        // §5 says the field is simply ignored where it is not meaningful.
+        let otherReason = Data(
+            #"{"holderName":"Mac Studio","reason":"MIC_UNAVAILABLE","requestId":"r","type":"START_NACK","v":1}"#.utf8
+        )
+        XCTAssertEqual(
+            try ControlCodec.decode(otherReason),
+            .startNack(requestId: "r", reason: "MIC_UNAVAILABLE", holderName: "Mac Studio")
+        )
     }
 
     func testStatusHasExactlyThreeFieldsBeyondVersionAndType() throws {
@@ -1040,11 +1052,11 @@ public enum ControlMessage: Equatable {
     case helloAck(serverId: String, micPresent: Bool, deviceLabel: String)
     case start(requestId: String, preferredFormat: AudioFormat)
     case startAck(requestId: String, sessionId: String, format: AudioFormat)
-    /// `holder` is the protocol's only optional field: the friendly name of the
+    /// `holderName` is the protocol's only optional field: the friendly name of the
     /// Mac that currently holds the session, sent only with
     /// `reason == "SESSION_IN_USE"` and permitted to be absent even then. It is
     /// advisory — every path that uses it must work when it is nil.
-    case startNack(requestId: String, reason: String, holder: String?)
+    case startNack(requestId: String, reason: String, holderName: String?)
     case stop(requestId: String, sessionId: String)
     case stopAck(requestId: String, sessionId: String)
     case status(micPresent: Bool, active: Bool, deviceLabel: String)
@@ -1092,13 +1104,13 @@ public enum ControlMessage: Equatable {
             object["requestId"] = requestId
             object["sessionId"] = sessionId
             object["format"] = format.jsonObject
-        case .startNack(let requestId, let reason, let holder):
+        case .startNack(let requestId, let reason, let holderName):
             object["requestId"] = requestId
             object["reason"] = reason
             // Omitted, not encoded as null: the committed START_NACK vector has
-            // no `holder` key and must round-trip byte-identically.
-            if let holder {
-                object["holder"] = holder
+            // no `holderName` key and must round-trip byte-identically.
+            if let holderName {
+                object["holderName"] = holderName
             }
         case .stop(let requestId, let sessionId):
             object["requestId"] = requestId
@@ -1164,17 +1176,14 @@ public enum ControlMessage: Equatable {
             }
             return number.intValue
         }
-        /// An optional string field: absent is nil, present-but-not-a-string is
-        /// a protocol error. Silently swallowing a wrong type would hide a
-        /// genuine encoder bug on the other end.
-        func optionalString(_ key: String) throws -> String? {
-            guard let raw = dictionary[key] else {
-                return nil
-            }
-            guard let value = raw as? String else {
-                throw ProtocolError.wrongFieldType(type: typeName, field: key)
-            }
-            return value
+        /// An OPTIONAL ADVISORY field. protocol-v1 §5 is explicit that a
+        /// START_NACK must never be rejected for carrying `holderName`, and that
+        /// the field is display-only, so anything unusable — absent, null, or
+        /// not a string — decodes to nil rather than throwing. This is
+        /// deliberately more forgiving than `string(_:)`, which guards required
+        /// fields and must stay strict.
+        func advisoryString(_ key: String) -> String? {
+            dictionary[key] as? String
         }
         func format(_ key: String) throws -> AudioFormat {
             guard let raw = dictionary[key] else {
@@ -1208,7 +1217,7 @@ public enum ControlMessage: Equatable {
         case "START_NACK":
             self = .startNack(requestId: try string("requestId"),
                               reason: try string("reason"),
-                              holder: try optionalString("holder"))
+                              holderName: advisoryString("holderName"))
         case "STOP":
             self = .stop(requestId: try string("requestId"), sessionId: try string("sessionId"))
         case "STOP_ACK":
@@ -1282,7 +1291,7 @@ feat(macos): control message model and canonical sorted-key JSON codec
 All eleven protocol-v1 §5 types with per-type required-field validation on both
 encode and decode, version-1 enforcement, and canonical UTF-8 output with
 lexicographically sorted keys including nested format objects. START_NACK
-carries the optional advisory `holder` name, omitted rather than encoded as null
+carries the optional advisory `holderName` name, omitted rather than encoded as null
 when absent so the committed vector still round-trips byte for byte.
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
@@ -2714,10 +2723,10 @@ The one place the phase's lifecycle rules live: `START`/`STOP` idempotency, the 
 **Interfaces:**
 - Consumes: `SharedMicProtocol.startTimeout` / `.stopTimeout` (Task 1).
 - Produces:
-  - `public enum AgentState: Equatable` — `unpaired`, `disconnected`, `connecting`, `idle`, `starting(requestId: String)`, `streaming(sessionId: String)`, `stopping(requestId: String, sessionId: String)`, `sessionInUse(holder: String?)`, `degraded(reason: String)`, `hardStop(reason: String)`; plus `var displayName: String`
-  - `public enum SessionEvent: Equatable` — `paired`, `connectAttemptStarted`, `authenticated(micPresent: Bool, deviceLabel: String)`, `userRequestedStart(requestId: String)`, `startAcked(requestId: String, sessionId: String)`, `startNacked(requestId: String, reason: String, holder: String?)`, `startTimedOut(requestId: String)`, `userRequestedStop(requestId: String)`, `stopAcked(requestId: String)`, `stopTimedOut(requestId: String)`, `statusReceived(micPresent: Bool, active: Bool, deviceLabel: String)`, `connectionLost(reason: String)`, `fingerprintMismatch(expected: String, presented: String)`, `unpairedByUser`
+  - `public enum AgentState: Equatable` — `unpaired`, `disconnected`, `connecting`, `idle`, `starting(requestId: String)`, `streaming(sessionId: String)`, `stopping(requestId: String, sessionId: String)`, `sessionInUse(holderName: String?)`, `degraded(reason: String)`, `hardStop(reason: String)`; plus `var displayName: String`
+  - `public enum SessionEvent: Equatable` — `paired`, `connectAttemptStarted`, `authenticated(micPresent: Bool, deviceLabel: String)`, `userRequestedStart(requestId: String)`, `startAcked(requestId: String, sessionId: String)`, `startNacked(requestId: String, reason: String, holderName: String?)`, `startTimedOut(requestId: String)`, `userRequestedStop(requestId: String)`, `stopAcked(requestId: String)`, `stopTimedOut(requestId: String)`, `statusReceived(micPresent: Bool, active: Bool, deviceLabel: String)`, `connectionLost(reason: String)`, `fingerprintMismatch(expected: String, presented: String)`, `unpairedByUser`
 
-`sessionInUse` is **not an error state**. The connection is authenticated, healthy and heartbeating; this Mac simply does not have the microphone. It is distinct from `degraded` (which means something is wrong) and from `idle` (which means "Start would probably work"), and its `displayName` is what the menu bar shows: `In use by Mac Studio`, or `In use by another Mac` when the advisory `holder` is absent.
+`sessionInUse` is **not an error state**. The connection is authenticated, healthy and heartbeating; this Mac simply does not have the microphone. It is distinct from `degraded` (which means something is wrong) and from `idle` (which means "Start would probably work"), and its `displayName` is what the menu bar shows: `In use by Mac Studio`, or `In use by another Mac` when the advisory `holderName` is absent.
 
 Leaving `sessionInUse` has exactly three routes, because version 1 has no "the mic is free now" message: the user tries Start again (which retries and may now succeed), a `STATUS` arrives saying nothing is active, or the connection changes state. Nothing polls.
   - `public enum SessionAction: Equatable` — `sendStart(requestId: String)`, `sendStop(requestId: String, sessionId: String)`, `armStartTimeout(requestId: String, seconds: TimeInterval)`, `armStopTimeout(requestId: String, seconds: TimeInterval)`, `scheduleReconnect`, `closeConnection`, `warnFingerprintMismatch(expected: String, presented: String)`, `notify(String)`
@@ -2800,7 +2809,7 @@ final class SessionControllerTests: XCTestCase {
     func testStartNackReturnsToIdleWithTheReason() {
         var controller = authenticatedController()
         _ = controller.handle(.userRequestedStart(requestId: "req-1"))
-        let actions = controller.handle(.startNacked(requestId: "req-1", reason: "MIC_UNAVAILABLE", holder: nil))
+        let actions = controller.handle(.startNacked(requestId: "req-1", reason: "MIC_UNAVAILABLE", holderName: nil))
         XCTAssertEqual(actions, [.notify("Start refused: MIC_UNAVAILABLE")])
         XCTAssertEqual(controller.state, .idle)
     }
@@ -2812,24 +2821,24 @@ final class SessionControllerTests: XCTestCase {
         var controller = authenticatedController()
         _ = controller.handle(.userRequestedStart(requestId: "req-1"))
         let actions = controller.handle(
-            .startNacked(requestId: "req-1", reason: "SESSION_IN_USE", holder: "Mac Studio")
+            .startNacked(requestId: "req-1", reason: "SESSION_IN_USE", holderName: "Mac Studio")
         )
         XCTAssertEqual(actions, [.notify("The microphone is in use by Mac Studio.")])
-        XCTAssertEqual(controller.state, .sessionInUse(holder: "Mac Studio"))
+        XCTAssertEqual(controller.state, .sessionInUse(holderName: "Mac Studio"))
         XCTAssertEqual(controller.state.displayName, "In use by Mac Studio")
         XCTAssertNil(controller.activeSessionId)
     }
 
-    /// protocol-v1 §5: `holder` is advisory and may be absent. The UI must not
+    /// protocol-v1 §5: `holderName` is advisory and may be absent. The UI must not
     /// render "In use by " with nothing after it.
     func testSessionInUseWithoutAHolderNameSaysAnotherMac() {
         var controller = authenticatedController()
         _ = controller.handle(.userRequestedStart(requestId: "req-1"))
         let actions = controller.handle(
-            .startNacked(requestId: "req-1", reason: "SESSION_IN_USE", holder: nil)
+            .startNacked(requestId: "req-1", reason: "SESSION_IN_USE", holderName: nil)
         )
         XCTAssertEqual(actions, [.notify("The microphone is in use by another Mac.")])
-        XCTAssertEqual(controller.state, .sessionInUse(holder: nil))
+        XCTAssertEqual(controller.state, .sessionInUse(holderName: nil))
         XCTAssertEqual(controller.state.displayName, "In use by another Mac")
     }
 
@@ -2837,8 +2846,8 @@ final class SessionControllerTests: XCTestCase {
     func testABlankHolderNameIsTreatedAsAbsent() {
         var controller = authenticatedController()
         _ = controller.handle(.userRequestedStart(requestId: "req-1"))
-        _ = controller.handle(.startNacked(requestId: "req-1", reason: "SESSION_IN_USE", holder: "   "))
-        XCTAssertEqual(controller.state, .sessionInUse(holder: nil))
+        _ = controller.handle(.startNacked(requestId: "req-1", reason: "SESSION_IN_USE", holderName: "   "))
+        XCTAssertEqual(controller.state, .sessionInUse(holderName: nil))
         XCTAssertEqual(controller.state.displayName, "In use by another Mac")
     }
 
@@ -2847,7 +2856,7 @@ final class SessionControllerTests: XCTestCase {
     func testStartCanBeRetriedFromSessionInUse() {
         var controller = authenticatedController()
         _ = controller.handle(.userRequestedStart(requestId: "req-1"))
-        _ = controller.handle(.startNacked(requestId: "req-1", reason: "SESSION_IN_USE", holder: "Mac Studio"))
+        _ = controller.handle(.startNacked(requestId: "req-1", reason: "SESSION_IN_USE", holderName: "Mac Studio"))
 
         let actions = controller.handle(.userRequestedStart(requestId: "req-2"))
 
@@ -2867,7 +2876,7 @@ final class SessionControllerTests: XCTestCase {
         var controller = authenticatedController()
         _ = controller.handle(.userRequestedStart(requestId: "req-1"))
         let actions = controller.handle(
-            .startNacked(requestId: "req-1", reason: "SESSION_IN_USE", holder: "Mac Studio")
+            .startNacked(requestId: "req-1", reason: "SESSION_IN_USE", holderName: "Mac Studio")
         )
         XCTAssertFalse(actions.contains(.closeConnection))
         XCTAssertFalse(actions.contains(.scheduleReconnect))
@@ -2878,7 +2887,7 @@ final class SessionControllerTests: XCTestCase {
     func testAnIdleStatusClearsSessionInUse() {
         var controller = authenticatedController()
         _ = controller.handle(.userRequestedStart(requestId: "req-1"))
-        _ = controller.handle(.startNacked(requestId: "req-1", reason: "SESSION_IN_USE", holder: "Mac Studio"))
+        _ = controller.handle(.startNacked(requestId: "req-1", reason: "SESSION_IN_USE", holderName: "Mac Studio"))
 
         let actions = controller.handle(
             .statusReceived(micPresent: true, active: false, deviceLabel: "USB Microphone")
@@ -2892,17 +2901,17 @@ final class SessionControllerTests: XCTestCase {
     func testAnActiveStatusLeavesSessionInUseAlone() {
         var controller = authenticatedController()
         _ = controller.handle(.userRequestedStart(requestId: "req-1"))
-        _ = controller.handle(.startNacked(requestId: "req-1", reason: "SESSION_IN_USE", holder: "Mac Studio"))
+        _ = controller.handle(.startNacked(requestId: "req-1", reason: "SESSION_IN_USE", holderName: "Mac Studio"))
 
         _ = controller.handle(.statusReceived(micPresent: true, active: true, deviceLabel: "USB Microphone"))
 
-        XCTAssertEqual(controller.state, .sessionInUse(holder: "Mac Studio"))
+        XCTAssertEqual(controller.state, .sessionInUse(holderName: "Mac Studio"))
     }
 
     func testLosingTheConnectionClearsSessionInUse() {
         var controller = authenticatedController()
         _ = controller.handle(.userRequestedStart(requestId: "req-1"))
-        _ = controller.handle(.startNacked(requestId: "req-1", reason: "SESSION_IN_USE", holder: "Mac Studio"))
+        _ = controller.handle(.startNacked(requestId: "req-1", reason: "SESSION_IN_USE", holderName: "Mac Studio"))
 
         let actions = controller.handle(.connectionLost(reason: "peer dead"))
 
@@ -2917,7 +2926,7 @@ final class SessionControllerTests: XCTestCase {
         _ = controller.handle(.startAcked(requestId: "req-1", sessionId: "sess-1"))
 
         let actions = controller.handle(
-            .startNacked(requestId: "req-1", reason: "SESSION_IN_USE", holder: "Mac Studio")
+            .startNacked(requestId: "req-1", reason: "SESSION_IN_USE", holderName: "Mac Studio")
         )
 
         XCTAssertEqual(actions, [])
@@ -3073,8 +3082,8 @@ final class SessionControllerTests: XCTestCase {
         XCTAssertEqual(AgentState.idle.displayName, "Idle")
         XCTAssertEqual(AgentState.starting(requestId: "r").displayName, "Starting")
         XCTAssertEqual(AgentState.streaming(sessionId: "s").displayName, "Streaming")
-        XCTAssertEqual(AgentState.sessionInUse(holder: "Mac Studio").displayName, "In use by Mac Studio")
-        XCTAssertEqual(AgentState.sessionInUse(holder: nil).displayName, "In use by another Mac")
+        XCTAssertEqual(AgentState.sessionInUse(holderName: "Mac Studio").displayName, "In use by Mac Studio")
+        XCTAssertEqual(AgentState.sessionInUse(holderName: nil).displayName, "In use by another Mac")
         XCTAssertEqual(AgentState.degraded(reason: "x").displayName, "Degraded")
     }
 }
@@ -3105,8 +3114,8 @@ public enum AgentState: Equatable {
     case stopping(requestId: String, sessionId: String)
     /// Another paired Mac holds the Windows microphone. NOT an error: this Mac
     /// is authenticated, healthy and heartbeating; it just does not have the
-    /// mic. `holder` is the advisory name from START_NACK and may be nil.
-    case sessionInUse(holder: String?)
+    /// mic. `holderName` is the advisory name from START_NACK and may be nil.
+    case sessionInUse(holderName: String?)
     case degraded(reason: String)
     /// Terminal until the user re-pairs. Reached only by a pinned-fingerprint
     /// mismatch, which protocol-v1 §2 forbids recovering from automatically.
@@ -3121,13 +3130,13 @@ public enum AgentState: Equatable {
         case .starting: return "Starting"
         case .streaming: return "Streaming"
         case .stopping: return "Stopping"
-        case .sessionInUse(let holder):
-            // The advisory name may be absent; "In use by " with nothing after
-            // it is not an acceptable thing to put in a menu bar.
-            guard let holder, !holder.trimmingCharacters(in: .whitespaces).isEmpty else {
+        case .sessionInUse(let holderName):
+            // The advisory name may be absent or empty; "In use by " with
+            // nothing after it is not an acceptable thing to put in a menu bar.
+            guard let holderName, !holderName.trimmingCharacters(in: .whitespaces).isEmpty else {
                 return "In use by another Mac"
             }
-            return "In use by \(holder)"
+            return "In use by \(holderName)"
         case .degraded: return "Degraded"
         case .hardStop: return "Certificate mismatch"
         }
@@ -3140,7 +3149,7 @@ public enum SessionEvent: Equatable {
     case authenticated(micPresent: Bool, deviceLabel: String)
     case userRequestedStart(requestId: String)
     case startAcked(requestId: String, sessionId: String)
-    case startNacked(requestId: String, reason: String, holder: String?)
+    case startNacked(requestId: String, reason: String, holderName: String?)
     case startTimedOut(requestId: String)
     case userRequestedStop(requestId: String)
     case stopAcked(requestId: String)
@@ -3262,16 +3271,21 @@ public struct SessionController {
             state = .streaming(sessionId: sessionId)
             return []
 
-        case .startNacked(let requestId, let reason, let holder):
+        case .startNacked(let requestId, let reason, let holderName):
             guard case .starting(let pending) = state, pending == requestId else { return [] }
 
             // SESSION_IN_USE is not a failure. Another paired Mac has the one
             // microphone; this connection is untouched and the user is told who
             // has it, by name when Windows offered one.
+            //
+            // protocol-v1 §5: holderName is advisory and display-only. It is
+            // carried here so the UI can render it, and it drives no decision —
+            // not the retry policy, not the transition, not the notification's
+            // severity. Only the wording changes.
             if reason == Self.sessionInUseReason {
-                let named = holder?.trimmingCharacters(in: .whitespaces)
+                let named = holderName?.trimmingCharacters(in: .whitespaces)
                 let usable = (named?.isEmpty == false) ? named : nil
-                state = .sessionInUse(holder: usable)
+                state = .sessionInUse(holderName: usable)
                 return [.notify("The microphone is in use by \(usable ?? "another Mac").")]
             }
 
@@ -5613,12 +5627,12 @@ public final class ConnectionCoordinator: ControlClientDelegate {
             case .startAck(let requestId, let sessionId, _):
                 self.startTimeoutTimer?.cancel(); self.startTimeoutTimer = nil
                 self.apply(self.controller.handle(.startAcked(requestId: requestId, sessionId: sessionId)))
-            case .startNack(let requestId, let reason, let holder):
+            case .startNack(let requestId, let reason, let holderName):
                 self.startTimeoutTimer?.cancel(); self.startTimeoutTimer = nil
                 // The advisory holder name is passed straight through; the
                 // controller decides what to do when it is nil or blank.
                 self.apply(self.controller.handle(
-                    .startNacked(requestId: requestId, reason: reason, holder: holder)))
+                    .startNacked(requestId: requestId, reason: reason, holderName: holderName)))
             case .stopAck(let requestId, _):
                 self.stopTimeoutTimer?.cancel(); self.stopTimeoutTimer = nil
                 self.apply(self.controller.handle(.stopAcked(requestId: requestId)))
@@ -5810,13 +5824,13 @@ final class AppModelTests: XCTestCase {
         _ = controller.handle(.connectAttemptStarted)
         _ = controller.handle(.authenticated(micPresent: true, deviceLabel: "USB Microphone"))
         _ = controller.handle(.userRequestedStart(requestId: "req-1"))
-        _ = controller.handle(.startNacked(requestId: "req-1", reason: "SESSION_IN_USE", holder: "Mac Studio"))
+        _ = controller.handle(.startNacked(requestId: "req-1", reason: "SESSION_IN_USE", holderName: "Mac Studio"))
 
         XCTAssertEqual(controller.state.displayName, "In use by Mac Studio")
 
         var anonymous = controller
         _ = anonymous.handle(.userRequestedStart(requestId: "req-2"))
-        _ = anonymous.handle(.startNacked(requestId: "req-2", reason: "SESSION_IN_USE", holder: nil))
+        _ = anonymous.handle(.startNacked(requestId: "req-2", reason: "SESSION_IN_USE", holderName: nil))
 
         XCTAssertEqual(anonymous.state.displayName, "In use by another Mac")
     }
@@ -6219,7 +6233,7 @@ Every Phase 1 scope item, and the task that implements it.
 | Heartbeat: `PING` on the specified interval, `PONG` sequence verified, dead peer detected | 8 (`HeartbeatMonitor`), 12 (timer loop and violation handling) |
 | Reconnect with exponential backoff 0.5 s → 30 s cap, jittered | 8 (`ReconnectPolicy`), 13 (`scheduleReconnect`, reset on `HELLO_ACK`) |
 | Session lifecycle `START`/`STOP`, idempotent, with the specified timeouts | 9 (`SessionController`), 13 (2 s / 1 s timers, reply routing) |
-| Another paired Mac holding the microphone: `SESSION_IN_USE` shown as "In use by \<name\>", and "In use by another Mac" when the advisory `holder` is absent | 3 (optional `holder` field), 9 (`.sessionInUse` state and its transitions), 13 (dispatch passes `holder` through), 14 (menu-bar text and retryable Start) |
+| Another paired Mac holding the microphone: `SESSION_IN_USE` shown as "In use by \<name\>", and "In use by another Mac" when the advisory `holderName` is absent | 3 (optional `holderName` field), 9 (`.sessionInUse` state and its transitions), 13 (dispatch passes `holderName` through), 14 (menu-bar text and retryable Start) |
 | Minimal menu-bar UI: state, pairing field, temporary Start/Stop, quit | 14 |
 | Golden-vector conformance as a real iterating test | 5 |
 | Endianness trap: big-endian envelope/header, little-endian PCM | 4 (codec and its tests), 5 (`testAudioVectorPCMIsLittleEndian` against real vector data) |
