@@ -7,149 +7,158 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		09CDD55B524931B5B112895D /* Cocoa.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = B4B5B4146D7F1324AB6CA907 /* Cocoa.framework */; };
-		15711FCE4DF44663EDBAE225 /* HexTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02FF4069457C200998A2A97E /* HexTests.swift */; };
-		1DF765068CEBFC0DF035898A /* ProtocolError.swift in Sources */ = {isa = PBXBuildFile; fileRef = C705D1036A6EF71B83455E37 /* ProtocolError.swift */; };
-		2B1A695A9C8BA18FFD101A4C /* FrameCodec.swift in Sources */ = {isa = PBXBuildFile; fileRef = EB092C9C85D6FBFD13FBF11C /* FrameCodec.swift */; };
-		58BD80873E593314B053BED6 /* SharedMicApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 58FCED8F46CB097EA4B121E3 /* SharedMicApp.swift */; };
-		6D2486ED10EBC14C3A7E25CF /* Hex.swift in Sources */ = {isa = PBXBuildFile; fileRef = D4BD6A45D6A582D1C4FA9F10 /* Hex.swift */; };
-		84CBE631F8B82154E273BF2F /* ProtocolConstants.swift in Sources */ = {isa = PBXBuildFile; fileRef = B66F72C68A1B95E724C5C3C8 /* ProtocolConstants.swift */; };
-		A04FAC28DD714802204A9892 /* Cocoa.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = B4B5B4146D7F1324AB6CA907 /* Cocoa.framework */; };
-		AEC663AB5B6D853ACC4F1E1B /* ProtocolConstantsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 64D0906427E75255EAFC5599 /* ProtocolConstantsTests.swift */; };
-		CFD9A182FEE68525B61627A6 /* FrameCodecTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 966F803F7C63508B8F8FE529 /* FrameCodecTests.swift */; };
+		00CF48938DD42E508BFC4984 /* FrameCodec.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7E8BF9F60B6A9D90E5B84594 /* FrameCodec.swift */; };
+		018FECCB89D45DA7A502E8F6 /* HexTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2B9D93A63D74F977A0B41AB /* HexTests.swift */; };
+		0C3C0D03BC0F5EBB0DC42C8E /* ProtocolConstants.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7F33005A752595CEB92257BE /* ProtocolConstants.swift */; };
+		23D092B0195FC44EEBCC9D08 /* ControlCodec.swift in Sources */ = {isa = PBXBuildFile; fileRef = BFFF336F12F52316871FF790 /* ControlCodec.swift */; };
+		38293C25AD7D01A6D0D07FE2 /* ProtocolError.swift in Sources */ = {isa = PBXBuildFile; fileRef = A701D2F2B150543D4ACC3CD7 /* ProtocolError.swift */; };
+		4D0525EB5F44CDFED16860B5 /* ControlMessage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7D9D42FFE4FA9B59D2EF635C /* ControlMessage.swift */; };
+		5DFB75E990A373255392DE65 /* ProtocolConstantsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B859D3AD2BA2CF73417AA659 /* ProtocolConstantsTests.swift */; };
+		98A3E2EDA3BC00AE44E07FE1 /* Hex.swift in Sources */ = {isa = PBXBuildFile; fileRef = 416D1A0E792A4D32DDA73521 /* Hex.swift */; };
+		9A01F289DF4119E2622244E7 /* ControlCodecTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = EEEBA0FC37470A88FE268D42 /* ControlCodecTests.swift */; };
+		B1BB1F1D1BBA86313018463F /* SharedMicApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CAADFB1DC4FFD46639861DD /* SharedMicApp.swift */; };
+		E9BBBD45A6D17C4497CFE4C5 /* Cocoa.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 1D3D80615D22BE05961B9D07 /* Cocoa.framework */; };
+		FBC0E75607BDBBE0E1DC1E8C /* Cocoa.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 1D3D80615D22BE05961B9D07 /* Cocoa.framework */; };
+		FE0D1336FB836325ECC37E5E /* FrameCodecTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C246ECD5D6D503C7786AF360 /* FrameCodecTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
-		9BD0306F130380FB6785237C /* PBXContainerItemProxy */ = {
+		9B2DBF6898A8834113488493 /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
-			containerPortal = 99E1C6D6899430AB8D3BACBE /* Project object */;
+			containerPortal = B66DA767918252BAC3C51E40 /* Project object */;
 			proxyType = 1;
-			remoteGlobalIDString = EC2905D6B25483DD296A53FC;
+			remoteGlobalIDString = F9CC4853247519507D7F852E;
 			remoteInfo = SharedMic;
 		};
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
-		02FF4069457C200998A2A97E /* HexTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = HexTests.swift; sourceTree = "<group>"; };
-		4FFD936CF0FCE7C9995FAC05 /* SharedMic.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = SharedMic.app; sourceTree = BUILT_PRODUCTS_DIR; };
-		58FCED8F46CB097EA4B121E3 /* SharedMicApp.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = SharedMicApp.swift; path = App/SharedMicApp.swift; sourceTree = "<group>"; };
-		64D0906427E75255EAFC5599 /* ProtocolConstantsTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ProtocolConstantsTests.swift; sourceTree = "<group>"; };
-		8954A1106B70F0ADFC97B90B /* SharedMicTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = SharedMicTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
-		966F803F7C63508B8F8FE529 /* FrameCodecTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = FrameCodecTests.swift; sourceTree = "<group>"; };
-		B4B5B4146D7F1324AB6CA907 /* Cocoa.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Cocoa.framework; path = Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.0.sdk/System/Library/Frameworks/Cocoa.framework; sourceTree = DEVELOPER_DIR; };
-		B66F72C68A1B95E724C5C3C8 /* ProtocolConstants.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ProtocolConstants.swift; path = Protocol/ProtocolConstants.swift; sourceTree = "<group>"; };
-		C705D1036A6EF71B83455E37 /* ProtocolError.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ProtocolError.swift; path = Protocol/ProtocolError.swift; sourceTree = "<group>"; };
-		D4BD6A45D6A582D1C4FA9F10 /* Hex.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = Hex.swift; path = Protocol/Hex.swift; sourceTree = "<group>"; };
-		EB092C9C85D6FBFD13FBF11C /* FrameCodec.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = FrameCodec.swift; path = Protocol/FrameCodec.swift; sourceTree = "<group>"; };
+		0494D004A760417CFCF9B6EF /* SharedMicTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = SharedMicTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		1D3D80615D22BE05961B9D07 /* Cocoa.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Cocoa.framework; path = Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.0.sdk/System/Library/Frameworks/Cocoa.framework; sourceTree = DEVELOPER_DIR; };
+		416D1A0E792A4D32DDA73521 /* Hex.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = Hex.swift; path = Protocol/Hex.swift; sourceTree = "<group>"; };
+		7D9D42FFE4FA9B59D2EF635C /* ControlMessage.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ControlMessage.swift; path = Protocol/ControlMessage.swift; sourceTree = "<group>"; };
+		7E8BF9F60B6A9D90E5B84594 /* FrameCodec.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = FrameCodec.swift; path = Protocol/FrameCodec.swift; sourceTree = "<group>"; };
+		7F33005A752595CEB92257BE /* ProtocolConstants.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ProtocolConstants.swift; path = Protocol/ProtocolConstants.swift; sourceTree = "<group>"; };
+		994BA78464406076DDD153C5 /* SharedMic.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = SharedMic.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		9CAADFB1DC4FFD46639861DD /* SharedMicApp.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = SharedMicApp.swift; path = App/SharedMicApp.swift; sourceTree = "<group>"; };
+		A2B9D93A63D74F977A0B41AB /* HexTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = HexTests.swift; sourceTree = "<group>"; };
+		A701D2F2B150543D4ACC3CD7 /* ProtocolError.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ProtocolError.swift; path = Protocol/ProtocolError.swift; sourceTree = "<group>"; };
+		B859D3AD2BA2CF73417AA659 /* ProtocolConstantsTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ProtocolConstantsTests.swift; sourceTree = "<group>"; };
+		BFFF336F12F52316871FF790 /* ControlCodec.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ControlCodec.swift; path = Protocol/ControlCodec.swift; sourceTree = "<group>"; };
+		C246ECD5D6D503C7786AF360 /* FrameCodecTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = FrameCodecTests.swift; sourceTree = "<group>"; };
+		EEEBA0FC37470A88FE268D42 /* ControlCodecTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ControlCodecTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
-		3B10681D1B1ED9968BF6D447 /* Frameworks */ = {
+		1D9D01A3B29BF58EC01ABEBA /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				A04FAC28DD714802204A9892 /* Cocoa.framework in Frameworks */,
+				FBC0E75607BDBBE0E1DC1E8C /* Cocoa.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		94490D6FD4CF2D50DAAA3E6A /* Frameworks */ = {
+		6240DF3A8E55098C20D8EF67 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				09CDD55B524931B5B112895D /* Cocoa.framework in Frameworks */,
+				E9BBBD45A6D17C4497CFE4C5 /* Cocoa.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
-		313271DF2C2077A75025CFD0 /* SharedMic */ = {
+		230487299994214879887394 /* SharedMic */ = {
 			isa = PBXGroup;
 			children = (
-				58FCED8F46CB097EA4B121E3 /* SharedMicApp.swift */,
-				EB092C9C85D6FBFD13FBF11C /* FrameCodec.swift */,
-				D4BD6A45D6A582D1C4FA9F10 /* Hex.swift */,
-				B66F72C68A1B95E724C5C3C8 /* ProtocolConstants.swift */,
-				C705D1036A6EF71B83455E37 /* ProtocolError.swift */,
+				9CAADFB1DC4FFD46639861DD /* SharedMicApp.swift */,
+				BFFF336F12F52316871FF790 /* ControlCodec.swift */,
+				7D9D42FFE4FA9B59D2EF635C /* ControlMessage.swift */,
+				7E8BF9F60B6A9D90E5B84594 /* FrameCodec.swift */,
+				416D1A0E792A4D32DDA73521 /* Hex.swift */,
+				7F33005A752595CEB92257BE /* ProtocolConstants.swift */,
+				A701D2F2B150543D4ACC3CD7 /* ProtocolError.swift */,
 			);
 			name = SharedMic;
 			path = SharedMic;
 			sourceTree = "<group>";
 		};
-		657C7F546EE2D5A67164F7E2 /* SharedMicTests */ = {
+		61F9D8D18CD78AD0B1CA9D5D = {
 			isa = PBXGroup;
 			children = (
-				966F803F7C63508B8F8FE529 /* FrameCodecTests.swift */,
-				02FF4069457C200998A2A97E /* HexTests.swift */,
-				64D0906427E75255EAFC5599 /* ProtocolConstantsTests.swift */,
+				97BBE162CF7161B43F828C91 /* Products */,
+				D86B84710E591052B0F36BDF /* Frameworks */,
+				230487299994214879887394 /* SharedMic */,
+				EA73DE913781C44ED3BF61D6 /* SharedMicTests */,
+			);
+			sourceTree = "<group>";
+		};
+		8D4A6656FD24D20800C2053C /* OS X */ = {
+			isa = PBXGroup;
+			children = (
+				1D3D80615D22BE05961B9D07 /* Cocoa.framework */,
+			);
+			name = "OS X";
+			sourceTree = "<group>";
+		};
+		97BBE162CF7161B43F828C91 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				994BA78464406076DDD153C5 /* SharedMic.app */,
+				0494D004A760417CFCF9B6EF /* SharedMicTests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		D86B84710E591052B0F36BDF /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				8D4A6656FD24D20800C2053C /* OS X */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+		EA73DE913781C44ED3BF61D6 /* SharedMicTests */ = {
+			isa = PBXGroup;
+			children = (
+				EEEBA0FC37470A88FE268D42 /* ControlCodecTests.swift */,
+				C246ECD5D6D503C7786AF360 /* FrameCodecTests.swift */,
+				A2B9D93A63D74F977A0B41AB /* HexTests.swift */,
+				B859D3AD2BA2CF73417AA659 /* ProtocolConstantsTests.swift */,
 			);
 			name = SharedMicTests;
 			path = SharedMicTests;
 			sourceTree = "<group>";
 		};
-		B02FB07DD5C692C90D0A017A /* OS X */ = {
-			isa = PBXGroup;
-			children = (
-				B4B5B4146D7F1324AB6CA907 /* Cocoa.framework */,
-			);
-			name = "OS X";
-			sourceTree = "<group>";
-		};
-		CBBACDCDF3AD63BEEC828930 /* Frameworks */ = {
-			isa = PBXGroup;
-			children = (
-				B02FB07DD5C692C90D0A017A /* OS X */,
-			);
-			name = Frameworks;
-			sourceTree = "<group>";
-		};
-		E0BB4A53F52A1F44E3A7AABE = {
-			isa = PBXGroup;
-			children = (
-				EE87ABC7436C078352BBFED5 /* Products */,
-				CBBACDCDF3AD63BEEC828930 /* Frameworks */,
-				313271DF2C2077A75025CFD0 /* SharedMic */,
-				657C7F546EE2D5A67164F7E2 /* SharedMicTests */,
-			);
-			sourceTree = "<group>";
-		};
-		EE87ABC7436C078352BBFED5 /* Products */ = {
-			isa = PBXGroup;
-			children = (
-				4FFD936CF0FCE7C9995FAC05 /* SharedMic.app */,
-				8954A1106B70F0ADFC97B90B /* SharedMicTests.xctest */,
-			);
-			name = Products;
-			sourceTree = "<group>";
-		};
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
-		5C0211CC9C8FE0C44E8A7B15 /* SharedMicTests */ = {
+		9BD90C9E0964FB1E7599D7A6 /* SharedMicTests */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = 951C922F5FB9CB918B592C8F /* Build configuration list for PBXNativeTarget "SharedMicTests" */;
+			buildConfigurationList = 23D286372EF614EA0A52AB75 /* Build configuration list for PBXNativeTarget "SharedMicTests" */;
 			buildPhases = (
-				B327717517E43E96673B207C /* Sources */,
-				94490D6FD4CF2D50DAAA3E6A /* Frameworks */,
-				FC4F9A46B65C6EC9132849D4 /* Resources */,
+				1B257636BEFE68182BDE207E /* Sources */,
+				6240DF3A8E55098C20D8EF67 /* Frameworks */,
+				4609B4222DECC96E58C32AB4 /* Resources */,
 			);
 			buildRules = (
 			);
 			dependencies = (
-				EFE2C49F748EC5E114145AA5 /* PBXTargetDependency */,
+				07A46744868CDE45CBEE67D5 /* PBXTargetDependency */,
 			);
 			name = SharedMicTests;
 			productName = SharedMicTests;
-			productReference = 8954A1106B70F0ADFC97B90B /* SharedMicTests.xctest */;
+			productReference = 0494D004A760417CFCF9B6EF /* SharedMicTests.xctest */;
 			productType = "com.apple.product-type.bundle.unit-test";
 		};
-		EC2905D6B25483DD296A53FC /* SharedMic */ = {
+		F9CC4853247519507D7F852E /* SharedMic */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = E5982F03D0E8D296625A880D /* Build configuration list for PBXNativeTarget "SharedMic" */;
+			buildConfigurationList = 52F893F08901322D8FAB1A28 /* Build configuration list for PBXNativeTarget "SharedMic" */;
 			buildPhases = (
-				4862777F84BDE92B153FFBD0 /* Sources */,
-				3B10681D1B1ED9968BF6D447 /* Frameworks */,
-				8E1CCC9A6129EC4731F9C84C /* Resources */,
+				9DFFC194A821BBC8A9A110AA /* Sources */,
+				1D9D01A3B29BF58EC01ABEBA /* Frameworks */,
+				B8FDD749E31929D9C710BEC2 /* Resources */,
 			);
 			buildRules = (
 			);
@@ -157,19 +166,19 @@
 			);
 			name = SharedMic;
 			productName = SharedMic;
-			productReference = 4FFD936CF0FCE7C9995FAC05 /* SharedMic.app */;
+			productReference = 994BA78464406076DDD153C5 /* SharedMic.app */;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
-		99E1C6D6899430AB8D3BACBE /* Project object */ = {
+		B66DA767918252BAC3C51E40 /* Project object */ = {
 			isa = PBXProject;
 			attributes = {
 				LastSwiftUpdateCheck = 1600;
 				LastUpgradeCheck = 1600;
 			};
-			buildConfigurationList = 6075AC2AF172DF2D3E0BFEA8 /* Build configuration list for PBXProject "SharedMic" */;
+			buildConfigurationList = DBC39FD1C82A3E5E9B9EB683 /* Build configuration list for PBXProject "SharedMic" */;
 			compatibilityVersion = "Xcode 3.2";
 			developmentRegion = en;
 			hasScannedForEncodings = 0;
@@ -177,28 +186,28 @@
 				en,
 				Base,
 			);
-			mainGroup = E0BB4A53F52A1F44E3A7AABE;
+			mainGroup = 61F9D8D18CD78AD0B1CA9D5D;
 			minimizedProjectReferenceProxies = 0;
 			preferredProjectObjectVersion = 77;
-			productRefGroup = EE87ABC7436C078352BBFED5 /* Products */;
+			productRefGroup = 97BBE162CF7161B43F828C91 /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
-				EC2905D6B25483DD296A53FC /* SharedMic */,
-				5C0211CC9C8FE0C44E8A7B15 /* SharedMicTests */,
+				F9CC4853247519507D7F852E /* SharedMic */,
+				9BD90C9E0964FB1E7599D7A6 /* SharedMicTests */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
-		8E1CCC9A6129EC4731F9C84C /* Resources */ = {
+		4609B4222DECC96E58C32AB4 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		FC4F9A46B65C6EC9132849D4 /* Resources */ = {
+		B8FDD749E31929D9C710BEC2 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -208,97 +217,64 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
-		4862777F84BDE92B153FFBD0 /* Sources */ = {
+		1B257636BEFE68182BDE207E /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				58BD80873E593314B053BED6 /* SharedMicApp.swift in Sources */,
-				2B1A695A9C8BA18FFD101A4C /* FrameCodec.swift in Sources */,
-				6D2486ED10EBC14C3A7E25CF /* Hex.swift in Sources */,
-				84CBE631F8B82154E273BF2F /* ProtocolConstants.swift in Sources */,
-				1DF765068CEBFC0DF035898A /* ProtocolError.swift in Sources */,
+				9A01F289DF4119E2622244E7 /* ControlCodecTests.swift in Sources */,
+				FE0D1336FB836325ECC37E5E /* FrameCodecTests.swift in Sources */,
+				018FECCB89D45DA7A502E8F6 /* HexTests.swift in Sources */,
+				5DFB75E990A373255392DE65 /* ProtocolConstantsTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		B327717517E43E96673B207C /* Sources */ = {
+		9DFFC194A821BBC8A9A110AA /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				CFD9A182FEE68525B61627A6 /* FrameCodecTests.swift in Sources */,
-				15711FCE4DF44663EDBAE225 /* HexTests.swift in Sources */,
-				AEC663AB5B6D853ACC4F1E1B /* ProtocolConstantsTests.swift in Sources */,
+				B1BB1F1D1BBA86313018463F /* SharedMicApp.swift in Sources */,
+				23D092B0195FC44EEBCC9D08 /* ControlCodec.swift in Sources */,
+				4D0525EB5F44CDFED16860B5 /* ControlMessage.swift in Sources */,
+				00CF48938DD42E508BFC4984 /* FrameCodec.swift in Sources */,
+				98A3E2EDA3BC00AE44E07FE1 /* Hex.swift in Sources */,
+				0C3C0D03BC0F5EBB0DC42C8E /* ProtocolConstants.swift in Sources */,
+				38293C25AD7D01A6D0D07FE2 /* ProtocolError.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
-		EFE2C49F748EC5E114145AA5 /* PBXTargetDependency */ = {
+		07A46744868CDE45CBEE67D5 /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
 			name = SharedMic;
-			target = EC2905D6B25483DD296A53FC /* SharedMic */;
-			targetProxy = 9BD0306F130380FB6785237C /* PBXContainerItemProxy */;
+			target = F9CC4853247519507D7F852E /* SharedMic */;
+			targetProxy = 9B2DBF6898A8834113488493 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
-		0DB71A211ACE2269DB7EE4DE /* Release */ = {
+		2388E4C4400F9D81B90CE16B /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				ALWAYS_SEARCH_USER_PATHS = NO;
-				CLANG_ANALYZER_NONNULL = YES;
-				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
-				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
-				CLANG_CXX_LIBRARY = "libc++";
-				CLANG_ENABLE_MODULES = YES;
-				CLANG_ENABLE_OBJC_ARC = YES;
-				CLANG_ENABLE_OBJC_WEAK = YES;
-				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
-				CLANG_WARN_BOOL_CONVERSION = YES;
-				CLANG_WARN_COMMA = YES;
-				CLANG_WARN_CONSTANT_CONVERSION = YES;
-				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
-				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
-				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
-				CLANG_WARN_EMPTY_BODY = YES;
-				CLANG_WARN_ENUM_CONVERSION = YES;
-				CLANG_WARN_INFINITE_RECURSION = YES;
-				CLANG_WARN_INT_CONVERSION = YES;
-				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
-				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
-				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
-				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
-				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
-				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
-				CLANG_WARN_STRICT_PROTOTYPES = YES;
-				CLANG_WARN_SUSPICIOUS_MOVE = YES;
-				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
-				CLANG_WARN_UNREACHABLE_CODE = YES;
-				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
-				COPY_PHASE_STRIP = NO;
-				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
-				ENABLE_NS_ASSERTIONS = NO;
-				ENABLE_STRICT_OBJC_MSGSEND = YES;
-				GCC_C_LANGUAGE_STANDARD = gnu11;
-				GCC_NO_COMMON_BLOCKS = YES;
-				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
-				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
-				GCC_WARN_UNDECLARED_SELECTOR = YES;
-				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
-				GCC_WARN_UNUSED_FUNCTION = YES;
-				GCC_WARN_UNUSED_VARIABLE = YES;
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				ENABLE_HARDENED_RUNTIME = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = SharedMic/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/../Frameworks";
 				MACOSX_DEPLOYMENT_TARGET = 14.4;
-				MTL_ENABLE_DEBUG_INFO = NO;
-				MTL_FAST_MATH = YES;
-				PRODUCT_NAME = "$(TARGET_NAME)";
+				PRODUCT_BUNDLE_IDENTIFIER = com.sharedmic.SharedMic;
+				PRODUCT_NAME = SharedMic;
 				SDKROOT = macosx;
-				SWIFT_COMPILATION_MODE = wholemodule;
-				SWIFT_OPTIMIZATION_LEVEL = "-O";
 				SWIFT_VERSION = 5.0;
 			};
 			name = Release;
 		};
-		9A6DF189CCF6CF246A96AD0A /* Debug */ = {
+		3BBFD86B7BF424162738EA0B /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
@@ -361,7 +337,63 @@
 			};
 			name = Debug;
 		};
-		A9670EA23A2F43482DA323AF /* Debug */ = {
+		3E3BDE61066F3DE0C0AF65EF /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 14.4;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+		49ECC60444CA980D6E29D6DF /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
@@ -375,9 +407,9 @@
 				SWIFT_VERSION = 5.0;
 				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/SharedMic.app/Contents/MacOS/SharedMic";
 			};
-			name = Debug;
+			name = Release;
 		};
-		D72E75A1BB34A20B72244414 /* Debug */ = {
+		8CD9FC0845A92390D3EC2451 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
@@ -397,27 +429,7 @@
 			};
 			name = Debug;
 		};
-		DD21A5E4F06C0B17BD7260C5 /* Release */ = {
-			isa = XCBuildConfiguration;
-			buildSettings = {
-				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
-				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
-				CODE_SIGN_IDENTITY = "-";
-				CODE_SIGN_STYLE = Automatic;
-				COMBINE_HIDPI_IMAGES = YES;
-				ENABLE_HARDENED_RUNTIME = YES;
-				GENERATE_INFOPLIST_FILE = NO;
-				INFOPLIST_FILE = SharedMic/Info.plist;
-				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/../Frameworks";
-				MACOSX_DEPLOYMENT_TARGET = 14.4;
-				PRODUCT_BUNDLE_IDENTIFIER = com.sharedmic.SharedMic;
-				PRODUCT_NAME = SharedMic;
-				SDKROOT = macosx;
-				SWIFT_VERSION = 5.0;
-			};
-			name = Release;
-		};
-		E9065C7C8DBEB1DBE20CAF26 /* Release */ = {
+		EEE6C26998CBE4D53B07A19D /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
@@ -431,39 +443,39 @@
 				SWIFT_VERSION = 5.0;
 				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/SharedMic.app/Contents/MacOS/SharedMic";
 			};
-			name = Release;
+			name = Debug;
 		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
-		6075AC2AF172DF2D3E0BFEA8 /* Build configuration list for PBXProject "SharedMic" */ = {
+		23D286372EF614EA0A52AB75 /* Build configuration list for PBXNativeTarget "SharedMicTests" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
-				9A6DF189CCF6CF246A96AD0A /* Debug */,
-				0DB71A211ACE2269DB7EE4DE /* Release */,
+				49ECC60444CA980D6E29D6DF /* Release */,
+				EEE6C26998CBE4D53B07A19D /* Debug */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		951C922F5FB9CB918B592C8F /* Build configuration list for PBXNativeTarget "SharedMicTests" */ = {
+		52F893F08901322D8FAB1A28 /* Build configuration list for PBXNativeTarget "SharedMic" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
-				E9065C7C8DBEB1DBE20CAF26 /* Release */,
-				A9670EA23A2F43482DA323AF /* Debug */,
+				2388E4C4400F9D81B90CE16B /* Release */,
+				8CD9FC0845A92390D3EC2451 /* Debug */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		E5982F03D0E8D296625A880D /* Build configuration list for PBXNativeTarget "SharedMic" */ = {
+		DBC39FD1C82A3E5E9B9EB683 /* Build configuration list for PBXProject "SharedMic" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
-				DD21A5E4F06C0B17BD7260C5 /* Release */,
-				D72E75A1BB34A20B72244414 /* Debug */,
+				3BBFD86B7BF424162738EA0B /* Debug */,
+				3E3BDE61066F3DE0C0AF65EF /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
 	};
-	rootObject = 99E1C6D6899430AB8D3BACBE /* Project object */;
+	rootObject = B66DA767918252BAC3C51E40 /* Project object */;
 }
