@@ -38,6 +38,11 @@ correction**.
 
 - One USB-A microphone attached to Windows is usable from Windows and macOS without a hardware switch.
 - Both machines may use it at the same time.
+- **More than one Mac may be paired with the Windows host, and all of them may be connected at
+  once — but at most one holds an active microphone session at any moment.** A `START` from a
+  second Mac while another holds the session is refused with a clear reason naming the holder; it
+  does not disconnect anyone and does not interrupt the session in progress. See §7.1 for pairing
+  and `protocol/protocol-v1.md` §7 for the session rule.
 - No manual switching during normal operation.
 - Microphone audio is transmitted only while macOS has active input demand **on the shared virtual
   device**.
@@ -65,7 +70,14 @@ correction**.
 - Studio-quality monitoring or musical performance.
 - Multi-user conferencing or WAN traversal.
 - Replacing the Windows microphone with a virtual device.
-- More than one remote Mac.
+- **Streaming the microphone to several Macs simultaneously.** Multiple Macs may be *paired* and
+  *connected* (§2.1), and they take turns: exactly one session is active at a time, and a second
+  Mac's request is refused while another holds it. Fan-out — one capture feeding two or more remote
+  Macs at once — is out of scope. It is not a protocol change but an audio-path change: the capture
+  path would need reference counting (who still wants the microphone, and when does capture
+  actually stop), a send queue and drop accounting per subscriber, and a demand model where "idle"
+  is the absence of demand from *every* Mac rather than from the one. That is a materially different
+  design against the zero-idle-bytes guarantee, and nothing in this project needs it.
 - Echo cancellation, noise suppression, gain control, or transcription.
 - A custom macOS audio driver.
 
@@ -102,13 +114,22 @@ Windows listens on **TCP 47800** (configurable), bound to private interfaces onl
 client. The connection is established whenever both machines are awake and stays up; it carries
 control messages and, when a session is active, audio.
 
+The diagram shows one Mac because that is the common case, not because it is the limit. Windows
+serves **every paired Mac that is connected, concurrently** — each with its own connection, its own
+control and audio queues, and its own view of status. What the extra Macs do not each get is a
+session: the single `MicCaptureService` and `SessionStateMachine` on the left of the diagram are
+per host, so one Mac streams at a time and the others are told the microphone is busy (§7.1,
+`protocol/protocol-v1.md` §7).
+
 ### 3.1 Module boundaries
 
 Three units hold the logic that is easy to get wrong. All three are pure — no I/O, no platform
 APIs — and all three carry real unit tests:
 
 - **`PcmNormalizer`** (Windows) — device mix format to 48 kHz / mono / s16le.
-- **`SessionStateMachine`** (Windows) — session lifecycle as a pure transition function.
+- **`SessionStateMachine`** (Windows) — session lifecycle as a pure transition function, including
+  which connection holds the single session and therefore which `START`s are granted and which are
+  refused as busy.
 - **`PCMRingBuffer`** (macOS) — lock-free single-producer/single-consumer ring.
 
 Everything touching WASAPI, Core Audio, or sockets is a thin shell around these. Network code never
@@ -124,9 +145,10 @@ application with launch-at-login.
 | `DeviceManager` | Resolve and persist the MMDevice endpoint ID; watch arrival/removal | Network, sessions |
 | `MicCaptureService` | Own the WASAPI shared-mode client; emit frames to a bounded channel | Network, protocol |
 | `PcmNormalizer` | Format conversion (pure) | Everything else |
-| `SessionStateMachine` | Session lifecycle (pure) | I/O |
-| `ControlConnection` | TLS, framing, priority send queue, heartbeat, auth | Audio semantics |
-| `TrayApp` | Status UI, device picker, level meter, pairing display | Protocol details |
+| `SessionStateMachine` | Session lifecycle and single-holder arbitration (pure); one instance per host | I/O |
+| `PairedDeviceStore` | The paired-device list: per-device token, friendly name, paired-at; add, revoke, and verify a `HELLO` proof against every stored token | Sockets, sessions |
+| `ControlConnection` | TLS, framing, priority send queue, heartbeat, auth — **one instance per connected Mac** | Audio semantics |
+| `TrayApp` | Status UI, device picker, level meter, pairing display, paired-device list and session holder | Protocol details |
 
 ### 3.3 macOS agent
 
@@ -245,16 +267,33 @@ The Mac reconnects with exponential backoff from **0.5 s to a 30 s cap**, jitter
 | `HELLO_ACK` | Win → Mac | Server identity, microphone status |
 | `START` | Mac → Win | Request an active session |
 | `START_ACK` | Win → Mac | Session ID, negotiated format |
-| `START_NACK` | Win → Mac | Reason (e.g. `MIC_UNAVAILABLE`) |
+| `START_NACK` | Win → Mac | Reason (`MIC_UNAVAILABLE`, or `SESSION_IN_USE` with the holder's friendly name in `holderName`) |
 | `STOP` | Mac → Win | End the active session |
 | `STOP_ACK` | Win → Mac | Session ended |
 | `STATUS` | Win → Mac | Mic presence, active state, device label |
 | `PING` / `PONG` | Both | Connection health |
 
-`START` and `STOP` are idempotent. A duplicate `START` while active returns the current session
-info; a duplicate `STOP` while idle returns success. This makes reconnect and retry safe.
+`START` and `STOP` are idempotent **for the connection that holds the session**. A duplicate `START`
+on that connection returns the current session info; a duplicate `STOP` while idle returns success.
+This makes reconnect and retry safe.
 
-The full wire contract lives in `protocol/protocol-v1.md`, written in Phase 0.
+Idempotency does not cross connections, and with several Macs paired that distinction carries the
+whole multi-device design:
+
+- A `START` from a Mac while a **different** Mac holds the session is not a duplicate. It is
+  refused with `START_NACK{reason: SESSION_IN_USE, holderName}` — immediately, with no queueing and
+  no preemption of the holder.
+- A `STOP` from a Mac that does not hold the session ends nothing. It is answered with `STOP_ACK`
+  and leaves the holder's audio uninterrupted. A session ID is not a capability.
+- **A session ends when its control connection closes, not only on `STOP`.** A Mac that crashes,
+  sleeps, or drops off the network releases the microphone the moment Windows sees the socket
+  close — otherwise it would hold every other paired Mac off until the 45 s dead-peer timer
+  (§4.3) expired. Dead-peer expiry releases it too; it is the backstop for a peer that vanished
+  without a visible close, not the normal path.
+
+The full wire contract lives in `protocol/protocol-v1.md`, written in Phase 0 — §5 for
+`START_NACK`'s reasons and the `holderName` field, §6 for concurrent authenticated connections, §7
+for the one-session rule and the release-on-close requirement.
 
 ---
 
@@ -415,6 +454,17 @@ pass, each Raycast release cleared cleanly with no observed re-appearance, and n
 debounce is retained as cheap insurance, and Phase 3 should measure whether it fires at all. Note
 that it is no defence against the Sound Settings false positive described in §5.1, which is
 persistent rather than transient.
+
+**`START_NACK{SESSION_IN_USE}` takes the same `STARTING → DEGRADED` edge as any other `START_NACK`,
+but it is not the same event to the user.** The transition is deliberately unchanged — the Mac has
+demand it cannot satisfy, it is rendering silence, and §5.5's notification policy (alert on
+`DEGRADED` while demand is active) is exactly right for it. What differs is the message: this is
+"another Mac is using the microphone", named with `holderName` when the refusal carried one and
+worded generically when it did not, rather than a fault the user is expected to fix on this machine.
+Recovery is also ordinary rather than special: nothing pushes "the microphone is free now", so the
+Mac leaves `DEGRADED` the way it does after any other refusal — the next time demand is present and
+it retries `START`. Do not build a waiting queue, a polling loop faster than the demand signal, or
+any form of automatic preemption of the other Mac.
 
 ### 5.3 Kill switch
 
@@ -667,12 +717,29 @@ long sessions stable indefinitely.
 ### 7.1 Pairing
 
 Windows generates a self-signed P-256 device certificate on first run, with the private key
-DPAPI-protected. The tray displays a pairing string encoding a random 256-bit token. The user
-enters the host address and that string on the Mac once. At that moment the Mac pins the server
-certificate fingerprint and stores the token and fingerprint in the Keychain.
+DPAPI-protected. **One certificate serves the host, for every paired Mac** — pairing another Mac
+never regenerates it, because doing so would break the pins of the Macs already paired.
 
-The pairing string's exact encoding and the certificate's required profile — both of which two
-implementers would otherwise each invent differently — are specified in `protocol/protocol-v1.md`
+**Windows keeps a list of paired devices, one entry per Mac, and each entry has its own token.**
+Pairing a Mac generates a fresh random 256-bit token for that device and records it alongside a
+friendly name and the paired-at timestamp. The tray displays that device's pairing string; the user
+enters the host address and that string on the Mac once. At that moment the Mac pins the server
+certificate fingerprint and stores its own token and the fingerprint in the Keychain.
+
+Three properties of that list are requirements, not implementation latitude:
+
+- **Fresh token per device.** Two paired Macs never share a token, and one is never derived from
+  another. Re-pairing a device issues it a new token and leaves the other entries alone.
+- **Individually revocable.** Removing one device's entry must not disturb any other device: the
+  rest keep connecting with no user action, no re-pairing, and no new pairing strings. Revoking a
+  device must also drop its live connection and release its session if it held one, so revocation
+  takes effect now rather than at that device's next reconnect.
+- **Tokens are stored with the same protection as the certificate private key.** A list of 256-bit
+  keys in the clear is the same mistake as one key in the clear.
+
+The pairing string's exact encoding — unchanged by any of this; it is 32 bytes of secret and
+carries no device identifier — and the certificate's required profile, both of which two
+implementers would otherwise each invent differently, are specified in `protocol/protocol-v1.md`
 §11. Implement against that section, not against this paragraph.
 
 ### 7.2 Authentication
@@ -681,11 +748,24 @@ On each connection:
 
 1. Windows sends `GREETING{serverId, nonce}`.
 2. The Mac replies `HELLO{version, clientId, mac: HMAC-SHA256(token, nonce)}`.
-3. Windows verifies and replies `HELLO_ACK`.
+3. Windows verifies the proof **against each stored token in turn**; the entry that matches is the
+   device, and Windows replies `HELLO_ACK`. No match is an authentication failure and the
+   connection is closed.
 
-The token itself never crosses the wire, and the nonce makes the proof replay-resistant. Failed
-authentication is rate-limited to 5 attempts followed by a 30 s lockout — see
-`protocol/protocol-v1.md` §11.4 for what counts as an attempt and why the limit is not optional.
+The token itself never crosses the wire, and the nonce makes the proof replay-resistant.
+
+**Trial verification is the whole identification mechanism, and there is no lookup by identifier.**
+`HELLO` arrives before anything has been verified, so **`clientId` is a display label and is
+explicitly untrusted**: it must never be used to choose which token to check, to grant or scope
+anything, or to name the device anywhere a user might act on the name. Any name Windows shows for a
+connected Mac comes from the paired-device list entry whose token verified the proof. This is
+called out because `clientId` is precisely the field an implementer reaches for once several Macs
+are paired and something has to tell them apart — and it is attacker-controlled. See
+`protocol/protocol-v1.md` §5 (`HELLO`) and §6 step 3.
+
+Failed authentication is rate-limited to 5 attempts followed by a 30 s lockout — see
+`protocol/protocol-v1.md` §11.4 for what counts as an attempt (one connection is one attempt, no
+matter how many stored tokens were tried against it) and why the limit is not optional.
 
 ### 7.3 Rules
 
@@ -694,6 +774,10 @@ authentication is rate-limited to 5 attempts followed by a 30 s lockout — see
 - **A certificate fingerprint mismatch is a hard stop** — no auto-retry, no silent re-pair, a
   prominent warning, and re-pairing requires explicit user action. This is the one failure that can
   indicate an active attacker, and silently healing it would defeat the entire purpose of pinning.
+- **A device is whichever paired token verified its proof — nothing else.** No field a peer sends
+  before authentication (`clientId` above all) may select a token, identify a device, or grant
+  access. A device is authorised only for what any paired device may do; there are no per-device
+  privileges to escalate to, and the session is taken first-come rather than by rank.
 - Audio payload is never logged or persisted. Logs contain lifecycle events and counters only.
 
 ---
@@ -705,7 +789,10 @@ authentication is rate-limited to 5 attempts followed by a 30 s lockout — see
 | Windows agent unreachable | Mac renders silence into BlackHole, enters `DEGRADED`, reconnects with backoff. Notification only if demand was active (§5.5). Under the §3.4 configuration this affects only applications that explicitly target BlackHole; applications on the system default input are unaffected. |
 | USB mic unplugged while idle | Windows sends `STATUS{micPresent: false}`. Mac stays connected; activation is blocked with a clear reason. |
 | USB mic unplugged mid-session | Windows stops capture and sends `STATUS`. Mac enters `DEGRADED` and notifies. On replug, auto-restarts if demand is still active. |
-| Network drops mid-session | Mac renders silence, reconnects, reissues `START` if demand persists. |
+| Network drops mid-session | Mac renders silence, reconnects, reissues `START` if demand persists. On the Windows side the closed connection ends its session immediately — capture stops and the microphone is available to another paired Mac at once, not after the 45 s dead-peer timer. |
+| Session holder crashes, sleeps, or is force-quit mid-session | Same as above from Windows' side: **the session ends when its control connection closes**, so capture stops and the microphone is released the moment the socket goes. No `STOP` is needed or expected. If the peer vanishes without a visible close, the 45 s dead-peer timer (§4.3) releases it as a backstop. |
+| A second Mac requests the microphone while another holds it | Windows answers `START_NACK{SESSION_IN_USE, holderName}`. Nobody is disconnected, the holder's session is untouched, and the requesting Mac enters `DEGRADED` with a message naming the holder (§5.2). It retries only when its own demand next asks. |
+| A paired device is revoked while connected | Windows drops that device's connection and releases its session if it held one. Every other paired Mac is unaffected — no re-pairing, no new pairing string, no interruption. |
 | Mac sleeps | Sockets closed cleanly where possible. On wake, reconnect and **recompute demand from scratch** — a stale count must never be trusted across a sleep. |
 | Windows sleeps or reboots | Mac retries with backoff. No manual repair. |
 | BlackHole missing or uninstalled while running | Activation blocked, distinct error state, setup guidance in the menu. |
@@ -752,6 +839,17 @@ authentication is rate-limited to 5 attempts followed by a 30 s lockout — see
 - [ ] Mac and Windows sleep/wake recover without reconfiguration.
 - [ ] USB microphone unplug and replug recovers without restarting either application.
 - [ ] A tampered or mismatched certificate fingerprint blocks the connection and warns the user.
+- [ ] **Two Macs paired to one Windows host, each with its own pairing string, are connected at the
+      same time and both show as connected.** Neither disconnects the other, and each authenticates
+      with only its own token.
+- [ ] **With one Mac streaming, the other's `START` is refused with `SESSION_IN_USE` naming the
+      holder,** the streaming Mac's audio is uninterrupted, and the refused Mac receives zero audio
+      bytes.
+- [ ] **Killing the streaming Mac's agent without a `STOP` frees the microphone immediately** — the
+      second Mac's next `START` succeeds in well under the 45 s dead-peer window, and Windows'
+      microphone-in-use indicator goes out.
+- [ ] **Revoking one paired device leaves the other working** with no re-pairing, and the revoked
+      device can no longer authenticate.
 - [ ] No microphone PCM is written to disk or to any application log.
 
 ---
@@ -772,6 +870,10 @@ authentication is rate-limited to 5 attempts followed by a 30 s lockout — see
 | 10-minute idle | No PCM transport | Byte counter = 0 | P0 |
 | **ManyCam/Teams input opened** | **No START sent** | **False-start count = 0** | **P0** |
 | **Kill switch engaged, app requests input** | **No START sent** | **Byte counter = 0** | **P0** |
+| **Two paired Macs connected simultaneously** | Both authenticated, neither disconnects the other | Unexpected disconnects = 0 | **P0** |
+| **Second Mac requests while first is streaming** | `START_NACK{SESSION_IN_USE}` with holder name; first Mac's audio uninterrupted | Bytes received by second Mac = 0; gaps in first Mac's stream = 0 | **P0** |
+| **Streaming Mac killed without `STOP`** | Windows releases the session on socket close; second Mac's `START` then succeeds | Time to microphone available (must be ≪ 45 s) | **P0** |
+| Paired device revoked while connected | Connection dropped, session released; other device unaffected | Other device's interruptions = 0 | P1 |
 | Mic unplug / replug | Recover | Time to healthy | P0 |
 | Force-on hold expiry | Session ends at expiry | Elapsed vs configured | P1 |
 | Mac sleep / wake | Reconnect, demand recomputed | Manual actions = 0 | P1 |
@@ -787,7 +889,11 @@ authentication is rate-limited to 5 attempts followed by a 30 s lockout — see
 - **`PcmNormalizer`** — golden vectors covering float32 stereo 44.1 kHz → s16le mono 48 kHz, all
   three channel modes, and clipping behavior at full scale.
 - **`SessionStateMachine`** — every transition, including debounce expiry and cancellation, hold
-  expiry, kill-switch entry from each state, and idempotent duplicate `START`/`STOP`.
+  expiry, kill-switch entry from each state, and idempotent duplicate `START`/`STOP`. On the
+  Windows side this unit also owns single-holder arbitration, so its tests must cover: `START` from
+  a second connection while a session is active (refused, holder untouched), `STOP` from a
+  non-holder (no effect), the holder's connection closing without a `STOP` (session released), and
+  a subsequent `START` from another connection being granted a fresh session.
 - **`PCMRingBuffer`** — SPSC correctness, wraparound, underrun zero-fill, and drift-correction
   insert/drop.
 
@@ -797,12 +903,34 @@ A test double that speaks the wire protocol on both sides, so the Windows and ma
 built and tested independently without the other machine present. Written in Phase 0, before either
 implementation.
 
+**It does not cover any of the multi-device behavior above, and a green run is no evidence about
+it.** The mock Windows server holds exactly one token, never reads `clientId`, and gives every
+connection its own independent session with its own audio loop — so an implementation that supports
+one paired device, trusts `clientId` as an identity, streams to two Macs at once, and leaks sessions
+past their connections passes the entire suite. Those behaviors need local tests on each platform;
+`protocol/protocol-v1.md` §7 lists the specific ones to write.
+
 ---
 
 ## 11. Observability
 
 Windows tray and Mac menu bar both show: Disconnected, Idle, Starting, Streaming, Degraded,
 Disabled, and Held (force-on, with time remaining).
+
+**The Windows tray additionally shows the paired-device list and who holds the microphone**, since
+with several Macs paired "Streaming" alone no longer says enough:
+
+- **Every paired device**, by friendly name, with its paired-at date and whether it is currently
+  connected — and a way to revoke one. A device the user does not recognise in that list is the
+  signal that matters most, and it is invisible if the list is not shown.
+- **Which device holds the active session**, by friendly name, and for how long. "The microphone is
+  in use" without a name is unactionable when the answer could be either of two machines.
+- **Which devices are connected but idle.** These carry zero audio by design (§4.4), and showing
+  them idle rather than not showing them at all is what makes that verifiable.
+
+The Mac menu bar shows the reason it is not streaming when that reason is another device: the
+holder's name from `START_NACK{SESSION_IN_USE}`, or generic wording when the refusal carried no
+name.
 
 Counters exposed in a diagnostics view:
 
@@ -812,6 +940,8 @@ Counters exposed in a diagnostics view:
 - Jitter buffer depth, underrun count, drift corrections applied
 - Frames dropped at the send queue
 - Reconnect count, authentication failures
+- **Sessions refused as `SESSION_IN_USE`, and by which device** — a count that climbs steadily means
+  two Macs are contending for the microphone often enough that the user should know
 - **Current demand process count, and the bundle identifier of each process holding BlackHole** —
   not just the count. The Phase 0 pass found processes that legitimately carry BlackHole without the
   user thinking of themselves as recording (§5.1), and a bare count of 1 is unattributable while a
@@ -845,7 +975,13 @@ since been supplied by the owner and are recorded in §6.1 and the findings docu
 design consequences the mix format carries (§6.1, §12 Phase 2).
 
 **Phase 1 — Transport and security.** Single TLS channel, certificate generation, pairing, HMAC
-auth, framing, priority send queue, heartbeat, reconnect. Both ends. No audio yet.
+auth, framing, priority send queue, heartbeat, reconnect. Both ends. No audio yet. Phase 1 also
+carries the multi-device work, because it is all in the connection layer: the **paired-device list**
+(per-device token, friendly name, paired-at, add and revoke), **trial verification** of a `HELLO`
+proof against every stored token, **concurrent authenticated connections**, and the **single-holder
+session arbiter** — `START_NACK{SESSION_IN_USE, holderName}`, `STOP` scoped to the holder, and
+release of the session when its connection closes. The conformance harness covers none of it
+(§10.2), so these need real tests on each platform rather than a green harness run.
 
 **Phase 2 — Audio path.** Windows capture and normalization, Mac render to BlackHole, manual
 START/STOP from the menu. Validate quality, measure latency, set the prefill figure, verify drift
