@@ -32,7 +32,10 @@ public struct ReconnectPolicy {
         attempt += 1
         let clamped = min(max(randomFraction, 0.0), 1.0)
         let multiplier = (1.0 - jitterFraction) + (2.0 * jitterFraction * clamped)
-        return base * multiplier
+        let jittered = base * multiplier
+        // Design spec §4.3's 30 s cap is a hard ceiling, not a pre-jitter base:
+        // clamp the final jittered result into [initialDelay, maxDelay].
+        return min(max(jittered, initialDelay), maxDelay)
     }
 
     public mutating func nextDelay() -> TimeInterval {
