@@ -29,4 +29,11 @@ final class HexTests: XCTestCase {
         XCTAssertNil(Hex.decode("zz"))
         XCTAssertNil(Hex.decode("00 11"))
     }
+
+    func testDecodeRejectsFullwidthUnicodeDigits() {
+        // U+FF11 "1" and U+FF12 "2" satisfy Unicode's Hex_Digit property (Character.hexDigitValue
+        // would accept them) but are not ASCII '1' and '2'. Only [0-9a-fA-F] is valid.
+        XCTAssertNil(Hex.decode("\u{FF11}\u{FF12}"))
+        XCTAssertNil(Hex.decode("\u{FF21}b"))
+    }
 }
