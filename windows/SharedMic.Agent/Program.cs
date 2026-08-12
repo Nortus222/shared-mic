@@ -109,24 +109,35 @@ public static class Program
             //     TrayApp.SetStatus checks IsDisposed / IsHandleCreated and
             //     drops the update instead of throwing.
             //
-            // AgentLog.Info is a lock-free console write and tray?.SetStatus is
-            // a post; neither blocks.
+            // Both calls below satisfy that. AgentLog.Info takes only a short,
+            // leaf-level lock of its own (AgentLog.Gate, around one
+            // Console.WriteLine) and never re-enters the listener, so it cannot
+            // close a lock cycle; tray?.SetStatus is a post. Note the
+            // pre-existing hazard the logging call carries into this critical
+            // section though: a console write that BLOCKS - conhost QuickEdit
+            // text selection pausing output is the everyday case - stalls this
+            // thread while it still holds the listener's _gate.
             (status, detail) =>
             {
                 AgentLog.Info($"status: {status}{(string.IsNullOrWhiteSpace(detail) ? string.Empty : $" ({detail})")}");
-                tray?.SetStatus(status, detail);
+
+                // The listener publishes Disconnected with no detail. The port
+                // is the one thing a user staring at a disconnected tray wants,
+                // so it is filled in here rather than latching whatever the
+                // startup status happened to say.
+                var shown = string.IsNullOrWhiteSpace(detail) && status == AgentStatus.Disconnected
+                    ? $"port {options.Port}"
+                    : detail;
+
+                tray?.SetStatus(status, shown);
             });
 
-        try
-        {
-            listener.Start();
-        }
-        catch (InvalidOperationException exception)
-        {
-            AgentLog.Error(exception.Message);
-            return 1;
-        }
-
+        // Constructed BEFORE Start(). The other order loses a status: a Mac that
+        // reconnects the instant the listener binds publishes Idle into a null
+        // tray, and the tray then reads Disconnected for the whole live session
+        // because nothing re-publishes. Assigning before Start also means the
+        // callback's cross-thread read of this variable is ordered by the
+        // thread starts inside Start, not by luck.
         if (!options.Headless)
         {
             ApplicationConfiguration.Initialize();
@@ -139,7 +150,23 @@ public static class Program
                 AgentLog.Info($"final counters: {metrics.Snapshot()}");
             });
             tray.SetStatus(AgentStatus.Disconnected, $"port {options.Port}");
+        }
 
+        try
+        {
+            listener.Start();
+        }
+        catch (InvalidOperationException exception)
+        {
+            AgentLog.Error(exception.Message);
+
+            // The bind failed, so the tray must not linger as a dead icon.
+            tray?.Dispose();
+            return 1;
+        }
+
+        if (tray is not null)
+        {
             AgentLog.Info("running with a tray icon. Use the tray menu to quit.");
             Application.Run(tray);
             return 0;

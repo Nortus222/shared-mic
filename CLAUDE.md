@@ -31,7 +31,7 @@ protocol harness, both Phase 0 probes, and the Phase 1 Windows agent exist now.
 
 **Windows agent (from `windows\`, on the Windows host).** Requires the .NET SDK pinned in
 `windows/global.json` (10.0.302). The `net10.0-windows` target framework and WinForms tray mean
-these do not build on macOS. All four were run on the Windows host on 2026-08-11:
+these do not build on macOS.
 
 ```powershell
 dotnet build SharedMic.Windows.sln                   # Build succeeded. 0 Warning(s) 0 Error(s)
@@ -40,6 +40,11 @@ dotnet run --project SharedMic.Agent                 # tray icon plus a console 
 dotnet run --project SharedMic.Agent -- --headless   # console only, Ctrl+C to quit
 ```
 
+What has actually been run on this Windows host, as of 2026-08-11: `build` and `test` exactly as
+above; the tray host as `dotnet run --project SharedMic.Agent -- --loopback-only --port 47899
+--data-dir <temp>` (driven end to end by `drive_windows_agent.py --mode session`); and the headless
+host in Task 14, launched from the built `SharedMic.Agent.exe` rather than through `dotnet run`.
+
 Other flags: `--port N`, `--no-mic`, `--device-label TEXT`, `--data-dir PATH`, `--loopback-only`.
 Phase 1 is transport and security only — `--no-mic` and `--device-label` are configuration flags,
 not device queries, because there is no capture path yet.
@@ -47,11 +52,16 @@ not device queries, because there is no capture path yet.
 The `.csproj` files are XML: **never put a doubled hyphen inside an `<!-- -->` comment.** It is
 illegal XML and fails the build with `MSB4025`.
 
-**Harness (from `harness/`).** There is no bare `python` on `PATH` on either machine — use the
-project virtualenv's interpreter explicitly rather than relying on `PATH` or activation. Note the
-leading dot in `.venv`; a stale `harness/venv` also exists and is not usable. The interpreter path
-is layout-specific: `\.venv\Scripts\python.exe` on Windows, `.venv/bin/python` on macOS. The
-Windows form below is what was actually run here:
+**Harness (from `harness/`).** Use the project virtualenv's interpreter explicitly rather than
+relying on `PATH` or activation; the interpreter path is layout-specific,
+`.venv\Scripts\python.exe` on Windows and `.venv/bin/python` on POSIX. Note the leading dot in
+`.venv`. (Per the Phase 0 findings, the Mac used for that work had no bare `python` on `PATH` and a
+system `python3` without `pytest`, and carried a stale `harness/venv` alongside `.venv`; none of
+that is checkable from here.)
+
+Of the four below, `pytest` and `drive_windows_agent.py --mode session` were run on this Windows
+host; the editable install was done when the virtualenv was created, and `generate_vectors.py` has
+deliberately not been run here — nothing under `protocol/` changed.
 
 ```powershell
 cd harness
@@ -67,9 +77,10 @@ are `session` (handshake, heartbeat, idempotent START/STOP, zero audio bytes), `
 with `--no-mic`), and `lockout` (five bad-token attempts then the 30-second refusal). Take
 `--pairing` and `--fingerprint` from the agent's startup banner or its tray menu.
 
-**macOS demand-detection probe (from `probes/macos-demand/`).** Built and run on the target Mac
-(macOS 26.6.1) during Phase 0; it cannot be built on the Windows host. See
-`docs/superpowers/probes/2026-08-08-macos-demand-findings.md` for full results:
+**macOS demand-detection probe (from `probes/macos-demand/`).** Per
+`docs/superpowers/probes/2026-08-08-macos-demand-findings.md`, this was built and run on the target
+Mac (macOS 26.6.1) during Phase 0. It is Swift and Core Audio, so nothing about it is checkable
+from the Windows host:
 
 ```sh
 cd probes/macos-demand
