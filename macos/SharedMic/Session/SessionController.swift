@@ -32,9 +32,21 @@ public enum AgentState: Equatable {
 }
 
 public enum SessionEvent: Equatable {
+    /// MUST be emitted only in response to an explicit user pairing action —
+    /// never when loading a previously stored pairing from the Keychain at
+    /// launch. `.paired` is one of the two sanctioned escapes from
+    /// `.hardStop` (see `SessionController.handle(_:)`); firing it on a
+    /// stored-credential reload would silently defeat the certificate hard
+    /// stop that pinning exists to enforce. Task 13's wiring must keep this
+    /// invariant: a fresh pairing ceremony fires `.paired`, a Keychain-backed
+    /// reconnect at launch does not.
     case paired
     case connectAttemptStarted
     case authenticated(micPresent: Bool, deviceLabel: String)
+    // Temporary Phase 1 scaffolding: `userRequestedStart`/`userRequestedStop`
+    // exist only so a session can be driven by hand while there is no demand
+    // detection. Phase 3's `AudioDemandObserver` replaces the manual trigger
+    // and drives these same two events instead.
     case userRequestedStart(requestId: String)
     case startAcked(requestId: String, sessionId: String)
     case startNacked(requestId: String, reason: String)
@@ -130,6 +142,9 @@ public struct SessionController {
             state = .disconnected
             return [.scheduleReconnect]
 
+        // Temporary Phase 1 scaffolding: drives a session by hand while there is
+        // no demand detection. Phase 3's `AudioDemandObserver` fires this same
+        // event instead of a manual trigger.
         case .userRequestedStart(let requestId):
             switch state {
             case .idle:
@@ -162,6 +177,9 @@ public struct SessionController {
             state = .degraded(reason: Self.startTimeoutMessage)
             return [.closeConnection, .scheduleReconnect]
 
+        // Temporary Phase 1 scaffolding: drives a session by hand while there is
+        // no demand detection. Phase 3's `AudioDemandObserver` fires this same
+        // event instead of a manual trigger.
         case .userRequestedStop(let requestId):
             switch state {
             case .streaming(let sessionId):

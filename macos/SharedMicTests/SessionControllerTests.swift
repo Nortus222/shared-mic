@@ -219,6 +219,19 @@ final class SessionControllerTests: XCTestCase {
         XCTAssertEqual(controller.state, .unpaired)
     }
 
+    /// The hard stop's second sanctioned escape: an explicit unpair, exercised
+    /// from `.hardStop` itself (not from `.idle`, which `testUnpairingClosesTheConnection`
+    /// already covers) — distinct from the `.paired` re-pair path covered by
+    /// `testHardStopSwallowsEveryEventExceptAnExplicitRePair`.
+    func testUnpairingFromHardStopClosesTheConnectionAndClearsTheHardStop() {
+        var controller = authenticatedController()
+        _ = controller.handle(.fingerprintMismatch(expected: "aa", presented: "bb"))
+        XCTAssertEqual(controller.state, .hardStop(reason: "The Windows agent presented a different certificate than the one paired. Re-pair explicitly to continue."))
+
+        XCTAssertEqual(controller.handle(.unpairedByUser), [.closeConnection])
+        XCTAssertEqual(controller.state, .unpaired)
+    }
+
     func testDisplayNamesCoverTheObservabilityStates() {
         XCTAssertEqual(AgentState.disconnected.displayName, "Disconnected")
         XCTAssertEqual(AgentState.idle.displayName, "Idle")
