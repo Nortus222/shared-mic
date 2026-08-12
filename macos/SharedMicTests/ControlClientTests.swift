@@ -286,4 +286,67 @@ final class ControlClientTests: XCTestCase {
         XCTAssertEqual(client.sequenceGaps, 0,
                        "a legitimate session restart on the same connection must not be counted as a gap")
     }
+
+    /// protocol-v1 §5/§8: a session can also end via an unsolicited
+    /// `STATUS{micPresent:false}` (mic hot-unplug), which sends no `STOP_ACK`.
+    /// The reference mock's `_end_session_for_mic_loss` deliberately does not
+    /// join the audio thread first, so a straggler frame from the dying
+    /// session can legitimately land *after* that `STATUS` — unlike
+    /// `STOP_ACK`, this path cannot be trusted as a reset anchor. This is the
+    /// regression test for the `sequence == 0` rule in `handleAudio` that
+    /// covers it instead: mic loss mid-session, mic returns, a second session
+    /// starts and streams audio, and the restart must not be miscounted as a
+    /// gap.
+    func testSequenceGapsAreNotFalselyCountedAfterMicLossAndReplug() throws {
+        let server = try MockWindowsServerProcess()
+        defer { server.terminate() }
+        let delegate = RecordingDelegate()
+        let (client, transport) = try makeAuthenticatedClient(server, delegate: delegate)
+        defer { client.stop(); transport.close() }
+
+        let started1 = expectation(description: "START_ACK 1")
+        delegate.onMessage = { message in
+            if case .startAck = message { started1.fulfill() }
+        }
+        client.send(.start(requestId: "start-1", preferredFormat: .v1))
+        wait(for: [started1], timeout: 10.0)
+
+        let streaming1 = expectation(description: "audio arrived 1")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { streaming1.fulfill() }
+        wait(for: [streaming1], timeout: 5.0)
+        XCTAssertGreaterThan(client.audioFramesReceived, 10, "expected audio before mic loss")
+
+        let lost = expectation(description: "STATUS micPresent=false")
+        delegate.onMessage = { message in
+            if case .status(let micPresent, _, _) = message, micPresent == false {
+                lost.fulfill()
+            }
+        }
+        server.setMicPresent(false)
+        wait(for: [lost], timeout: 10.0)
+
+        let restored = expectation(description: "STATUS micPresent=true")
+        delegate.onMessage = { message in
+            if case .status(let micPresent, _, _) = message, micPresent == true {
+                restored.fulfill()
+            }
+        }
+        server.setMicPresent(true)
+        wait(for: [restored], timeout: 10.0)
+
+        let started2 = expectation(description: "START_ACK 2")
+        delegate.onMessage = { message in
+            if case .startAck = message { started2.fulfill() }
+        }
+        client.send(.start(requestId: "start-2", preferredFormat: .v1))
+        wait(for: [started2], timeout: 10.0)
+
+        let streaming2 = expectation(description: "audio arrived 2")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { streaming2.fulfill() }
+        wait(for: [streaming2], timeout: 5.0)
+
+        XCTAssertGreaterThan(client.audioFramesReceived, 20, "expected audio frames from both sessions")
+        XCTAssertEqual(client.sequenceGaps, 0,
+                       "a session restarted after mic loss must not be counted as a gap")
+    }
 }

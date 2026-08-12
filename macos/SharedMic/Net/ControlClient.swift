@@ -90,9 +90,32 @@ public final class ControlClient {
     /// `audioFramesReceived`/`audioBytesReceived` are cumulative for the whole
     /// connection, by design — they are what makes "an idle connection carries
     /// zero audio bytes" assertable. `sequenceGaps` is also connection-lifetime,
-    /// but its baseline is reset on every `START_ACK` (protocol-v1 §4: sequence
-    /// starts at 0 per session), so a legitimate session restart on the same
-    /// connection is never counted as a gap.
+    /// but a legitimate session restart on the same connection must never be
+    /// counted as a gap (protocol-v1 §4: sequence "starts at 0 per session"),
+    /// which is enforced two ways:
+    ///
+    /// 1. `handle(_:)` clears the gap-detection baseline (`lastSequence`) on
+    ///    `STOP_ACK`. This is deliberately **not** anchored to the *next*
+    ///    session's `START_ACK`: a `START` handler is free to start generating
+    ///    the new session's frame 0 before it enqueues that session's own
+    ///    `START_ACK` for sending (the reference mock does exactly this), so
+    ///    frame 0 can reach this client ahead of its own `START_ACK` — a reset
+    ///    triggered by `START_ACK` would already be too late for that frame.
+    ///    `STOP_ACK` carries no such race in the mock: the ending session's
+    ///    audio thread is joined and its queue drained *before* `STOP_ACK` is
+    ///    sent, so nothing from the old session can arrive after it. It is
+    ///    similarly **not** anchored to the unsolicited `STATUS{micPresent:
+    ///    false}` that ends a session on mic loss — unlike `STOP`, that path
+    ///    does not join the audio thread first, so a straggler frame can
+    ///    legitimately land *after* the `STATUS` (see `_end_session_for_mic_loss`
+    ///    in the reference mock) and re-arm a stale baseline.
+    /// 2. `handleAudio(_:)` treats `sequence == 0` as "a new session just
+    ///    began" rather than a gap, regardless of what came before. This is
+    ///    the belt to (1)'s braces: a genuine dropped-frame gap can only ever
+    ///    show up as a forward jump, never as a return to 0, so this rule is
+    ///    immune to straggler ordering and covers every session-end path
+    ///    — `STOP`, mic loss, and any future one — without this class tracking
+    ///    sessions.
     public var audioFramesReceived: Int { queue.sync { frameCount } }
     public var audioBytesReceived: Int { queue.sync { byteCount } }
     public var sequenceGaps: Int { queue.sync { gapCount } }
@@ -217,6 +240,11 @@ public final class ControlClient {
                 // client's own STOP request — and therefore this STOP_ACK — has
                 // already been sent and observed, by the ordering guarantee of a
                 // single TCP stream.
+                //
+                // Not the only line of defense — see the `sequenceGaps` doc
+                // comment for why `handleAudio` also treats `sequence == 0` as
+                // a fresh baseline, which covers session ends this reset does
+                // not (e.g. mic loss).
                 lastSequence = nil
             }
             let client = self
@@ -236,7 +264,14 @@ public final class ControlClient {
         // Strict: protocol-v1 §4 requires exactly 1932 bytes. decodePayload throws
         // otherwise, which closes the connection.
         let frame = try AudioFrameCodec.decodePayload(payload)
-        if let previous = lastSequence, frame.sequence != previous &+ 1 {
+        // protocol-v1 §4: sequence "starts at 0 per session". A 0 unambiguously
+        // means a session just began, never a dropped frame — a genuine gap can
+        // only ever be a forward jump. Treating 0 as a fresh baseline rather
+        // than comparing it against `lastSequence` makes this immune to which
+        // wire event (STOP_ACK, an unsolicited mic-loss STATUS, or anything
+        // else) ended the previous session, and to any straggler frame from it
+        // that arrives out of order — see the doc comment on `sequenceGaps`.
+        if frame.sequence != 0, let previous = lastSequence, frame.sequence != previous &+ 1 {
             gapCount += 1
         }
         lastSequence = frame.sequence
