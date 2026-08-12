@@ -73,6 +73,28 @@ public class SessionStateMachineTests
 
         Assert.False(outcome.Accepted);
         Assert.Equal(SessionState.Active, machine.State);
+        // The session's IDENTITY must survive a rejected duplicate START, not
+        // just the state enum: a wrong implementation could clear or
+        // reallocate _sessionId on this path and orphan the active session.
+        Assert.Equal("sess-0001", machine.SessionId);
+        Assert.Equal("sess-0001", outcome.SessionId);
+        Assert.Equal(1, machine.SessionsStarted);
+        Assert.False(outcome.StartedNewSession);
+    }
+
+    [Fact]
+    public void SessionSurvivesAMicAbsentNackAndTheNextStartReusesTheSameSessionId()
+    {
+        var machine = Counting();
+        var first = machine.HandleStart(micPresent: true);
+
+        machine.HandleStart(micPresent: false);
+        var recovered = machine.HandleStart(micPresent: true);
+
+        Assert.Equal(first.SessionId, recovered.SessionId);
+        Assert.True(recovered.Accepted);
+        Assert.False(recovered.StartedNewSession);
+        Assert.Equal(1, machine.SessionsStarted);
     }
 
     [Fact]

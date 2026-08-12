@@ -30,6 +30,20 @@ public readonly record struct StopOutcome(string SessionId, bool EndedSession);
 ///
 /// Phase 1 note: an active session streams nothing. There is no capture path
 /// yet, so State == Active means only that a session identifier is allocated.
+///
+/// <see cref="StartOutcome.StartedNewSession"/> is the hook the future audio
+/// layer resets its sequence counter on: sequence resets to 0 if and only if
+/// StartedNewSession is true (protocol-v1.md section 7). A duplicate START
+/// leaves the sequence counter untouched. Phase 1 emits no audio, so nothing
+/// here can prove that end to end &#8212; this class only guarantees the signal
+/// StartedNewSession is correct.
+///
+/// <see cref="StartOutcome.SessionId"/> on a rejected (NACK) outcome is
+/// diagnostic only: START_NACK on the wire carries just requestId and reason
+/// (protocol-v1.md section 7), so this value is never wire-visible. It is
+/// populated when a session is already active (so logs can show which
+/// session the NACK applied to) and empty when idle (there is no session to
+/// report).
 /// </summary>
 public sealed class SessionStateMachine
 {
