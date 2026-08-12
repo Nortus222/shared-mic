@@ -21,6 +21,21 @@ public sealed record AgentIdentity(string ServerId, byte[] Token, X509Certificat
 /// design spec section 7.1: the token and the certificate's private key are
 /// DPAPI-protected under the current user. Regenerating them is an explicit
 /// re-pair, never automatic.
+///
+/// The token, the certificate and the server id are persisted as ONE blob
+/// (<c>identity.dpapi</c>), not three independent files. That makes the
+/// identity atomic: there is no on-disk state where the token survived an
+/// interrupted write, an antivirus quarantine, or a partial restore while the
+/// certificate did not (or vice versa). A file that exists is a complete
+/// identity or it is corrupt; either way LoadOrCreate never mints a fresh
+/// certificate (and therefore a fresh pinned fingerprint) while silently
+/// keeping the old token - that would strand the Mac at its hard-stop
+/// fingerprint check with no explanation. Fix round 1, finding 1.
+///
+/// Writes go to a temp file in the same directory and are published with an
+/// atomic <see cref="File.Move(string, string, bool)"/>, so a crash or power
+/// loss mid-write leaves either the old identity file or nothing - never a
+/// half-written one that permanently bricks the store. Fix round 1, finding 2.
 /// </summary>
 public sealed class IdentityStore
 {
@@ -28,118 +43,157 @@ public sealed class IdentityStore
 
     private readonly string _directory;
 
+    private X509Certificate2? _currentCertificate;
+
     public IdentityStore(string directory) => _directory = directory;
 
     public static string DefaultDirectory => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "SharedMic");
 
-    private string TokenPath => Path.Combine(_directory, "token.dpapi");
-
-    private string CertificatePath => Path.Combine(_directory, "device-cert.dpapi");
-
-    private string ServerIdPath => Path.Combine(_directory, "server-id.txt");
+    private string IdentityPath => Path.Combine(_directory, "identity.dpapi");
 
     public AgentIdentity LoadOrCreate()
     {
         Directory.CreateDirectory(_directory);
 
-        var token = LoadOrCreateToken();
-        var certificate = LoadOrCreateCertificate();
-        var serverId = LoadOrCreateServerId();
-
-        return new AgentIdentity(serverId, token, certificate, DeviceCertificate.Fingerprint(certificate));
+        var identity = File.Exists(IdentityPath) ? LoadExisting() : CreateNew();
+        _currentCertificate = identity.Certificate;
+        return identity;
     }
 
+    /// <summary>
+    /// Destroys the current identity so the next <see cref="LoadOrCreate"/>
+    /// mints a new token and certificate. Disposes the certificate this store
+    /// last handed out so its CNG private-key container
+    /// (%APPDATA%\Microsoft\Crypto\Keys, the key the PKCS#12 round-trip in
+    /// <see cref="DeviceCertificate.CreateSelfSigned"/> persists there because
+    /// Schannel cannot serve an ephemeral key) is actually deleted on re-pair
+    /// rather than orphaned. Fix round 1, finding 3.
+    /// </summary>
     public void Reset()
     {
-        foreach (var path in new[] { TokenPath, CertificatePath, ServerIdPath })
+        _currentCertificate?.Dispose();
+        _currentCertificate = null;
+
+        if (File.Exists(IdentityPath))
         {
-            if (File.Exists(path))
-            {
-                File.Delete(path);
-            }
+            File.Delete(IdentityPath);
         }
     }
 
-    private byte[] LoadOrCreateToken()
+    private AgentIdentity LoadExisting()
     {
-        byte[] token;
-        if (File.Exists(TokenPath))
+        var stored = Unprotect(File.ReadAllBytes(IdentityPath));
+        try
         {
-            token = Unprotect(File.ReadAllBytes(TokenPath));
-        }
-        else
-        {
-            token = PairingToken.Generate();
-            WriteProtected(TokenPath, token);
-        }
+            var record = Deserialize(stored);
 
-        if (token.Length != ProtocolConstants.TokenBytes)
-        {
-            throw new InvalidOperationException(
-                $"the stored pairing token is {token.Length} bytes, expected {ProtocolConstants.TokenBytes}");
-        }
+            if (record.Token.Length != ProtocolConstants.TokenBytes)
+            {
+                throw new InvalidOperationException(
+                    $"the stored pairing token is {record.Token.Length} bytes, expected {ProtocolConstants.TokenBytes}");
+            }
 
-        return token;
+            var certificate = X509CertificateLoader.LoadPkcs12(
+                record.CertificatePkcs12,
+                password: null,
+                X509KeyStorageFlags.Exportable | X509KeyStorageFlags.UserKeySet);
+
+            return new AgentIdentity(record.ServerId, record.Token, certificate, DeviceCertificate.Fingerprint(certificate));
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(stored);
+        }
     }
 
-    private X509Certificate2 LoadOrCreateCertificate()
+    private AgentIdentity CreateNew()
     {
-        if (File.Exists(CertificatePath))
-        {
-            var stored = Unprotect(File.ReadAllBytes(CertificatePath));
-            try
-            {
-                return X509CertificateLoader.LoadPkcs12(
-                    stored,
-                    password: null,
-                    X509KeyStorageFlags.Exportable | X509KeyStorageFlags.UserKeySet);
-            }
-            finally
-            {
-                CryptographicOperations.ZeroMemory(stored);
-            }
-        }
-
+        var token = PairingToken.Generate();
         var certificate = DeviceCertificate.CreateSelfSigned();
+        var serverId = ComputeServerId();
+
         var pkcs12 = certificate.Export(X509ContentType.Pkcs12);
         try
         {
-            WriteProtected(CertificatePath, pkcs12);
+            var blob = Serialize(token, pkcs12, serverId);
+            try
+            {
+                WriteProtectedAtomic(IdentityPath, blob);
+            }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(blob);
+            }
         }
         finally
         {
             CryptographicOperations.ZeroMemory(pkcs12);
         }
 
-        return certificate;
+        return new AgentIdentity(serverId, token, certificate, DeviceCertificate.Fingerprint(certificate));
     }
 
-    private string LoadOrCreateServerId()
+    private static string ComputeServerId()
     {
-        if (File.Exists(ServerIdPath))
-        {
-            var stored = File.ReadAllText(ServerIdPath).Trim();
-            if (stored.Length > 0)
-            {
-                return stored;
-            }
-        }
-
         var serverId = Environment.MachineName.Trim();
-        if (serverId.Length == 0)
-        {
-            serverId = "shared-mic-windows";
-        }
-
-        File.WriteAllText(ServerIdPath, serverId);
-        return serverId;
+        return serverId.Length == 0 ? "shared-mic-windows" : serverId;
     }
 
-    private static void WriteProtected(string path, byte[] plaintext) =>
-        File.WriteAllBytes(path, ProtectedData.Protect(plaintext, Entropy, DataProtectionScope.CurrentUser));
+    private static byte[] Serialize(byte[] token, byte[] certificatePkcs12, string serverId)
+    {
+        using var stream = new MemoryStream();
+        using (var writer = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: true))
+        {
+            WriteChunk(writer, token);
+            WriteChunk(writer, certificatePkcs12);
+            WriteChunk(writer, Encoding.UTF8.GetBytes(serverId));
+        }
+
+        return stream.ToArray();
+    }
+
+    private static IdentityRecord Deserialize(byte[] data)
+    {
+        using var stream = new MemoryStream(data);
+        using var reader = new BinaryReader(stream, Encoding.UTF8, leaveOpen: true);
+
+        var token = ReadChunk(reader);
+        var certificatePkcs12 = ReadChunk(reader);
+        var serverId = Encoding.UTF8.GetString(ReadChunk(reader));
+
+        return new IdentityRecord(token, certificatePkcs12, serverId);
+    }
+
+    private static void WriteChunk(BinaryWriter writer, byte[] chunk)
+    {
+        writer.Write(chunk.Length);
+        writer.Write(chunk);
+    }
+
+    private static byte[] ReadChunk(BinaryReader reader)
+    {
+        var length = reader.ReadInt32();
+        if (length < 0 || length > reader.BaseStream.Length - reader.BaseStream.Position)
+        {
+            throw new InvalidDataException("the stored identity record is truncated or corrupt");
+        }
+
+        return reader.ReadBytes(length);
+    }
+
+    private static void WriteProtectedAtomic(string path, byte[] plaintext)
+    {
+        var protectedBytes = ProtectedData.Protect(plaintext, Entropy, DataProtectionScope.CurrentUser);
+        var tempPath = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+
+        File.WriteAllBytes(tempPath, protectedBytes);
+        File.Move(tempPath, path, overwrite: true);
+    }
 
     private static byte[] Unprotect(byte[] ciphertext) =>
         ProtectedData.Unprotect(ciphertext, Entropy, DataProtectionScope.CurrentUser);
+
+    private sealed record IdentityRecord(byte[] Token, byte[] CertificatePkcs12, string ServerId);
 }
