@@ -230,15 +230,17 @@ public sealed class ControlConnection : IAsyncDisposable
             }
             catch (Exception exception) when (exception is IOException or ObjectDisposedException)
             {
-                // An abortive close is still a connection that reached section 6
-                // without a verified HELLO, so section 11.4 counts it exactly as
-                // the clean-EOF path below does. Not counted when the agent is
-                // the one shutting down: that is our decision, not a peer
-                // failure, and counting it would let a normal restart eat into
-                // the lockout budget.
+                // Logged, NEVER counted. See NotCountedDroppedConnection below:
+                // a connection that dropped without ever producing a decoded
+                // control message never consulted the HMAC oracle, so counting
+                // it buys no security and hands anyone on the LAN a lockout
+                // primitive that costs five TCP connections and no token
+                // knowledge.
                 if (!IsAuthenticated && !cancellationToken.IsCancellationRequested)
                 {
-                    FailAuthentication($"the connection faulted before authenticating ({exception.GetType().Name})");
+                    AgentLog.Info(
+                        $"{RemoteDescription} faulted before authenticating ({exception.GetType().Name}); " +
+                        "not counted as a failed attempt");
                 }
 
                 return;
@@ -246,12 +248,11 @@ public sealed class ControlConnection : IAsyncDisposable
 
             if (frame is null)
             {
+                // Logged, NEVER counted, for the same reason as the fault path
+                // above. A Mac that roams Wi-Fi, sleeps, or has its lid closed
+                // mid-handshake must not be able to spend the legitimate user's
+                // lockout budget.
                 AgentLog.Info($"{RemoteDescription} closed the connection");
-                if (!IsAuthenticated)
-                {
-                    FailAuthentication("the peer closed before authenticating");
-                }
-
                 return;
             }
 
@@ -373,6 +374,26 @@ public sealed class ControlConnection : IAsyncDisposable
         return true;
     }
 
+    /// <summary>
+    /// The ONLY place a section 11.4 failed attempt is counted. Call it exactly
+    /// when the peer produced something the agent had to evaluate and rejected —
+    /// a wrong mac, a malformed or non-HELLO message, an AUDIO frame before
+    /// authentication — or when the 5-second pre-auth deadline expired. Those
+    /// are the three cases section 11.4 enumerates, and they are the same set
+    /// the Python reference counts (harness server.py counts in one place, inside
+    /// its wrong-type-or-bad-proof branch).
+    ///
+    /// Do NOT call it for a connection that simply went away: a clean EOF or an
+    /// IOException before any control message was decoded. Counting those is a
+    /// strictly worse trade. It buys nothing — such a peer never consulted the
+    /// HMAC verification oracle this limiter exists to throttle — and it creates
+    /// a pre-auth denial-of-service cheaper than the guessing attack being
+    /// defended against: five open-and-drop TCP connections per 30 s, requiring
+    /// no token knowledge and no cryptographic work, lock the legitimate Mac out
+    /// indefinitely. It also fires on ordinary bad luck (a Wi-Fi roam, a closed
+    /// lid), where a Mac that auto-retries can loop itself out forever.
+    /// A connect-and-hold peer stays covered by the deadline, which IS counted.
+    /// </summary>
     private void FailAuthentication(string reason)
     {
         _rateLimiter.RecordFailure();

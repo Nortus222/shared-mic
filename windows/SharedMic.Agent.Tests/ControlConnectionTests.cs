@@ -682,4 +682,91 @@ public class ControlConnectionTests
 
         Assert.Equal(1, limiter.ConsecutiveFailures);
     }
+
+    [Fact]
+    public async Task AWrongMacCountsAsAFailedAttempt()
+    {
+        var token = PairingToken.Generate();
+        var limiter = new AuthRateLimiter();
+        var metrics = new AgentMetrics();
+        await using var fixture = await StartAsync(token, FastOptions(), limiter, metrics);
+        using var cancellation = new CancellationTokenSource(Timeout);
+
+        await fixture.Peer.ReadControlAsync(cancellation.Token);
+        await fixture.Peer.SendControlAsync(
+            ControlMessages.Hello("mock-mac", new string('b', 64)),
+            cancellation.Token);
+
+        Assert.True(await fixture.Peer.WaitForCloseAsync(TimeSpan.FromSeconds(5)));
+        Assert.False(fixture.Connection.IsAuthenticated);
+        Assert.Equal(1, limiter.ConsecutiveFailures);
+        Assert.Equal(1, metrics.Snapshot().AuthFailures);
+    }
+
+    /// <summary>
+    /// The narrow section 11.4 reading, pinned. A peer that connects and goes
+    /// away without ever sending a control message has told the agent nothing
+    /// about the token and has not touched the HMAC verification path the
+    /// limiter exists to throttle, so it must not spend the lockout budget.
+    /// Counting it would make five open-and-drop TCP connections — no token
+    /// knowledge, no cryptographic work — enough to lock the legitimate Mac out
+    /// indefinitely, which is a cheaper denial of service than the guessing
+    /// attack being defended against. It also fires on an ordinary Wi-Fi roam or
+    /// a closed lid. Matches the Python reference, which counts only inside its
+    /// wrong-type-or-bad-proof branch.
+    /// </summary>
+    [Fact]
+    public async Task APeerThatDropsWithoutSendingAnythingIsNotAFailedAttempt()
+    {
+        var token = PairingToken.Generate();
+        var limiter = new AuthRateLimiter();
+        var metrics = new AgentMetrics();
+
+        // A deadline long enough that it cannot be what ends this connection:
+        // the close below is the only thing that can, so the assertion is about
+        // the drop and not about a race with the deadline path.
+        await using var fixture = await StartAsync(token, FastOptions(helloDeadlineMs: 30_000), limiter, metrics);
+        using var cancellation = new CancellationTokenSource(Timeout);
+
+        await fixture.Peer.ReadControlAsync(cancellation.Token);
+        await fixture.Peer.ClientStream.DisposeAsync();
+
+        await fixture.Run.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.False(fixture.Connection.IsAuthenticated);
+        Assert.Equal(0, limiter.ConsecutiveFailures);
+        Assert.False(limiter.IsLockedOut);
+        Assert.Equal(0, metrics.Snapshot().AuthFailures);
+    }
+
+    /// <summary>
+    /// The DoS the narrow reading closes, stated as a test rather than as a
+    /// comment: repeating the drop far more times than the five-failure budget
+    /// still leaves a correct token able to authenticate.
+    /// </summary>
+    [Fact]
+    public async Task RepeatedDropsCannotLockOutTheLegitimateClient()
+    {
+        var token = PairingToken.Generate();
+        var limiter = new AuthRateLimiter();
+        using var cancellation = new CancellationTokenSource(Timeout);
+
+        for (var attempt = 0; attempt < 10; attempt++)
+        {
+            await using var dropped = await StartAsync(token, FastOptions(helloDeadlineMs: 30_000), limiter);
+            await dropped.Peer.ReadControlAsync(cancellation.Token);
+            await dropped.Peer.ClientStream.DisposeAsync();
+            await dropped.Run.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+
+        Assert.False(limiter.IsLockedOut);
+
+        await using var good = await StartAsync(token, FastOptions(), limiter);
+        await good.Peer.AuthenticateAsync(token, cancellation.Token);
+        var ack = await good.Peer.ReadControlAsync(cancellation.Token);
+
+        Assert.NotNull(ack);
+        Assert.Equal("HELLO_ACK", ack!["type"]);
+        Assert.True(good.Connection.IsAuthenticated);
+    }
 }

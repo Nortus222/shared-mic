@@ -105,8 +105,13 @@ public static class Program
         AgentLog.Info("running. Press Ctrl+C to quit.");
         quit.Wait();
 
-        AgentLog.Info($"final counters: {metrics.Snapshot()}");
+        // Dispose FIRST, snapshot second. Teardown itself counts: closing the
+        // current connection discards queued audio and can still move counters,
+        // and this line is the run's evidence artefact — printing it before the
+        // listener has drained makes it "counters as of shortly before the end",
+        // which is exactly the misreading it is there to prevent.
         listener.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        AgentLog.Info($"final counters: {metrics.Snapshot()}");
         return 0;
     }
 
