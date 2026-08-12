@@ -204,10 +204,9 @@ public final class ControlClient {
             phase = .authenticated
             cancelHandshakeDeadline()
             startHeartbeat()
-            let client = self
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
-                self.delegate?.controlClientDidAuthenticate(client,
+                self.delegate?.controlClientDidAuthenticate(self,
                                                             micPresent: micPresent,
                                                             deviceLabel: deviceLabel)
             }
@@ -247,9 +246,9 @@ public final class ControlClient {
                 // not (e.g. mic loss).
                 lastSequence = nil
             }
-            let client = self
             DispatchQueue.main.async { [weak self] in
-                self?.delegate?.controlClient(client, didReceive: message)
+                guard let self else { return }
+                self.delegate?.controlClient(self, didReceive: message)
             }
 
         case .finished:
@@ -360,9 +359,9 @@ public final class ControlClient {
         guard phase != .finished else { return }
         phase = .finished
         cancelTimers()
-        let client = self
         DispatchQueue.main.async { [weak self] in
-            self?.delegate?.controlClient(client, didCloseWith: error)
+            guard let self else { return }
+            self.delegate?.controlClient(self, didCloseWith: error)
         }
     }
 }

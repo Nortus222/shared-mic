@@ -4,6 +4,9 @@ public enum PairingError: Error, Equatable {
     case alreadyPairing
     case authenticationFailed(String)
     case transport(String)
+    /// The attempt was abandoned by an explicit user action — `unpair()` or a
+    /// quit — rather than by anything the peer did.
+    case cancelled
 }
 
 extension PairingError: CustomStringConvertible {
@@ -15,6 +18,8 @@ extension PairingError: CustomStringConvertible {
             return "The Windows agent rejected that pairing string (\(detail)). Check it and try again."
         case .transport(let detail):
             return "Could not reach the Windows agent: \(detail)"
+        case .cancelled:
+            return "The pairing attempt was cancelled."
         }
     }
 }
@@ -42,9 +47,21 @@ public final class ConnectionCoordinator: ControlClientDelegate {
     private var record: PairingRecord?
     private var reconnectTimer: DispatchSourceTimer?
     private var startTimeoutTimer: DispatchSourceTimer?
+    private var startTimeoutRequestId: String?
     private var stopTimeoutTimer: DispatchSourceTimer?
-    private var pairingInProgress = false
-    private var pendingPairing: (record: PairingRecord, completion: (Result<PairingRecord, Error>) -> Void)?
+    private var stopTimeoutRequestId: String?
+    /// Non-nil for exactly as long as a `pair(...)` ceremony is in flight. It is
+    /// both the "already pairing" interlock and the only place that attempt's
+    /// completion lives, so every way an attempt can end — success, peer
+    /// failure, or explicit abandonment by `unpair()`/`shutdown()` — goes
+    /// through `resolvePairing(_:)`. One field with one resolver is what makes
+    /// "called exactly once, and never latched on" structural rather than a
+    /// property of remembering to clear a flag at every exit.
+    private var pairingCompletion: ((Result<PairingRecord, Error>) -> Void)?
+    /// The candidate record for the in-flight attempt: set once its TLS
+    /// connection is up and the HMAC handshake has begun, persisted only when
+    /// HELLO_ACK proves the token.
+    private var pendingPairingRecord: PairingRecord?
     private var shuttingDown = false
     private var requestCounter = 0
     private var totalAudioBytes = 0
@@ -78,35 +95,36 @@ public final class ConnectionCoordinator: ControlClientDelegate {
     /// Temporary Phase 1 scaffolding: called once at launch to resume a stored
     /// pairing. Deliberately does NOT feed `.paired` into `SessionController` —
     /// that event is reserved for the completion of an explicit `pair(...)`
-    /// ceremony.
-    ///
-    /// A stored record whose `hardStopPresentedFingerprint` is set means the
-    /// *previous* run hard-stopped on this exact peer and never got an explicit
-    /// re-pair before exiting. `AgentState` itself is in-memory and does not
-    /// survive a relaunch, but the record does — so rather than dialing the
-    /// mismatching peer again to rediscover what is already known, this feeds
-    /// the same `.fingerprintMismatch` event `SessionController` already
-    /// understands and never opens a connection. Only a successful `pair(...)`
-    /// (which always produces a record with this field unset) or `unpair()`
-    /// (which clears the whole record) can get past this.
+    /// ceremony. The persisted hard-stop check lives in `openConnection()`, not
+    /// here, so that no future caller can reach the dialer around it.
     public func startIfPaired() {
         queue.async { [weak self] in
-            guard let self, let record = self.record else { return }
-            if let presented = record.hardStopPresentedFingerprint {
-                self.applyFingerprintMismatch(expected: record.certificateFingerprint, presented: presented)
-                return
-            }
+            guard let self, self.record != nil else { return }
             self.openConnection()
         }
     }
 
-    public func shutdown() {
+    /// `completion` runs on the main queue once the graceful teardown has
+    /// actually happened. `quit()` sequences `NSApplication.terminate` behind it
+    /// rather than racing it — today that only costs a stray TCP RST, but Phase 2
+    /// wants to send a STOP on the way out, and a terminate that beats the
+    /// teardown would silently drop it.
+    public func shutdown(completion: (() -> Void)? = nil) {
         queue.async { [weak self] in
-            guard let self else { return }
+            guard let self else {
+                if let completion { DispatchQueue.main.async(execute: completion) }
+                return
+            }
             self.shuttingDown = true
             self.cancelReconnect()
             self.cancelSessionTimers()
+            // Nothing below will ever call an in-flight pairing's completion:
+            // the transport's connect completion is dropped by the generation
+            // guard, and `client.stop()` makes `ControlClient` suppress its own
+            // close callback. Resolve it here or it strands forever.
+            self.resolvePairing(.failure(PairingError.cancelled))
             self.teardownConnection()
+            if let completion { DispatchQueue.main.async(execute: completion) }
         }
     }
 
@@ -130,12 +148,26 @@ public final class ConnectionCoordinator: ControlClientDelegate {
 
         queue.async { [weak self] in
             guard let self else { return }
-            guard !self.pairingInProgress else {
+            guard self.pairingCompletion == nil else {
                 DispatchQueue.main.async { completion(.failure(PairingError.alreadyPairing)) }
                 return
             }
-            self.pairingInProgress = true
+            self.pairingCompletion = completion
+            // A re-pair tears down whatever connection is live, so the state
+            // machine has to hear about it — otherwise a re-pair that then fails
+            // leaves `state` reading `.idle`/`.streaming` with no client and no
+            // transport behind it. Only when there is something to lose: pairing
+            // for the first time must stay `.unpaired` rather than announce a
+            // disconnection that never happened.
+            if self.client != nil || self.transport != nil {
+                self.apply(self.controller.handle(.connectionLost(reason: "re-pairing")))
+                self.publishState()
+            }
+            // After the `.connectionLost` above, which asks for a reconnect: this
+            // pairing attempt *is* the reconnect, and the old record's backoff
+            // timer must not race it.
             self.cancelReconnect()
+            self.cancelSessionTimers()
             self.teardownConnection()
             let generation = self.connectionGeneration
 
@@ -145,41 +177,51 @@ public final class ConnectionCoordinator: ControlClientDelegate {
             // and reconnect alike — constructs its own instance.
             let transport = PinnedTLSTransport()
             self.transport = transport
-            transport.connect(host: host, port: port, mode: .trustOnFirstUse) { [weak self] result in
+            // `weak transport`: the transport stores this closure in its own
+            // `connectCompletion`, so a strong capture is a cycle. `finishConnect`
+            // normally clears it microseconds later, but on an abandoned attempt
+            // nothing clears it until the 10 s connect timeout — which would leak
+            // the transport and its NWConnection for that whole window.
+            transport.connect(host: host, port: port, mode: .trustOnFirstUse) { [weak self, weak transport] result in
                 guard let self else { return }
                 self.queue.async {
                     // A newer attempt (or unpair()/shutdown()) already tore this
                     // one down — this completion belongs to a dead attempt.
-                    guard self.connectionGeneration == generation else { return }
+                    guard self.connectionGeneration == generation, let transport else { return }
                     switch result {
                     case .failure(let error):
-                        self.pairingInProgress = false
                         self.teardownConnection()
-                        DispatchQueue.main.async {
-                            completion(.failure(PairingError.transport(String(describing: error))))
-                        }
+                        self.resolvePairing(.failure(PairingError.transport(String(describing: error))))
                     case .success(let presentedFingerprint):
                         let candidate = PairingRecord(host: host,
                                                       port: port,
                                                       token: token,
                                                       certificateFingerprint: presentedFingerprint)
-                        self.beginPairingHandshake(transport: transport,
-                                                   candidate: candidate,
-                                                   completion: completion)
+                        self.beginPairingHandshake(transport: transport, candidate: candidate)
                     }
                 }
             }
         }
     }
 
-    private func beginPairingHandshake(transport: PinnedTLSTransport,
-                                       candidate: PairingRecord,
-                                       completion: @escaping (Result<PairingRecord, Error>) -> Void) {
+    private func beginPairingHandshake(transport: PinnedTLSTransport, candidate: PairingRecord) {
         let client = ControlClient(transport: transport, token: candidate.token, clientId: clientId)
         self.client = client
-        self.pendingPairing = (candidate, completion)
+        self.pendingPairingRecord = candidate
         client.delegate = self
         client.begin()
+    }
+
+    /// The single exit for an in-flight `pair(...)`. Both fields are cleared
+    /// before the completion is called out to, so whichever path arrives first
+    /// wins and no later path can double-fire it.
+    @discardableResult
+    private func resolvePairing(_ result: Result<PairingRecord, Error>) -> Bool {
+        guard let completion = pairingCompletion else { return false }
+        pairingCompletion = nil
+        pendingPairingRecord = nil
+        DispatchQueue.main.async { completion(result) }
+        return true
     }
 
     public func unpair() {
@@ -187,6 +229,12 @@ public final class ConnectionCoordinator: ControlClientDelegate {
             guard let self else { return }
             self.cancelReconnect()
             self.cancelSessionTimers()
+            // An in-flight pair(...) is abandoned by this unpair. Nothing
+            // downstream will ever complete it — a connect completion that
+            // resolves later fails the generation guard, and `client.stop()`
+            // inside `teardownConnection()` makes `ControlClient` suppress its
+            // close callback — so resolve it here, before the teardown.
+            self.resolvePairing(.failure(PairingError.cancelled))
             try? self.store.clear()
             self.record = nil
             self.apply(self.controller.handle(.unpairedByUser))
@@ -217,9 +265,28 @@ public final class ConnectionCoordinator: ControlClientDelegate {
 
     // MARK: - Connection
 
+    /// The only place in this class that dials out, and therefore the only place
+    /// the hard stop has to be enforced. Both halves of it live here:
+    ///
+    /// - the in-memory `.hardStop` state, for a mismatch this process already saw;
+    /// - the persisted `hardStopPresentedFingerprint` marker, for one an earlier
+    ///   run saw. `AgentState` does not survive a relaunch but the record does,
+    ///   so rather than dialing the mismatching peer again to rediscover what is
+    ///   already known, this replays the same `.fingerprintMismatch` event
+    ///   `SessionController` already understands and opens nothing. Only a
+    ///   successful `pair(...)` (which always writes a record with the marker
+    ///   unset) or `unpair()` (which clears the record) gets past it.
+    ///
+    /// Keeping the marker check here rather than in `startIfPaired()` makes the
+    /// invariant local to the dialer instead of a property of the call graph —
+    /// a future "reconnect now" entry point cannot route around it.
     private func openConnection() {
         guard !shuttingDown, let record else { return }
         if case .hardStop = controller.state { return }
+        if let presented = record.hardStopPresentedFingerprint {
+            applyFingerprintMismatch(expected: record.certificateFingerprint, presented: presented)
+            return
+        }
         teardownConnection()
         let generation = self.connectionGeneration
 
@@ -229,15 +296,17 @@ public final class ConnectionCoordinator: ControlClientDelegate {
         // Fresh transport per attempt — see the note in `pair(...)`.
         let transport = PinnedTLSTransport()
         self.transport = transport
+        // `weak transport`: see the note in `pair(...)` — a strong capture here
+        // is a retain cycle through the transport's own `connectCompletion`.
         transport.connect(host: record.host,
                           port: record.port,
-                          mode: .pinned(fingerprint: record.certificateFingerprint)) { [weak self] result in
+                          mode: .pinned(fingerprint: record.certificateFingerprint)) { [weak self, weak transport] result in
             guard let self else { return }
             self.queue.async {
                 // See the matching guard in `pair(...)`: a stale completion from
                 // an attempt this coordinator has already abandoned must not
                 // mutate `self.client` or drive the state machine.
-                guard self.connectionGeneration == generation else { return }
+                guard self.connectionGeneration == generation, let transport else { return }
                 switch result {
                 case .success:
                     let client = ControlClient(transport: transport,
@@ -272,10 +341,13 @@ public final class ConnectionCoordinator: ControlClientDelegate {
 
     /// The single place that both records a fingerprint mismatch (so a relaunch
     /// can reconstruct `.hardStop` from the store instead of reconnecting to
-    /// find out again — see `startIfPaired()`) and drives it through the normal
+    /// find out again — see `openConnection()`) and drives it through the normal
     /// `SessionController`/`apply(...)` pipeline.
     private func applyFingerprintMismatch(expected: String, presented: String) {
-        if let current = record {
+        // Only when it actually changes: replaying a persisted marker at launch
+        // would otherwise rewrite a byte-identical record to the Keychain on
+        // every hard-stopped launch.
+        if let current = record, current.hardStopPresentedFingerprint != presented {
             let updated = PairingRecord(host: current.host,
                                         port: current.port,
                                         token: current.token,
@@ -301,6 +373,10 @@ public final class ConnectionCoordinator: ControlClientDelegate {
                 armStartTimeout(requestId: requestId, seconds: seconds)
             case .armStopTimeout(let requestId, let seconds):
                 armStopTimeout(requestId: requestId, seconds: seconds)
+            case .cancelStartTimeout(let requestId):
+                cancelStartTimeout(requestId: requestId)
+            case .cancelStopTimeout(let requestId):
+                cancelStopTimeout(requestId: requestId)
             case .scheduleReconnect:
                 scheduleReconnect()
             case .closeConnection:
@@ -324,6 +400,7 @@ public final class ConnectionCoordinator: ControlClientDelegate {
 
     private func armStartTimeout(requestId: String, seconds: TimeInterval) {
         startTimeoutTimer?.cancel()
+        startTimeoutRequestId = requestId
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + seconds)
         timer.setEventHandler { [weak self] in
@@ -337,6 +414,7 @@ public final class ConnectionCoordinator: ControlClientDelegate {
 
     private func armStopTimeout(requestId: String, seconds: TimeInterval) {
         stopTimeoutTimer?.cancel()
+        stopTimeoutRequestId = requestId
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + seconds)
         timer.setEventHandler { [weak self] in
@@ -348,9 +426,27 @@ public final class ConnectionCoordinator: ControlClientDelegate {
         stopTimeoutTimer = timer
     }
 
+    /// Only ever reached from `SessionAction.cancelStartTimeout`, which
+    /// `SessionController` emits solely from the branch that matched its pending
+    /// `requestId`. The id is re-checked here so the coordinator's own timer
+    /// cannot be cancelled by a reply that answers some other request.
+    private func cancelStartTimeout(requestId: String) {
+        guard startTimeoutRequestId == requestId else { return }
+        startTimeoutTimer?.cancel(); startTimeoutTimer = nil
+        startTimeoutRequestId = nil
+    }
+
+    private func cancelStopTimeout(requestId: String) {
+        guard stopTimeoutRequestId == requestId else { return }
+        stopTimeoutTimer?.cancel(); stopTimeoutTimer = nil
+        stopTimeoutRequestId = nil
+    }
+
     private func cancelSessionTimers() {
         startTimeoutTimer?.cancel(); startTimeoutTimer = nil
+        startTimeoutRequestId = nil
         stopTimeoutTimer?.cancel(); stopTimeoutTimer = nil
+        stopTimeoutRequestId = nil
     }
 
     private func scheduleReconnect() {
@@ -389,24 +485,22 @@ public final class ConnectionCoordinator: ControlClientDelegate {
             // attempt this coordinator has already abandoned (torn down by a
             // newer attempt, unpair(), or shutdown()) must not resurrect it.
             guard let self, client === self.client else { return }
-            if let pending = self.pendingPairing {
+            if let candidate = self.pendingPairingRecord {
                 // The token proved out on this connection, so the certificate it
                 // presented is now trustworthy enough to pin.
-                self.pendingPairing = nil
-                self.pairingInProgress = false
                 do {
-                    try self.store.save(pending.record)
+                    try self.store.save(candidate)
                 } catch {
-                    DispatchQueue.main.async { pending.completion(.failure(error)) }
+                    self.resolvePairing(.failure(error))
                     return
                 }
-                self.record = pending.record
+                self.record = candidate
                 // Sanctioned escape from `.hardStop`: only this path, the
                 // completion of an explicit user pairing action, ever feeds
                 // `.paired` into `SessionController`. `startIfPaired()` and the
                 // reconnect loop never do.
                 self.apply(self.controller.handle(.paired))
-                DispatchQueue.main.async { pending.completion(.success(pending.record)) }
+                self.resolvePairing(.success(candidate))
             }
             self.backoff.reset()
             self.apply(self.controller.handle(.authenticated(micPresent: micPresent,
@@ -419,14 +513,17 @@ public final class ConnectionCoordinator: ControlClientDelegate {
         queue.async { [weak self] in
             guard let self, client === self.client else { return }
             switch message {
+            // No unconditional timer cancel here: whether a reply answers the
+            // request actually in flight is `SessionController`'s decision, and
+            // it emits `.cancelStartTimeout`/`.cancelStopTimeout` only from the
+            // branches where the `requestId` matched. Cancelling first would let
+            // a reply carrying somebody else's `requestId` disarm the timeout and
+            // strand this agent in `.starting`/`.stopping` with no way out.
             case .startAck(let requestId, let sessionId, _):
-                self.startTimeoutTimer?.cancel(); self.startTimeoutTimer = nil
                 self.apply(self.controller.handle(.startAcked(requestId: requestId, sessionId: sessionId)))
             case .startNack(let requestId, let reason):
-                self.startTimeoutTimer?.cancel(); self.startTimeoutTimer = nil
                 self.apply(self.controller.handle(.startNacked(requestId: requestId, reason: reason)))
             case .stopAck(let requestId, _):
-                self.stopTimeoutTimer?.cancel(); self.stopTimeoutTimer = nil
                 self.apply(self.controller.handle(.stopAcked(requestId: requestId)))
             case .status(let micPresent, let active, let deviceLabel):
                 self.apply(self.controller.handle(.statusReceived(micPresent: micPresent,
@@ -446,15 +543,11 @@ public final class ConnectionCoordinator: ControlClientDelegate {
         queue.async { [weak self] in
             guard let self, client === self.client else { return }
             self.cancelSessionTimers()
-            if let pending = self.pendingPairing {
+            if self.pendingPairingRecord != nil {
                 // Closed before HELLO_ACK: the token was wrong, or the peer hung up.
-                self.pendingPairing = nil
-                self.pairingInProgress = false
                 self.teardownConnection()
-                DispatchQueue.main.async {
-                    pending.completion(.failure(
-                        PairingError.authenticationFailed(error.map { String(describing: $0) } ?? "connection closed")))
-                }
+                self.resolvePairing(.failure(
+                    PairingError.authenticationFailed(error.map { String(describing: $0) } ?? "connection closed")))
                 return
             }
             self.teardownConnection()

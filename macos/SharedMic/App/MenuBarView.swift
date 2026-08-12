@@ -75,7 +75,9 @@ struct MenuBarView: View {
                 .font(.subheadline)
             TextField("Host or IP address", text: $model.hostField)
             TextField("Port", text: $model.portField)
-            TextField("Pairing string", text: $model.pairingField)
+            // SecureField, not TextField: this is a 32-byte bearer secret, and
+            // nothing about typing it once justifies leaving it legible on screen.
+            SecureField("Pairing string", text: $model.pairingField)
                 .font(.system(.body, design: .monospaced))
             Button(model.isPairing ? "Pairing…" : "Pair") { model.pair() }
                 .disabled(model.isPairing || model.hostField.isEmpty || model.pairingField.isEmpty)

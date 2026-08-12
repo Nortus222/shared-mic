@@ -72,6 +72,11 @@ public enum AudioFrameCodec {
     }
 
     /// s16 **little-endian** — low byte first.
+    ///
+    /// An odd-length input has its trailing byte dropped: half a sample is not a
+    /// sample. Unreachable through the protocol (protocol-v1 §4 fixes the PCM at
+    /// 1920 bytes and `decodePayload` rejects anything else), but stated because
+    /// Phase 2's renderer calls this directly.
     public static func samples(from pcm: Data) -> [Int16] {
         var output: [Int16] = []
         output.reserveCapacity(pcm.count / 2)

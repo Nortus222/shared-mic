@@ -135,6 +135,78 @@ final class PinnedTLSTransportTests: XCTestCase {
         XCTAssertEqual(nonce.count, 64)
     }
 
+    /// The sibling test above installs `onReceive` *before* `connect()`, which no
+    /// real caller does: `ConnectionCoordinator` only reaches
+    /// `ControlClient.begin()` — and therefore only installs a handler — from
+    /// `connect`'s completion, hopped onto its own queue. protocol-v1 §6 has the
+    /// server send GREETING the instant the handshake finishes, so those bytes
+    /// routinely land in that window. They must be buffered, not dropped: a
+    /// dropped GREETING strands the handshake until the 5 s deadline and surfaces
+    /// during pairing as a bogus "wrong token" failure.
+    func testGreetingSurvivesAHandlerInstalledAfterConnectCompletes() throws {
+        let server = try MockWindowsServerProcess()
+        defer { server.terminate() }
+        let transport = PinnedTLSTransport()
+        defer { transport.close() }
+
+        guard case .success = connect(transport, to: server, mode: .pinned(fingerprint: server.fingerprint)) else {
+            return XCTFail("handshake failed")
+        }
+
+        // Give the GREETING every chance to arrive while no handler exists — the
+        // window this test is about — rather than hoping to hit it by luck.
+        let settled = expectation(description: "greeting is on the wire")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { settled.fulfill() }
+        wait(for: [settled], timeout: 5.0)
+
+        let received = expectation(description: "greeting bytes")
+        var bytes = Data()
+        transport.onReceive = { chunk in
+            bytes.append(chunk)
+            if bytes.count >= 5 { received.fulfill() }
+        }
+        wait(for: [received], timeout: 10.0)
+
+        let frame = try XCTUnwrap(FrameCodec.decode(bytes))
+        guard case .greeting = try ControlCodec.decode(frame.payload) else {
+            return XCTFail("the buffered bytes were not the GREETING")
+        }
+    }
+
+    /// The same window, for the close path. A close that lands before `onClose`
+    /// is installed must still be delivered — latching it as "reported" would
+    /// leave the `ControlClient` unable to ever learn the connection died.
+    func testCloseThatLandsBeforeTheHandlerIsInstalledIsStillDelivered() throws {
+        let server = try MockWindowsServerProcess()
+        defer { server.terminate() }
+        let transport = PinnedTLSTransport()
+        defer { transport.close() }
+
+        guard case .success = connect(transport, to: server, mode: .pinned(fingerprint: server.fingerprint)) else {
+            return XCTFail("handshake failed")
+        }
+        server.dropConnections()
+
+        let settled = expectation(description: "drop observed with no handler installed")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { settled.fulfill() }
+        wait(for: [settled], timeout: 5.0)
+
+        let closed = expectation(description: "close delivered late")
+        var closeCount = 0
+        transport.onClose = { error in
+            closeCount += 1
+            XCTAssertNotNil(error, "an unexpected drop must be reported as an error")
+            closed.fulfill()
+        }
+        wait(for: [closed], timeout: 10.0)
+
+        // Exactly once: a buffered close must not also re-fire later.
+        let quiet = expectation(description: "no second close")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { quiet.fulfill() }
+        wait(for: [quiet], timeout: 5.0)
+        XCTAssertEqual(closeCount, 1)
+    }
+
     func testConnectingToAClosedPortFailsRatherThanHanging() {
         let transport = PinnedTLSTransport()
         defer { transport.close() }

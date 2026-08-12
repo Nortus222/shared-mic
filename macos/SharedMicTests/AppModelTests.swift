@@ -88,6 +88,47 @@ final class AppModelTests: XCTestCase {
         XCTAssertTrue(model.canStart)
     }
 
+    /// `audioBytesReceived` used to be refreshed only from `onStateChange`, and
+    /// the state does not change for the length of a streaming session — so the
+    /// menu showed whatever the counter read the instant streaming began ("Zero
+    /// KB") for the whole session. "Zero bytes while idle" is this project's
+    /// headline invariant; a readout permanently stuck at zero is worse than
+    /// none. A 1 Hz refresh timer is what makes it move.
+    func testAudioByteReadoutRefreshesDuringASessionWithoutAStateChange() throws {
+        let server = try MockWindowsServerProcess()
+        defer { server.terminate() }
+        let model = AppModel(store: InMemoryPairingStore(), clientId: "mac-tests", autoStart: false)
+        model.hostField = "127.0.0.1"
+        model.portField = String(server.port)
+        model.pairingField = server.pairingString
+        model.pair()
+        waitUntil("idle") { model.state == .idle }
+        XCTAssertEqual(model.audioBytesReceived, 0, "an idle session carries no audio")
+
+        model.startSession()
+        waitUntil("streaming") {
+            if case .streaming = model.state { return true }
+            return false
+        }
+
+        // Let the session settle, then take a reading. From here nothing else
+        // publishes state — the coordinator only publishes on an event, and a
+        // quiet streaming session has none (protocol-v1 §8 heartbeats are
+        // consumed by `ControlClient`, and the mock sends STATUS only on a mic
+        // change) — so nothing but the refresh timer can move this number.
+        let settled = expectation(description: "session settled")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { settled.fulfill() }
+        wait(for: [settled], timeout: 5.0)
+        let reading = model.audioBytesReceived
+
+        waitUntil("byte counter advanced without a state event", timeout: 15.0) {
+            model.audioBytesReceived > reading
+        }
+
+        model.stopSession()
+        waitUntil("idle again") { model.state == .idle }
+    }
+
     func testFingerprintMismatchSurfacesAProminentWarning() throws {
         let server = try MockWindowsServerProcess()
         defer { server.terminate() }

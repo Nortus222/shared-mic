@@ -55,9 +55,32 @@ public final class AppModel: ObservableObject {
             }
         }
 
+        // The byte counter is the only value here that changes without a state
+        // change, and "zero bytes while idle" is this project's headline
+        // invariant — a readout frozen at whatever it was when streaming began
+        // would be worse than none. 1 Hz with generous tolerance is enough for a
+        // human reading a menu and cheap enough to leave running.
+        let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                self.audioBytesReceived = self.coordinator.audioBytesReceived
+            }
+        }
+        timer.tolerance = 0.25
+        RunLoop.main.add(timer, forMode: .common)
+        refreshTimer = timer
+
         if autoStart {
             coordinator.startIfPaired()
         }
+    }
+
+    deinit {
+        // The timer holds only a weak reference back here, so it never keeps
+        // this object alive; invalidating releases it from the main run loop.
+        // This type is `@MainActor` and is only ever released from the main
+        // thread, which is where `invalidate()` has to run.
+        refreshTimer?.invalidate()
     }
 
     public var statusText: String { state.displayName }
@@ -84,11 +107,13 @@ public final class AppModel: ObservableObject {
             Task { @MainActor in
                 guard let self else { return }
                 self.isPairing = false
+                // Never keep the pairing string in memory or on screen once it has
+                // served its purpose — on failure just as much as on success. A
+                // failed attempt is not a reason to leave a bearer secret sitting
+                // in a @Published property.
+                self.pairingField = ""
                 switch result {
                 case .success(let record):
-                    // Never keep the pairing string in memory or on screen once it
-                    // has served its purpose.
-                    self.pairingField = ""
                     self.pairedHost = record.host
                     self.lastNotice = "Paired with \(record.host)."
                 case .failure(let error):
@@ -117,7 +142,13 @@ public final class AppModel: ObservableObject {
     public func stopSession() { coordinator.requestStop() }
 
     public func quit() {
-        coordinator.shutdown()
-        NSApplication.shared.terminate(nil)
+        refreshTimer?.invalidate()
+        refreshTimer = nil
+        // Terminate only once the coordinator has actually torn down, rather
+        // than racing its `queue.async`. Phase 2 wants to send a STOP on the way
+        // out; a terminate that beats the teardown would silently skip it.
+        coordinator.shutdown {
+            NSApplication.shared.terminate(nil)
+        }
     }
 }

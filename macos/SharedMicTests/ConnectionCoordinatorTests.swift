@@ -1,6 +1,63 @@
 import XCTest
 @testable import SharedMic
 
+/// A loopback socket that listens and then says nothing at all. The kernel
+/// completes the TCP handshake from the backlog, so `connect` succeeds, but
+/// nothing ever answers the ClientHello — a TLS client hangs there until its own
+/// timeout.
+///
+/// That is what makes "abandon a pairing while its connect is still in flight" a
+/// deterministic test rather than a race: nothing can resolve that connect while
+/// the test runs. Deliberately a raw BSD socket rather than an `NWListener` —
+/// `NWListener` fails outright (EINVAL at `start`) in this test environment,
+/// while `bind`/`listen` work, and the connection is never accepted or read from
+/// so nothing more than a listening socket is needed.
+private final class SilentTCPListener {
+    struct StartupFailure: Error { let detail: String }
+
+    private let descriptor: Int32
+    let port: UInt16
+
+    init() throws {
+        let fileDescriptor = socket(AF_INET, SOCK_STREAM, 0)
+        guard fileDescriptor >= 0 else { throw StartupFailure(detail: "socket() failed: \(errno)") }
+
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = 0                       // let the kernel choose
+        address.sin_addr.s_addr = inet_addr("127.0.0.1")
+
+        let bound = withUnsafePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(fileDescriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard bound == 0, listen(fileDescriptor, 4) == 0 else {
+            close(fileDescriptor)
+            throw StartupFailure(detail: "bind/listen failed: \(errno)")
+        }
+
+        var assigned = sockaddr_in()
+        var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let named = withUnsafeMutablePointer(to: &assigned) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                getsockname(fileDescriptor, $0, &length)
+            }
+        }
+        guard named == 0 else {
+            close(fileDescriptor)
+            throw StartupFailure(detail: "getsockname failed: \(errno)")
+        }
+        descriptor = fileDescriptor
+        port = UInt16(bigEndian: assigned.sin_port)
+    }
+
+    func stop() {
+        close(descriptor)
+    }
+}
+
 final class ConnectionCoordinatorTests: XCTestCase {
 
     private func waitForState(_ coordinator: ConnectionCoordinator,
@@ -370,6 +427,75 @@ final class ConnectionCoordinatorTests: XCTestCase {
         XCTAssertTrue(observedStates.isEmpty, "no state publish should result from a stale delegate callback")
         XCTAssertFalse(coordinator.micPresent)
         XCTAssertEqual(coordinator.deviceLabel, "")
+    }
+
+    // MARK: - Abandoning an in-flight pairing
+
+    /// The pairing interlock used to latch permanently. `unpair()` while a
+    /// `pair(...)` was still connecting tore the attempt down without clearing
+    /// the flag — the connect completion that would have cleared it is dropped
+    /// by the generation guard — so every later `pair(...)` returned
+    /// `.alreadyPairing` for the lifetime of the process, with no recovery but
+    /// quitting.
+    ///
+    /// The silent acceptor guarantees the first attempt is still mid-handshake
+    /// when it is abandoned, so this exercises the abandonment path every run.
+    func testUnpairDuringAnInFlightPairingDoesNotLockOutFuturePairings() throws {
+        let silent = try SilentTCPListener()
+        defer { silent.stop() }
+        let server = try MockWindowsServerProcess()
+        defer { server.terminate() }
+        let coordinator = ConnectionCoordinator(store: InMemoryPairingStore(), clientId: "mac-tests")
+        defer { coordinator.shutdown() }
+
+        let abandoned = expectation(description: "the abandoned attempt is resolved, not stranded")
+        // Optional, not implicitly unwrapped: a regression here means the
+        // completion never fires at all, and this test must then fail rather
+        // than trap and take the rest of the bundle with it.
+        var outcome: Result<PairingRecord, Error>?
+        coordinator.pair(host: "127.0.0.1", port: silent.port, pairingString: server.pairingString) { result in
+            outcome = result
+            abandoned.fulfill()
+        }
+        coordinator.unpair()
+        wait(for: [abandoned], timeout: 10.0)
+
+        guard case .failure(let error)? = outcome else {
+            return XCTFail("an abandoned pairing must fail rather than succeed or strand")
+        }
+        XCTAssertEqual(error as? PairingError, .cancelled)
+
+        // The interlock is clear: a fresh attempt runs normally instead of
+        // bouncing off `.alreadyPairing`.
+        let record = try pair(coordinator, with: server)
+        XCTAssertEqual(record.certificateFingerprint, server.fingerprint)
+        waitForState(coordinator, description: "idle after re-pairing") { $0 == .idle }
+    }
+
+    /// The same abandonment through `shutdown()`, which has the same two escape
+    /// routes and the same consequence: a completion that never fires.
+    func testShutdownResolvesAnInFlightPairing() throws {
+        let silent = try SilentTCPListener()
+        defer { silent.stop() }
+        let coordinator = ConnectionCoordinator(store: InMemoryPairingStore(), clientId: "mac-tests")
+
+        let abandoned = expectation(description: "pairing resolved by shutdown")
+        var outcome: Result<PairingRecord, Error>?
+        coordinator.pair(host: "127.0.0.1",
+                         port: silent.port,
+                         pairingString: PairingString.encode(token: Data(repeating: 0x11, count: 32))) { result in
+            outcome = result
+            abandoned.fulfill()
+        }
+
+        let finished = expectation(description: "shutdown completed")
+        coordinator.shutdown { finished.fulfill() }
+        wait(for: [abandoned, finished], timeout: 10.0)
+
+        guard case .failure(let error)? = outcome else {
+            return XCTFail("an abandoned pairing must fail rather than succeed or strand")
+        }
+        XCTAssertEqual(error as? PairingError, .cancelled)
     }
 
     func testUnpairClearsTheStoreAndReturnsToUnpaired() throws {

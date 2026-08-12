@@ -65,6 +65,13 @@ public enum SessionAction: Equatable {
     case sendStop(requestId: String, sessionId: String)
     case armStartTimeout(requestId: String, seconds: TimeInterval)
     case armStopTimeout(requestId: String, seconds: TimeInterval)
+    /// Emitted only from the branches that have *matched* the pending
+    /// `requestId`. Cancelling a timeout is a state decision, not a transport
+    /// one: a reply carrying somebody else's `requestId` must leave the timeout
+    /// armed, or a non-conformant peer could park this agent in `.starting` (or
+    /// `.stopping`) forever with no armed way out.
+    case cancelStartTimeout(requestId: String)
+    case cancelStopTimeout(requestId: String)
     case scheduleReconnect
     case closeConnection
     case warnFingerprintMismatch(expected: String, presented: String)
@@ -165,12 +172,12 @@ public struct SessionController {
         case .startAcked(let requestId, let sessionId):
             guard case .starting(let pending) = state, pending == requestId else { return [] }
             state = .streaming(sessionId: sessionId)
-            return []
+            return [.cancelStartTimeout(requestId: requestId)]
 
         case .startNacked(let requestId, let reason):
             guard case .starting(let pending) = state, pending == requestId else { return [] }
             state = .idle
-            return [.notify("Start refused: \(reason)")]
+            return [.cancelStartTimeout(requestId: requestId), .notify("Start refused: \(reason)")]
 
         case .startTimedOut(let requestId):
             guard case .starting(let pending) = state, pending == requestId else { return [] }
@@ -203,7 +210,7 @@ public struct SessionController {
         case .stopAcked(let requestId):
             guard case .stopping(let pending, _) = state, pending == requestId else { return [] }
             state = .idle
-            return []
+            return [.cancelStopTimeout(requestId: requestId)]
 
         case .stopTimedOut(let requestId):
             guard case .stopping(let pending, _) = state, pending == requestId else { return [] }

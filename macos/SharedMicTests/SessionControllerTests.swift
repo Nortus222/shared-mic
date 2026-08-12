@@ -46,7 +46,8 @@ final class SessionControllerTests: XCTestCase {
     func testStartAckMovesToStreamingAndExposesTheSessionId() {
         var controller = authenticatedController()
         _ = controller.handle(.userRequestedStart(requestId: "req-1"))
-        XCTAssertEqual(controller.handle(.startAcked(requestId: "req-1", sessionId: "sess-1")), [])
+        XCTAssertEqual(controller.handle(.startAcked(requestId: "req-1", sessionId: "sess-1")),
+                       [.cancelStartTimeout(requestId: "req-1")])
         XCTAssertEqual(controller.state, .streaming(sessionId: "sess-1"))
         XCTAssertEqual(controller.activeSessionId, "sess-1")
     }
@@ -71,7 +72,10 @@ final class SessionControllerTests: XCTestCase {
         var controller = authenticatedController()
         _ = controller.handle(.userRequestedStart(requestId: "req-1"))
         let actions = controller.handle(.startNacked(requestId: "req-1", reason: "MIC_UNAVAILABLE"))
-        XCTAssertEqual(actions, [.notify("Start refused: MIC_UNAVAILABLE")])
+        XCTAssertEqual(actions, [
+            .cancelStartTimeout(requestId: "req-1"),
+            .notify("Start refused: MIC_UNAVAILABLE")
+        ])
         XCTAssertEqual(controller.state, .idle)
     }
 
@@ -122,9 +126,54 @@ final class SessionControllerTests: XCTestCase {
         _ = controller.handle(.userRequestedStart(requestId: "req-1"))
         _ = controller.handle(.startAcked(requestId: "req-1", sessionId: "sess-1"))
         _ = controller.handle(.userRequestedStop(requestId: "req-2"))
-        XCTAssertEqual(controller.handle(.stopAcked(requestId: "req-2")), [])
+        XCTAssertEqual(controller.handle(.stopAcked(requestId: "req-2")),
+                       [.cancelStopTimeout(requestId: "req-2")])
         XCTAssertEqual(controller.state, .idle)
         XCTAssertNil(controller.activeSessionId)
+    }
+
+    // MARK: - Acks that answer some other request
+
+    /// The coordinator used to cancel the START timeout the moment a START_ACK
+    /// arrived, before this controller had decided whether the ack answered the
+    /// request actually in flight. A non-conformant peer could therefore disarm
+    /// the timeout with a stale `requestId` and park the agent in `.starting`
+    /// forever. The cancel is now an action, emitted only from the matching
+    /// branch — so a mismatch must produce no action at all, leaving the timeout
+    /// armed as the way out.
+    func testMismatchedStartAckLeavesTheStartTimeoutArmed() {
+        var controller = authenticatedController()
+        _ = controller.handle(.userRequestedStart(requestId: "req-1"))
+
+        XCTAssertEqual(controller.handle(.startAcked(requestId: "req-2", sessionId: "sess-1")), [],
+                       "an ack for another request must not cancel this request's timeout")
+        XCTAssertEqual(controller.state, .starting(requestId: "req-1"))
+
+        // The armed timeout is still the way out.
+        XCTAssertEqual(controller.handle(.startTimedOut(requestId: "req-1")),
+                       [.closeConnection, .scheduleReconnect])
+    }
+
+    func testMismatchedStartNackLeavesTheStartTimeoutArmed() {
+        var controller = authenticatedController()
+        _ = controller.handle(.userRequestedStart(requestId: "req-1"))
+
+        XCTAssertEqual(controller.handle(.startNacked(requestId: "req-2", reason: "MIC_UNAVAILABLE")), [])
+        XCTAssertEqual(controller.state, .starting(requestId: "req-1"))
+        XCTAssertEqual(controller.handle(.startTimedOut(requestId: "req-1")),
+                       [.closeConnection, .scheduleReconnect])
+    }
+
+    func testMismatchedStopAckLeavesTheStopTimeoutArmed() {
+        var controller = authenticatedController()
+        _ = controller.handle(.userRequestedStart(requestId: "req-1"))
+        _ = controller.handle(.startAcked(requestId: "req-1", sessionId: "sess-1"))
+        _ = controller.handle(.userRequestedStop(requestId: "req-2"))
+
+        XCTAssertEqual(controller.handle(.stopAcked(requestId: "req-3")), [])
+        XCTAssertEqual(controller.state, .stopping(requestId: "req-2", sessionId: "sess-1"))
+        XCTAssertEqual(controller.handle(.stopTimedOut(requestId: "req-2")),
+                       [.notify("STOP went unanswered; the session is treated as ended.")])
     }
 
     /// protocol-v1 §8: treat the session as ended locally regardless; do not block
