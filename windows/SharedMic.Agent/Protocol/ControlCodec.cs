@@ -1,3 +1,4 @@
+using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
 
@@ -46,6 +47,9 @@ namespace SharedMic.Agent.Protocol;
 /// </summary>
 public static class ControlCodec
 {
+    /// <summary>How much of an untrusted value <see cref="Quote"/> keeps.</summary>
+    private const int MaxQuotedLength = 48;
+
     public static readonly IReadOnlyDictionary<string, string[]> RequiredFields =
         new Dictionary<string, string[]>(StringComparer.Ordinal)
         {
@@ -134,13 +138,13 @@ public static class ControlCodec
         if (!message.TryGetValue("type", out var typeValue) || typeValue is not string type ||
             !RequiredFields.ContainsKey(type))
         {
-            throw new ProtocolException($"unknown control type '{typeValue ?? "(missing)"}'");
+            throw new ProtocolException($"unknown control type '{Quote(typeValue)}'");
         }
 
         if (!message.TryGetValue("v", out var versionValue) || versionValue is not long version ||
             version != ProtocolConstants.ProtocolVersion)
         {
-            throw new ProtocolException($"unsupported protocol version '{versionValue ?? "(missing)"}'");
+            throw new ProtocolException($"unsupported protocol version '{Quote(versionValue)}'");
         }
 
         foreach (var field in RequiredFields[type])
@@ -194,6 +198,44 @@ public static class ControlCodec
         }
 
         return Equals(left, right);
+    }
+
+    /// <summary>
+    /// Render an untrusted decoded value for an exception message that a caller
+    /// will very likely log. The two Validate throw sites above are the only
+    /// places in this codec where a value straight off the wire — arbitrary
+    /// JSON, up to the 1 MiB payload ceiling, from a peer that has not
+    /// authenticated — reaches a human-readable string. Left raw, a "type"
+    /// containing a newline lets an unauthenticated peer forge whole log
+    /// records, and a "type" containing a megabyte of text lets it amplify one
+    /// frame into a megabyte of log. Control characters become '?' and the
+    /// result is length-bounded, which removes both.
+    ///
+    /// Sanitising here rather than at each logging call site is deliberate: it
+    /// fixes the class at the point the untrusted value first enters a message,
+    /// so a future caller that logs ProtocolException.Message cannot reopen it.
+    /// </summary>
+    private static string Quote(object? value)
+    {
+        if (value is null)
+        {
+            return "(missing)";
+        }
+
+        var text = value as string ?? Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty;
+        var kept = Math.Min(text.Length, MaxQuotedLength);
+        var builder = new StringBuilder(kept + 1);
+        for (var index = 0; index < kept; index++)
+        {
+            builder.Append(char.IsControl(text[index]) ? '?' : text[index]);
+        }
+
+        if (text.Length > MaxQuotedLength)
+        {
+            builder.Append('…');
+        }
+
+        return builder.ToString();
     }
 
     private static object? NormalizeValue(object? value) => value switch

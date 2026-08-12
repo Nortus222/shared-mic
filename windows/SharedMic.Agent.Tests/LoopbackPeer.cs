@@ -32,7 +32,13 @@ public sealed class LoopbackPeer : IAsyncDisposable
 
     public NetworkStream ServerStream { get; }
 
-    public static async Task<LoopbackPeer> CreateAsync()
+    /// <summary>
+    /// <paramref name="socketBufferBytes"/> shrinks both socket buffers, so a
+    /// peer that stops reading backs the agent's writer up into a blocked
+    /// WriteAsync after a few kilobytes instead of the ~64 KB default. That is
+    /// what makes the stalled-writer teardown test finish in milliseconds.
+    /// </summary>
+    public static async Task<LoopbackPeer> CreateAsync(int? socketBufferBytes = null)
     {
         var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
@@ -42,6 +48,15 @@ public sealed class LoopbackPeer : IAsyncDisposable
         var accepted = await accepting;
         connecting.NoDelay = true;
         accepted.NoDelay = true;
+
+        if (socketBufferBytes is { } bytes)
+        {
+            connecting.ReceiveBufferSize = bytes;
+            connecting.SendBufferSize = bytes;
+            accepted.ReceiveBufferSize = bytes;
+            accepted.SendBufferSize = bytes;
+        }
+
         return new LoopbackPeer(listener, connecting, accepted);
     }
 

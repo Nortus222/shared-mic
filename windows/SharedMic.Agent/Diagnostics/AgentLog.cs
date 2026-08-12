@@ -10,6 +10,7 @@ namespace SharedMic.Agent.Diagnostics;
 public static class AgentLog
 {
     private const int MaxUntrustedLength = 64;
+    private const int MaxMessageLength = 256;
 
     private static readonly object Gate = new();
 
@@ -39,6 +40,37 @@ public static class AgentLog
         }
 
         if (text.Length > MaxUntrustedLength)
+        {
+            builder.Append('…');
+        }
+
+        return builder.ToString();
+    }
+
+    /// <summary>
+    /// Render an exception message safely for a log line. ProtocolException
+    /// messages are our own text, but some of them interpolate a value taken
+    /// off the wire. ControlCodec sanitises those at the point they are first
+    /// interpolated, which is where the class is actually closed; this is the
+    /// second layer, so that a throw site added later without that care cannot
+    /// reopen it. The cap is larger than <see cref="Sanitize"/>'s because these
+    /// strings are mostly trusted diagnostic text worth keeping.
+    /// </summary>
+    public static string SanitizeMessage(string? message)
+    {
+        if (string.IsNullOrEmpty(message))
+        {
+            return "(no detail)";
+        }
+
+        var kept = Math.Min(message.Length, MaxMessageLength);
+        var builder = new StringBuilder(kept + 1);
+        for (var index = 0; index < kept; index++)
+        {
+            builder.Append(char.IsControl(message[index]) ? '?' : message[index]);
+        }
+
+        if (message.Length > MaxMessageLength)
         {
             builder.Append('…');
         }

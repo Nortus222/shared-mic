@@ -27,6 +27,9 @@ namespace SharedMic.Agent.Net;
 /// </summary>
 public sealed class ControlConnection : IAsyncDisposable
 {
+    /// <summary>How long teardown waits for the writer and liveness loops before abandoning them.</summary>
+    private static readonly TimeSpan LoopDrainTimeout = TimeSpan.FromSeconds(5);
+
     private readonly Stream _stream;
     private readonly AgentIdentity _identity;
     private readonly AgentOptions _options;
@@ -37,7 +40,17 @@ public sealed class ControlConnection : IAsyncDisposable
     private readonly CancellationTokenSource _closing = new();
     private readonly byte[] _nonce = AuthProof.GenerateNonce();
 
-    private long _lastPeerActivityTicks;
+    // Monotonic milliseconds, never wall-clock. DateTime.UtcNow moves when NTP
+    // steps the clock or an operator changes it, and a backwards-to-forwards
+    // jump larger than PeerDeadTimeout would disconnect a perfectly healthy
+    // idle peer. Environment.TickCount64 only ever counts forward.
+    private long _lastPeerActivityMs;
+
+    // Written on the read loop, read on the liveness loop. Volatile so the
+    // cross-thread read is an explicit decision rather than an accident; the
+    // worst case without it is one poll interval of staleness, which is benign
+    // but not something a reader should have to derive.
+    private volatile bool _isAuthenticated;
 
     public ControlConnection(
         Stream stream,
@@ -56,7 +69,7 @@ public sealed class ControlConnection : IAsyncDisposable
     /// <summary>Raised once HELLO_ACK has been queued, so the listener can supersede an older connection.</summary>
     public event Action<ControlConnection>? Authenticated;
 
-    public bool IsAuthenticated { get; private set; }
+    public bool IsAuthenticated => _isAuthenticated;
 
     public string RemoteDescription { get; init; } = "unknown";
 
@@ -85,28 +98,23 @@ public sealed class ControlConnection : IAsyncDisposable
             _session.Reset();
             _queue.DiscardAudio();
 
-            try
-            {
-                await writer.ConfigureAwait(false);
-            }
-            catch (Exception)
-            {
-                // The writer's own error handling already closed the connection.
-            }
-
-            try
-            {
-                await liveness.ConfigureAwait(false);
-            }
-            catch (Exception)
-            {
-                // Cancellation during teardown.
-            }
-
-            // protocol-v1.md section 3 requires the receiver to CLOSE the
-            // connection on a violation, not merely stop reading. Disposing the
-            // stream here is what makes that true for every exit path, rather
-            // than only when the owner remembers to dispose this object.
+            // The stream is disposed BEFORE the loops are awaited, and the
+            // ordering is the whole point. Cancelling a token does not reliably
+            // abort a write already in flight — neither Socket nor SslStream
+            // guarantees it — and disposing the stream does. A peer that stops
+            // reading fills the TCP send window, parks the writer inside
+            // WriteAsync, and then goes silent; the liveness loop calls Close()
+            // and the read loop returns, but awaiting the writer first would
+            // then block forever on a write only this dispose can unstick, and
+            // RunAsync would never complete. That would leave the socket held
+            // and make section 6's supersession of an older connection
+            // impossible. Disposing first turns the stalled write into an
+            // ObjectDisposedException the writer already handles.
+            //
+            // It also satisfies protocol-v1.md section 3 on every exit path:
+            // a violation requires CLOSING the connection, not merely ceasing
+            // to read it, and doing that here means it does not depend on the
+            // owner remembering to dispose this object.
             try
             {
                 await _stream.DisposeAsync().ConfigureAwait(false);
@@ -115,6 +123,31 @@ public sealed class ControlConnection : IAsyncDisposable
             {
                 // Disposing an already-faulted stream is not interesting.
             }
+
+            // Bounded even so. These awaits exist to make teardown orderly, not
+            // to make it a place RunAsync can be trapped: any future stream
+            // implementation whose Dispose does not unblock a pending write
+            // should cost a few seconds and a warning, not the connection
+            // object.
+            await DrainAsync(writer, "writer").ConfigureAwait(false);
+            await DrainAsync(liveness, "liveness").ConfigureAwait(false);
+        }
+    }
+
+    private async Task DrainAsync(Task loop, string name)
+    {
+        try
+        {
+            await loop.WaitAsync(LoopDrainTimeout).ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            AgentLog.Warn($"the {name} loop for {RemoteDescription} did not finish within " +
+                          $"{LoopDrainTimeout.TotalSeconds:F0} s; abandoning it");
+        }
+        catch (Exception)
+        {
+            // Cancellation, or an error the loop has already handled and logged.
         }
     }
 
@@ -182,16 +215,32 @@ public sealed class ControlConnection : IAsyncDisposable
             }
             catch (ProtocolException exception)
             {
-                AgentLog.Warn($"closing {RemoteDescription}: protocol violation: {exception.Message}");
+                // Sanitised even though ControlCodec already sanitises the
+                // untrusted fragments it interpolates: this message is the one
+                // place a pre-authentication peer's bytes reach a log line, and
+                // one layer of defence at each end costs nothing.
+                var detail = AgentLog.SanitizeMessage(exception.Message);
+                AgentLog.Warn($"closing {RemoteDescription}: protocol violation: {detail}");
                 if (!IsAuthenticated)
                 {
-                    FailAuthentication(exception.Message);
+                    FailAuthentication(detail);
                 }
 
                 return;
             }
             catch (Exception exception) when (exception is IOException or ObjectDisposedException)
             {
+                // An abortive close is still a connection that reached section 6
+                // without a verified HELLO, so section 11.4 counts it exactly as
+                // the clean-EOF path below does. Not counted when the agent is
+                // the one shutting down: that is our decision, not a peer
+                // failure, and counting it would let a normal restart eat into
+                // the lockout budget.
+                if (!IsAuthenticated && !cancellationToken.IsCancellationRequested)
+                {
+                    FailAuthentication($"the connection faulted before authenticating ({exception.GetType().Name})");
+                }
+
                 return;
             }
 
@@ -228,10 +277,11 @@ public sealed class ControlConnection : IAsyncDisposable
             }
             catch (ProtocolException exception)
             {
-                AgentLog.Warn($"closing {RemoteDescription}: {exception.Message}");
+                var detail = AgentLog.SanitizeMessage(exception.Message);
+                AgentLog.Warn($"closing {RemoteDescription}: {detail}");
                 if (!IsAuthenticated)
                 {
-                    FailAuthentication(exception.Message);
+                    FailAuthentication(detail);
                 }
 
                 return;
@@ -292,7 +342,7 @@ public sealed class ControlConnection : IAsyncDisposable
         }
 
         _rateLimiter.RecordSuccess();
-        IsAuthenticated = true;
+        _isAuthenticated = true;
         _metrics.IncrementConnectionsAuthenticated();
 
         // Queue HELLO_ACK before flipping any observable state, so nothing can
@@ -463,7 +513,7 @@ public sealed class ControlConnection : IAsyncDisposable
                     continue;
                 }
 
-                var idle = TimeSpan.FromTicks(DateTime.UtcNow.Ticks - Interlocked.Read(ref _lastPeerActivityTicks));
+                var idle = TimeSpan.FromMilliseconds(Environment.TickCount64 - Interlocked.Read(ref _lastPeerActivityMs));
                 if (idle > _options.PeerDeadTimeout)
                 {
                     _metrics.IncrementDeadPeerDisconnects();
@@ -484,5 +534,5 @@ public sealed class ControlConnection : IAsyncDisposable
     private void SendControl(IReadOnlyDictionary<string, object?> message) =>
         _queue.EnqueueControl(FrameCodec.EncodeFrame(FrameType.Control, ControlCodec.Encode(message)));
 
-    private void Touch() => Interlocked.Exchange(ref _lastPeerActivityTicks, DateTime.UtcNow.Ticks);
+    private void Touch() => Interlocked.Exchange(ref _lastPeerActivityMs, Environment.TickCount64);
 }

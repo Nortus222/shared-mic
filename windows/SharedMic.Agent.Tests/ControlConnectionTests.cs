@@ -81,9 +81,10 @@ public class ControlConnectionTests
         byte[] token,
         AgentOptions options,
         AuthRateLimiter? limiter = null,
-        AgentMetrics? metrics = null)
+        AgentMetrics? metrics = null,
+        int? socketBufferBytes = null)
     {
-        var peer = await LoopbackPeer.CreateAsync();
+        var peer = await LoopbackPeer.CreateAsync(socketBufferBytes);
         var connection = new ControlConnection(
             peer.ServerStream,
             NewIdentity(token),
@@ -249,7 +250,11 @@ public class ControlConnectionTests
         await fixture.Peer.AuthenticateAsync(token, cancellation.Token);
         await fixture.Peer.ReadControlAsync(cancellation.Token);
 
-        foreach (var seq in new long[] { 1, 2, 99 })
+        // Negative and boundary values are included because "seq" is a signed
+        // 64-bit JSON number on the wire and the agent echoes it verbatim: the
+        // round trip through System.Text.Json is only proved to preserve
+        // long.MinValue and long.MaxValue by exercising them.
+        foreach (var seq in new[] { 1L, 2L, 99L, -1L, long.MinValue, long.MaxValue })
         {
             await fixture.Peer.SendControlAsync(ControlMessages.Ping(seq), cancellation.Token);
             var pong = await fixture.Peer.ReadControlAsync(cancellation.Token);
@@ -456,6 +461,212 @@ public class ControlConnectionTests
 
         Assert.True(await good.Peer.WaitForCloseAsync(TimeSpan.FromSeconds(5)));
         Assert.False(good.Connection.IsAuthenticated);
+    }
+
+    // The forged suffix is a complete, plausible log record. If it reaches a log
+    // file on its own line, an unauthenticated peer has just written the agent's
+    // own "authenticated client" event into the audit trail.
+    private const string ForgedLogRecord =
+        "\n2026-08-11T12:00:00.000Z INFO authenticated client 'attacker' from 10.0.0.9";
+
+    [Fact]
+    public void AnUntrustedControlTypeCannotForgeALogRecord()
+    {
+        var payload = System.Text.Encoding.UTF8.GetBytes(
+            "{\"type\":" + System.Text.Json.JsonSerializer.Serialize("X" + ForgedLogRecord) + ",\"v\":1}");
+
+        var error = Assert.Throws<ProtocolException>(() => ControlCodec.Decode(payload));
+
+        // Every place this message is logged interpolates it raw, so the
+        // message itself has to be single-line and bounded.
+        Assert.DoesNotContain('\n', error.Message);
+        Assert.DoesNotContain('\r', error.Message);
+        Assert.DoesNotContain("authenticated client", error.Message);
+        Assert.DoesNotContain('\n', AgentLog.SanitizeMessage(error.Message));
+    }
+
+    [Fact]
+    public void AnUntrustedProtocolVersionCannotForgeALogRecord()
+    {
+        var payload = System.Text.Encoding.UTF8.GetBytes(
+            "{\"seq\":1,\"type\":\"PING\",\"v\":" +
+            System.Text.Json.JsonSerializer.Serialize("2" + ForgedLogRecord) + "}");
+
+        var error = Assert.Throws<ProtocolException>(() => ControlCodec.Decode(payload));
+
+        Assert.Contains("unsupported protocol version", error.Message);
+        Assert.DoesNotContain('\n', error.Message);
+        Assert.DoesNotContain("authenticated client", error.Message);
+    }
+
+    [Fact]
+    public void AMegabyteOfUntrustedTextCannotAmplifyIntoAMegabyteOfLog()
+    {
+        var payload = System.Text.Encoding.UTF8.GetBytes(
+            "{\"type\":" + System.Text.Json.JsonSerializer.Serialize(new string('A', 100_000)) + ",\"v\":1}");
+
+        var error = Assert.Throws<ProtocolException>(() => ControlCodec.Decode(payload));
+
+        Assert.True(
+            error.Message.Length < 200,
+            $"an unauthenticated peer turned {payload.Length} bytes into a {error.Message.Length}-character log line");
+    }
+
+    [Fact]
+    public async Task AForgedLogRecordInAControlTypeClosesTheConnectionAndCountsAsAFailedAttempt()
+    {
+        var token = PairingToken.Generate();
+        var limiter = new AuthRateLimiter();
+        await using var fixture = await StartAsync(token, FastOptions(), limiter);
+        using var cancellation = new CancellationTokenSource(Timeout);
+
+        await fixture.Peer.ReadControlAsync(cancellation.Token);
+
+        var payload = System.Text.Encoding.UTF8.GetBytes(
+            "{\"type\":" + System.Text.Json.JsonSerializer.Serialize("X" + ForgedLogRecord) + ",\"v\":1}");
+        await fixture.Peer.SendRawAsync(
+            FrameCodec.EncodeFrame(FrameType.Control, payload), cancellation.Token);
+
+        Assert.True(await fixture.Peer.WaitForCloseAsync(TimeSpan.FromSeconds(5)));
+        Assert.False(fixture.Connection.IsAuthenticated);
+        Assert.Equal(1, limiter.ConsecutiveFailures);
+    }
+
+    /// <summary>
+    /// A stream whose WriteAsync ignores its CancellationToken and only ever
+    /// completes when the stream is disposed. That is the behaviour teardown has
+    /// to survive: a write already in flight is not reliably abortable by
+    /// cancelling a token, and disposing the stream is what unsticks it. A real
+    /// Windows socket happens to honour write cancellation, which is why the
+    /// loopback test alone cannot pin the ordering.
+    /// </summary>
+    private sealed class UncancellableWriteStream : Stream
+    {
+        private readonly TaskCompletionSource _disposed = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public bool IsDisposed => _disposed.Task.IsCompleted;
+
+        public override bool CanRead => true;
+
+        public override bool CanSeek => false;
+
+        public override bool CanWrite => true;
+
+        public override long Length => throw new NotSupportedException();
+
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+
+        public override async ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken)
+        {
+            await _disposed.Task;
+            throw new ObjectDisposedException(nameof(UncancellableWriteStream));
+        }
+
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken)
+        {
+            // Reads DO honour cancellation, so the read loop can still hit its
+            // pre-auth deadline and start teardown while the writer is parked.
+            await Task.WhenAny(_disposed.Task, Task.Delay(System.Threading.Timeout.Infinite, cancellationToken));
+            cancellationToken.ThrowIfCancellationRequested();
+            return 0;
+        }
+
+        public override Task FlushAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+
+        public override ValueTask DisposeAsync()
+        {
+            _disposed.TrySetResult();
+            return ValueTask.CompletedTask;
+        }
+
+        public override void Flush()
+        {
+        }
+
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+
+        public override void SetLength(long value) => throw new NotSupportedException();
+
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        protected override void Dispose(bool disposing)
+        {
+            _disposed.TrySetResult();
+            base.Dispose(disposing);
+        }
+    }
+
+    [Fact]
+    public async Task TeardownDisposesTheStreamBeforeAwaitingAWriterThatIgnoresCancellation()
+    {
+        var token = PairingToken.Generate();
+        var stream = new UncancellableWriteStream();
+        var connection = new ControlConnection(
+            stream,
+            NewIdentity(token),
+            FastOptions(helloDeadlineMs: 300),
+            new AuthRateLimiter(),
+            new AgentMetrics())
+        {
+            RemoteDescription = "stalled",
+        };
+
+        using var cancellation = new CancellationTokenSource();
+        var run = connection.RunAsync(cancellation.Token);
+
+        // The writer parks in WriteAsync on the GREETING immediately. The
+        // pre-auth deadline then ends the read loop and teardown begins. If
+        // teardown awaited the writer before disposing the stream, RunAsync
+        // would never complete and the connection would leak.
+        await run.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.True(run.IsCompletedSuccessfully);
+        Assert.True(stream.IsDisposed);
+
+        await connection.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task AStalledWriterDoesNotTrapTeardownWhenThePeerStopsReading()
+    {
+        var token = PairingToken.Generate();
+        await using var fixture = await StartAsync(
+            token,
+            FastOptions(peerDeadTimeoutMs: 600),
+            socketBufferBytes: 1024);
+        using var cancellation = new CancellationTokenSource(Timeout);
+
+        await fixture.Peer.AuthenticateAsync(token, cancellation.Token);
+        await fixture.Peer.ReadControlAsync(cancellation.Token);
+
+        // Enough PONGs to overrun both shrunk socket buffers several times over,
+        // so the writer is parked inside WriteAsync. The peer deliberately never
+        // reads them. The agent keeps reading throughout, so these writes cannot
+        // block on our side.
+        for (var seq = 1; seq <= 2000; seq++)
+        {
+            await fixture.Peer.SendControlAsync(ControlMessages.Ping(seq), cancellation.Token);
+        }
+
+        // Now go silent. The liveness loop declares the peer dead, and teardown
+        // must release the socket rather than park on the backed-up writer.
+        //
+        // Honest about what this proves: a real Windows socket DOES abort a
+        // pending write when its token is cancelled, so this test passes under
+        // either teardown ordering. It is here to pin the end-to-end outcome —
+        // a peer that stops reading cannot strand a connection object — while
+        // TeardownDisposesTheStreamBeforeAwaitingAWriterThatIgnoresCancellation
+        // pins the ordering itself against a stream that is not so obliging,
+        // which is the case Task 14's SslStream may turn out to be.
+        await fixture.Run.WaitAsync(TimeSpan.FromSeconds(8));
+
+        Assert.True(fixture.Run.IsCompleted);
     }
 
     [Fact]
