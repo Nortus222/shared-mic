@@ -97,6 +97,17 @@ public class TlsListenerTests : IDisposable
 
             Assert.Contains(expected, _statuses.ToArray());
         }
+
+        /// <summary>
+        /// The status a tray would currently be showing. Pins Finding 2: a stale
+        /// Disconnected published after a live Idle would latch here.
+        /// </summary>
+        public void AssertLastStatusIs(AgentStatus expected)
+        {
+            var recorded = _statuses.ToArray();
+            Assert.NotEmpty(recorded);
+            Assert.Equal(expected, recorded[^1]);
+        }
     }
 
     [Fact]
@@ -196,6 +207,74 @@ public class TlsListenerTests : IDisposable
         await first.DisposeAsync();
     }
 
+    /// <summary>
+    /// The security half of the supersession rule, which the positive test above
+    /// does not cover: an UNAUTHENTICATED peer must not displace a live session.
+    /// A second connection is opened, completes the TLS handshake, and then says
+    /// nothing until well past the HELLO deadline; the first, authenticated
+    /// connection must still answer a PING afterwards. If the listener ever
+    /// adopted a connection at handshake time rather than at authentication
+    /// time, the first connection would be closed here and the PING would never
+    /// be answered.
+    /// </summary>
+    [Fact]
+    public async Task AnUnauthenticatedConnectionCannotDisplaceALiveSession()
+    {
+        var identity = new IdentityStore(_directory).LoadOrCreate();
+        var options = LoopbackOptions(port: 0);
+        var statuses = new StatusLog();
+        await using var listener = new TlsListener(
+            identity,
+            options,
+            new AuthRateLimiter(),
+            new AgentMetrics(),
+            statuses.Record);
+
+        listener.Start();
+        var endpoint = listener.Endpoints.Single();
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+
+        await using var live = await AuthenticateAsync(endpoint, identity, cancellation.Token);
+        var liveReader = new FrameReader(live);
+
+        // The silent intruder: TLS completes, then nothing. It is disposed only
+        // after the assertions, so its socket stays open for the whole window.
+        await using var intruder = await ConnectPinnedAsync(endpoint, identity.Fingerprint);
+        var intruderReader = new FrameReader(intruder);
+        await intruderReader.ReadFrameAsync(cancellation.Token); // GREETING, then silence.
+
+        // Long enough for the 2 s HELLO deadline to expire and the intruder to
+        // be dropped. The live connection's PeerDeadTimeout is 30 s, so it is
+        // not at risk of being closed for its own silence during this wait.
+        await Task.Delay(TimeSpan.FromSeconds(4), cancellation.Token);
+
+        var intruderClosed = false;
+        try
+        {
+            intruderClosed = await intruderReader.ReadFrameAsync(cancellation.Token) is null;
+        }
+        catch (Exception exception) when (exception is IOException or ProtocolException or ObjectDisposedException)
+        {
+            intruderClosed = true;
+        }
+
+        Assert.True(intruderClosed, "the unauthenticated connection was not dropped");
+
+        // The live session is still the current one and still serving.
+        var ping = FrameCodec.EncodeFrame(
+            FrameType.Control,
+            ControlCodec.Encode(ControlMessages.Ping(7)));
+        await live.WriteAsync(ping, cancellation.Token);
+        await live.FlushAsync(cancellation.Token);
+
+        var pong = ControlCodec.Decode((await liveReader.ReadFrameAsync(cancellation.Token))!.Value.Payload);
+        Assert.Equal("PONG", pong["type"]);
+        Assert.Equal(7L, pong["seq"]);
+
+        // And the listener never announced that it lost its connection.
+        statuses.AssertLastStatusIs(AgentStatus.Idle);
+    }
+
     [Fact]
     public async Task AClientThatNeverSendsHelloIsDroppedAtTheDeadline()
     {
@@ -228,6 +307,29 @@ public class TlsListenerTests : IDisposable
 
         Assert.True(closed);
         Assert.Equal(1, limiter.ConsecutiveFailures);
+    }
+
+    [Fact]
+    public async Task StartingTwiceOrAfterDisposalIsRejected()
+    {
+        var identity = new IdentityStore(_directory).LoadOrCreate();
+        var listener = new TlsListener(
+            identity,
+            LoopbackOptions(port: 0),
+            new AuthRateLimiter(),
+            new AgentMetrics(),
+            (_, _) => { });
+
+        listener.Start();
+
+        // A second Start would bind a second set of sockets that the first set's
+        // teardown never sees.
+        Assert.Throws<InvalidOperationException>(listener.Start);
+
+        await listener.DisposeAsync();
+
+        // And a Start after disposal would leave listeners running past the drain.
+        Assert.Throws<ObjectDisposedException>(listener.Start);
     }
 
     private static async Task<SslStream> AuthenticateAsync(

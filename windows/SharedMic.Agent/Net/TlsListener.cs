@@ -39,6 +39,7 @@ public sealed class TlsListener : IAsyncDisposable
     private readonly object _gate = new();
 
     private ControlConnection? _current;
+    private bool _started;
     private bool _disposed;
 
     public TlsListener(
@@ -57,8 +58,26 @@ public sealed class TlsListener : IAsyncDisposable
 
     public IReadOnlyList<IPEndPoint> Endpoints { get; private set; } = Array.Empty<IPEndPoint>();
 
+    /// <summary>
+    /// Binds once. A second call would open a second set of listeners that the
+    /// first set's teardown never sees, and a call after disposal would leave
+    /// listeners running past the drain in DisposeAsync — both are programming
+    /// errors, so both throw rather than quietly leaking a socket.
+    /// </summary>
     public void Start()
     {
+        lock (_gate)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+
+            if (_started)
+            {
+                throw new InvalidOperationException("the listener has already been started");
+            }
+
+            _started = true;
+        }
+
         var addresses = _options.LoopbackOnly
             ? new[] { IPAddress.Loopback }
             : PrivateAddress.Enumerate().ToArray();
@@ -93,12 +112,15 @@ public sealed class TlsListener : IAsyncDisposable
         // reads it after Start() cannot observe a half-filled list.
         Endpoints = endpoints;
 
+        // Announced BEFORE the first accept loop runs. Announcing it afterwards
+        // would race a client that authenticated in the meantime, and this
+        // Disconnected would overwrite its Idle with nothing to correct it.
+        _onStatus(AgentStatus.Disconnected, null);
+
         foreach (var listener in _listeners)
         {
             _acceptLoops.Add(Task.Run(() => AcceptLoopAsync(listener, _stopping.Token), CancellationToken.None));
         }
-
-        _onStatus(AgentStatus.Disconnected, null);
     }
 
     public async ValueTask DisposeAsync()
@@ -204,15 +226,22 @@ public sealed class TlsListener : IAsyncDisposable
 
     private async Task ServeAsync(TcpClient client, CancellationToken cancellationToken)
     {
-        var remote = client.Client.RemoteEndPoint?.ToString() ?? "unknown";
-        _metrics.IncrementConnectionsAccepted();
-        AgentLog.Info($"connection from {remote}");
+        // Everything, including reading the remote endpoint, happens inside the
+        // try. A peer that resets between accept and this line makes
+        // RemoteEndPoint throw, and outside the try that would both fault this
+        // task unobserved and leak the TcpClient — the two failures the general
+        // catch clause and the finally below exist to prevent.
+        var remote = "unknown";
 
         SslStream? ssl = null;
         ControlConnection? connection = null;
 
         try
         {
+            remote = client.Client.RemoteEndPoint?.ToString() ?? "unknown";
+            _metrics.IncrementConnectionsAccepted();
+            AgentLog.Info($"connection from {remote}");
+
             client.NoDelay = true;
             ssl = new SslStream(client.GetStream(), leaveInnerStreamOpen: false);
 
@@ -275,6 +304,11 @@ public sealed class TlsListener : IAsyncDisposable
                     {
                         _current = null;
                     }
+
+                    // Inside the same critical section as the read of _current,
+                    // so a concurrent Adopt cannot slip between them and have
+                    // its Idle overwritten by this Disconnected.
+                    PublishStatus();
                 }
 
                 // Only after RunAsync has returned: DisposeAsync disposes the
@@ -289,7 +323,13 @@ public sealed class TlsListener : IAsyncDisposable
 
             client.Dispose();
             AgentLog.Info($"connection from {remote} closed");
-            PublishStatus();
+
+            if (connection is null)
+            {
+                // A connection that never got past the handshake was never
+                // current, so its only status publish is this one.
+                PublishStatus();
+            }
         }
     }
 
@@ -307,6 +347,11 @@ public sealed class TlsListener : IAsyncDisposable
         {
             previous = _current;
             _current = connection;
+
+            // Published inside the swap's critical section, so no other
+            // publisher can interleave between installing this connection and
+            // announcing it.
+            PublishStatus();
         }
 
         if (previous is not null && !ReferenceEquals(previous, connection))
@@ -314,18 +359,24 @@ public sealed class TlsListener : IAsyncDisposable
             AgentLog.Info("a newer authenticated connection superseded the previous one");
             _ = Task.Run(previous.Close, CancellationToken.None);
         }
-
-        PublishStatus();
     }
 
+    /// <summary>
+    /// Reads _current and publishes it in the SAME critical section. Reading
+    /// under the lock and publishing outside it lets two publishers reorder: a
+    /// dying non-current connection can read "no current connection", be
+    /// preempted while Adopt installs and announces a new one, and then resume
+    /// to announce Disconnected. Nothing re-publishes afterwards, so the tray
+    /// would latch on a wrong status for as long as that connection lives —
+    /// precisely across the window supersession opens. The callback was already
+    /// invoked from arbitrary threads, so serialising it changes no contract it
+    /// had.
+    /// </summary>
     private void PublishStatus()
     {
-        bool connected;
         lock (_gate)
         {
-            connected = _current is not null;
+            _onStatus(_current is not null ? AgentStatus.Idle : AgentStatus.Disconnected, null);
         }
-
-        _onStatus(connected ? AgentStatus.Idle : AgentStatus.Disconnected, null);
     }
 }
