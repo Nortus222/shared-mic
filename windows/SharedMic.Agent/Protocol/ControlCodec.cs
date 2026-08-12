@@ -6,10 +6,34 @@ namespace SharedMic.Agent.Protocol;
 /// <summary>
 /// The CONTROL payload of protocol-v1.md section 5: a single UTF-8 JSON object
 /// with no line breaks or padding, keys sorted lexicographically (recursively),
-/// and no ASCII escaping of non-ASCII characters. Those bytes must be identical
-/// to what json.dumps(msg, sort_keys=True, separators=(",", ":")) produces in
-/// the reference harness, which is what makes two implementations that build
-/// the same logical message interoperable byte for byte.
+/// and no ASCII escaping of non-ASCII characters. The target is the bytes that
+/// json.dumps(msg, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+/// produces in the reference harness, which is what makes two implementations
+/// that build the same logical message interoperable byte for byte.
+///
+/// That target is met for every string this protocol realistically carries, but
+/// not universally: JavaScriptEncoder.UnsafeRelaxedJsonEscaping is close to
+/// Python's ensure_ascii=False, not identical to it. Measured on .NET 10, the
+/// two diverge in exactly two ways. First, .NET escapes as a \u sequence a
+/// handful of code points Python emits as raw UTF-8: U+007F (DEL),
+/// U+0080-U+009F, U+00A0 (no-break space), U+2028, U+2029, U+FDD0-U+FDEF, and
+/// the U+FFFE/U+FFFF noncharacters. Second, for the control characters both
+/// sides escape, .NET writes the hex digits in uppercase and Python writes them
+/// in lowercase, so U+001F becomes backslash-u-001F here and backslash-u-001f
+/// there. Everything else matches, including the characters the default encoder
+/// would have escaped: &lt; &gt; &amp; ' + = ` / are all emitted literally, and
+/// the quote, backslash, backspace, form feed, newline, carriage return and tab
+/// escapes agree.
+///
+/// The reachable case is U+00A0 inside a Windows MMDevice friendly name
+/// reaching deviceLabel. The consequence is bounded: such a payload still
+/// decodes to the identical logical message on the far end, and section 6's
+/// mac is an HMAC over the raw nonce bytes rather than over canonical JSON, so
+/// authentication is unaffected. What would break is the byte-identity claim of
+/// section 10: a vector containing one of those code points would not compare
+/// equal across the two implementations. No committed vector contains one.
+/// Closing the gap needs a custom encoder, which should be a deliberate future
+/// decision rather than something done by accident.
 ///
 /// Validation runs on both encode and decode, deliberately: a bug here should
 /// surface as a loud local failure rather than as bytes the far end has to
@@ -43,10 +67,10 @@ public static class ControlCodec
         Indented = false,
         SkipValidation = false,
 
-        // The default encoder escapes every non-ASCII character as \uXXXX and
-        // also escapes characters such as '+' and '&'. The reference encoder
-        // uses ensure_ascii=False and escapes only what JSON requires, so the
-        // relaxed encoder is what produces matching bytes.
+        // The default encoder escapes every non-ASCII character as a \u
+        // sequence and also escapes characters such as '+' and '&'. The
+        // reference encoder uses ensure_ascii=False and escapes only what JSON
+        // requires, so the relaxed encoder is what produces matching bytes.
         Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
     };
 
@@ -192,6 +216,7 @@ public static class ControlCodec
         JsonValueKind.True => true,
         JsonValueKind.False => false,
         JsonValueKind.Null => null,
+
         // The cast to object is load bearing: without it both branches of the
         // conditional would unify to double, and every integer on the wire —
         // including "v" — would decode as a double instead of a long.
@@ -201,6 +226,9 @@ public static class ControlCodec
 
     private static void WriteObject(Utf8JsonWriter writer, IReadOnlyDictionary<string, object?> message)
     {
+        // Ordinal, never culture-aware: the reference encoder sorts keys by
+        // code point, and a culture-aware collation would order pairs such as
+        // "Z" and "a" the other way round.
         writer.WriteStartObject();
         foreach (var key in message.Keys.OrderBy(key => key, StringComparer.Ordinal))
         {

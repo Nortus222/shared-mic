@@ -32,6 +32,28 @@ public class ControlCodecTests
     }
 
     [Fact]
+    public void SortsKeysByCodePointNotByCulture()
+    {
+        // Ordinal puts 'Z' (0x5A) before 'a' (0x61); most culture-aware
+        // collations put "a" first. No real v1 message has a key pair that
+        // distinguishes the two, so without this test swapping the comparer in
+        // ControlCodec would leave every other test green and fail only against
+        // a real Mac.
+        var message = new Dictionary<string, object?>
+        {
+            ["v"] = 1L,
+            ["type"] = "PING",
+            ["seq"] = 1L,
+            ["a"] = "lower",
+            ["Z"] = "upper",
+        };
+
+        Assert.Equal(
+            "{\"Z\":\"upper\",\"a\":\"lower\",\"seq\":1,\"type\":\"PING\",\"v\":1}",
+            Encoding.UTF8.GetString(ControlCodec.Encode(message)));
+    }
+
+    [Fact]
     public void KeyOrderAtTheCallSiteDoesNotChangeTheBytes()
     {
         var a = new Dictionary<string, object?> { ["v"] = 1L, ["type"] = "STOP", ["requestId"] = "r", ["sessionId"] = "s" };
