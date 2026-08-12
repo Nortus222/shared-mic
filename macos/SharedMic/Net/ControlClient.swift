@@ -86,6 +86,13 @@ public final class ControlClient {
 
     /// Counters only — the PCM itself is discarded the moment it is validated.
     /// Phase 1 has no renderer, and audio payload is never logged or persisted.
+    ///
+    /// `audioFramesReceived`/`audioBytesReceived` are cumulative for the whole
+    /// connection, by design — they are what makes "an idle connection carries
+    /// zero audio bytes" assertable. `sequenceGaps` is also connection-lifetime,
+    /// but its baseline is reset on every `START_ACK` (protocol-v1 §4: sequence
+    /// starts at 0 per session), so a legitimate session restart on the same
+    /// connection is never counted as a gap.
     public var audioFramesReceived: Int { queue.sync { frameCount } }
     public var audioBytesReceived: Int { queue.sync { byteCount } }
     public var sequenceGaps: Int { queue.sync { gapCount } }
@@ -190,6 +197,27 @@ public final class ControlClient {
                     throw ControlClientError.protocolViolation("PONG seq \(seq) matches no outstanding PING")
                 }
                 return
+            }
+            if case .stopAck = message {
+                // protocol-v1 §4: audio `sequence` starts at 0 per session. Reset
+                // the gap-detection baseline the moment a session is confirmed
+                // over, so the next AUDIO frame — from whichever session sends it
+                // next — establishes a fresh baseline instead of being compared
+                // against this session's tail.
+                //
+                // Deliberately anchored to STOP_ACK rather than the next
+                // START_ACK: the mock (and, per protocol-v1 §7, a legitimate
+                // Windows implementation) may start a new session's audio thread
+                // before it enqueues that session's own START_ACK for sending, so
+                // the new session's frame 0 can race ahead of its own START_ACK on
+                // the wire. STOP_ACK carries no such race — the outgoing session's
+                // audio thread is joined and its queue drained synchronously
+                // before STOP_ACK is ever enqueued, and the next session's first
+                // control or audio byte cannot reach this client until this
+                // client's own STOP request — and therefore this STOP_ACK — has
+                // already been sent and observed, by the ordering guarantee of a
+                // single TCP stream.
+                lastSequence = nil
             }
             let client = self
             DispatchQueue.main.async { [weak self] in

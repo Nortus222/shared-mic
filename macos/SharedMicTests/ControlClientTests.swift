@@ -241,4 +241,49 @@ final class ControlClientTests: XCTestCase {
         wait(for: [quiet], timeout: 5.0)
         XCTAssertEqual(client.audioFramesReceived, afterStop, "audio continued after STOP_ACK")
     }
+
+    /// protocol-v1 §4: audio `sequence` "starts at 0 per session". Regression
+    /// test for a false-positive gap count: `lastSequence` used to be
+    /// connection-lifetime state, so the first AUDIO frame of a restarted
+    /// session (legitimately 0) was compared against the previous session's
+    /// tail and miscounted as a gap. Mirrors the harness's
+    /// `test_full_lifecycle_leaves_no_sequence_gaps` / `test_session_can_be_restarted`.
+    func testSequenceGapsAreNotFalselyCountedAcrossASessionRestart() throws {
+        let server = try MockWindowsServerProcess()
+        defer { server.terminate() }
+        let delegate = RecordingDelegate()
+        let (client, transport) = try makeAuthenticatedClient(server, delegate: delegate)
+        defer { client.stop(); transport.close() }
+
+        func runOneSessionCycle(index: Int) {
+            var sessionId = ""
+            let started = expectation(description: "START_ACK \(index)")
+            delegate.onMessage = { message in
+                if case .startAck(_, let id, _) = message {
+                    sessionId = id
+                    started.fulfill()
+                }
+            }
+            client.send(.start(requestId: "start-\(index)", preferredFormat: .v1))
+            wait(for: [started], timeout: 10.0)
+
+            let streaming = expectation(description: "audio arrived \(index)")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { streaming.fulfill() }
+            wait(for: [streaming], timeout: 5.0)
+
+            let stopped = expectation(description: "STOP_ACK \(index)")
+            delegate.onMessage = { message in
+                if case .stopAck = message { stopped.fulfill() }
+            }
+            client.send(.stop(requestId: "stop-\(index)", sessionId: sessionId))
+            wait(for: [stopped], timeout: 10.0)
+        }
+
+        runOneSessionCycle(index: 1)
+        runOneSessionCycle(index: 2)
+
+        XCTAssertGreaterThan(client.audioFramesReceived, 20, "expected audio frames from both sessions")
+        XCTAssertEqual(client.sequenceGaps, 0,
+                       "a legitimate session restart on the same connection must not be counted as a gap")
+    }
 }
