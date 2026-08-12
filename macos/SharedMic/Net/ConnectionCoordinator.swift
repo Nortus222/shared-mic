@@ -48,6 +48,13 @@ public final class ConnectionCoordinator: ControlClientDelegate {
     private var shuttingDown = false
     private var requestCounter = 0
     private var totalAudioBytes = 0
+    /// Bumped every time `teardownConnection()` runs. Captured by each connect
+    /// attempt's completion closure so a completion that resolves on
+    /// `PinnedTLSTransport`'s own queue after this coordinator has already
+    /// moved on (a fresh attempt, `unpair()`, or `shutdown()`) can recognize
+    /// itself as stale and do nothing, rather than mutate `self.client` out
+    /// from under whatever attempt is actually current.
+    private var connectionGeneration = 0
 
     public init(store: PairingStore, clientId: String = Host.current().localizedName ?? "mac") {
         self.store = store
@@ -71,13 +78,24 @@ public final class ConnectionCoordinator: ControlClientDelegate {
     /// Temporary Phase 1 scaffolding: called once at launch to resume a stored
     /// pairing. Deliberately does NOT feed `.paired` into `SessionController` —
     /// that event is reserved for the completion of an explicit `pair(...)`
-    /// ceremony. Loading a stored record and reconnecting from it must never be
-    /// able to escape a `.hardStop` left over from a prior run (in-memory state
-    /// does not survive a relaunch in the first place, so there is nothing to
-    /// escape from here — see the coordinator's report for the full story).
+    /// ceremony.
+    ///
+    /// A stored record whose `hardStopPresentedFingerprint` is set means the
+    /// *previous* run hard-stopped on this exact peer and never got an explicit
+    /// re-pair before exiting. `AgentState` itself is in-memory and does not
+    /// survive a relaunch, but the record does — so rather than dialing the
+    /// mismatching peer again to rediscover what is already known, this feeds
+    /// the same `.fingerprintMismatch` event `SessionController` already
+    /// understands and never opens a connection. Only a successful `pair(...)`
+    /// (which always produces a record with this field unset) or `unpair()`
+    /// (which clears the whole record) can get past this.
     public func startIfPaired() {
         queue.async { [weak self] in
-            guard let self, self.record != nil else { return }
+            guard let self, let record = self.record else { return }
+            if let presented = record.hardStopPresentedFingerprint {
+                self.applyFingerprintMismatch(expected: record.certificateFingerprint, presented: presented)
+                return
+            }
             self.openConnection()
         }
     }
@@ -119,6 +137,7 @@ public final class ConnectionCoordinator: ControlClientDelegate {
             self.pairingInProgress = true
             self.cancelReconnect()
             self.teardownConnection()
+            let generation = self.connectionGeneration
 
             // Fresh transport per attempt: `PinnedTLSTransport.connect` resets
             // per-connection state, so reusing an instance across attempts would
@@ -129,6 +148,9 @@ public final class ConnectionCoordinator: ControlClientDelegate {
             transport.connect(host: host, port: port, mode: .trustOnFirstUse) { [weak self] result in
                 guard let self else { return }
                 self.queue.async {
+                    // A newer attempt (or unpair()/shutdown()) already tore this
+                    // one down — this completion belongs to a dead attempt.
+                    guard self.connectionGeneration == generation else { return }
                     switch result {
                     case .failure(let error):
                         self.pairingInProgress = false
@@ -199,6 +221,7 @@ public final class ConnectionCoordinator: ControlClientDelegate {
         guard !shuttingDown, let record else { return }
         if case .hardStop = controller.state { return }
         teardownConnection()
+        let generation = self.connectionGeneration
 
         apply(controller.handle(.connectAttemptStarted))
         publishState()
@@ -211,6 +234,10 @@ public final class ConnectionCoordinator: ControlClientDelegate {
                           mode: .pinned(fingerprint: record.certificateFingerprint)) { [weak self] result in
             guard let self else { return }
             self.queue.async {
+                // See the matching guard in `pair(...)`: a stale completion from
+                // an attempt this coordinator has already abandoned must not
+                // mutate `self.client` or drive the state machine.
+                guard self.connectionGeneration == generation else { return }
                 switch result {
                 case .success:
                     let client = ControlClient(transport: transport,
@@ -221,24 +248,44 @@ public final class ConnectionCoordinator: ControlClientDelegate {
                     client.begin()
                 case .failure(let error):
                     if case .fingerprintMismatch(let expected, let presented) = (error as? TransportError) {
-                        self.apply(self.controller.handle(
-                            .fingerprintMismatch(expected: expected, presented: presented)))
+                        self.applyFingerprintMismatch(expected: expected, presented: presented)
                     } else {
                         self.apply(self.controller.handle(
                             .connectionLost(reason: String(describing: error))))
+                        self.publishState()
                     }
-                    self.publishState()
                 }
             }
         }
     }
 
     private func teardownConnection() {
+        // Invalidates every in-flight connect completion and delegate callback
+        // captured against the attempt being torn down here.
+        connectionGeneration += 1
         if let client { totalAudioBytes += client.audioBytesReceived }
         client?.stop()
         client = nil
         transport?.close()
         transport = nil
+    }
+
+    /// The single place that both records a fingerprint mismatch (so a relaunch
+    /// can reconstruct `.hardStop` from the store instead of reconnecting to
+    /// find out again — see `startIfPaired()`) and drives it through the normal
+    /// `SessionController`/`apply(...)` pipeline.
+    private func applyFingerprintMismatch(expected: String, presented: String) {
+        if let current = record {
+            let updated = PairingRecord(host: current.host,
+                                        port: current.port,
+                                        token: current.token,
+                                        certificateFingerprint: current.certificateFingerprint,
+                                        hardStopPresentedFingerprint: presented)
+            record = updated
+            try? store.save(updated)
+        }
+        apply(controller.handle(.fingerprintMismatch(expected: expected, presented: presented)))
+        publishState()
     }
 
     // MARK: - Actions
@@ -338,7 +385,10 @@ public final class ConnectionCoordinator: ControlClientDelegate {
                                              micPresent: Bool,
                                              deviceLabel: String) {
         queue.async { [weak self] in
-            guard let self else { return }
+            // Identity, not just non-nil: a stale delegate callback from an
+            // attempt this coordinator has already abandoned (torn down by a
+            // newer attempt, unpair(), or shutdown()) must not resurrect it.
+            guard let self, client === self.client else { return }
             if let pending = self.pendingPairing {
                 // The token proved out on this connection, so the certificate it
                 // presented is now trustworthy enough to pin.
@@ -367,7 +417,7 @@ public final class ConnectionCoordinator: ControlClientDelegate {
 
     public func controlClient(_ client: ControlClient, didReceive message: ControlMessage) {
         queue.async { [weak self] in
-            guard let self else { return }
+            guard let self, client === self.client else { return }
             switch message {
             case .startAck(let requestId, let sessionId, _):
                 self.startTimeoutTimer?.cancel(); self.startTimeoutTimer = nil
@@ -394,7 +444,7 @@ public final class ConnectionCoordinator: ControlClientDelegate {
 
     public func controlClient(_ client: ControlClient, didCloseWith error: Error?) {
         queue.async { [weak self] in
-            guard let self else { return }
+            guard let self, client === self.client else { return }
             self.cancelSessionTimers()
             if let pending = self.pendingPairing {
                 // Closed before HELLO_ACK: the token was wrong, or the peer hung up.

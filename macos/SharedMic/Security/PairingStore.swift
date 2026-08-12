@@ -8,12 +8,26 @@ public struct PairingRecord: Equatable {
     public let port: UInt16
     public let token: Data
     public let certificateFingerprint: String
+    /// Non-nil means the pinned peer's most recent certificate did not match
+    /// `certificateFingerprint` — the "presented" side of a hard stop, kept
+    /// alongside the "expected" `certificateFingerprint` above so a relaunch can
+    /// reconstruct `.hardStop` from the stored record alone rather than dialing
+    /// the mismatching peer again to rediscover it. Set only by
+    /// `ConnectionCoordinator` on a `fingerprintMismatch` event; cleared by any
+    /// record a successful `pair(...)` produces (the explicit user pairing
+    /// action the spec sanctions) and by `unpair()` clearing the whole record.
+    public let hardStopPresentedFingerprint: String?
 
-    public init(host: String, port: UInt16, token: Data, certificateFingerprint: String) {
+    public init(host: String,
+               port: UInt16,
+               token: Data,
+               certificateFingerprint: String,
+               hardStopPresentedFingerprint: String? = nil) {
         self.host = host
         self.port = port
         self.token = token
         self.certificateFingerprint = certificateFingerprint.lowercased()
+        self.hardStopPresentedFingerprint = hardStopPresentedFingerprint?.lowercased()
     }
 }
 
@@ -77,12 +91,15 @@ public final class KeychainPairingStore: PairingStore {
     }
 
     public func save(_ record: PairingRecord) throws {
-        let payload: [String: Any] = [
+        var payload: [String: Any] = [
             "host": record.host,
             "port": Int(record.port),
             "tokenHex": Hex.encode(record.token),
             "certificateFingerprint": record.certificateFingerprint
         ]
+        if let hardStopPresentedFingerprint = record.hardStopPresentedFingerprint {
+            payload["hardStopPresentedFingerprint"] = hardStopPresentedFingerprint
+        }
         let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
 
         // Delete-then-add keeps save idempotent and avoids a partial update.
@@ -123,7 +140,8 @@ public final class KeychainPairingStore: PairingStore {
         return PairingRecord(host: host,
                              port: UInt16(truncatingIfNeeded: port),
                              token: token,
-                             certificateFingerprint: fingerprint)
+                             certificateFingerprint: fingerprint,
+                             hardStopPresentedFingerprint: object["hardStopPresentedFingerprint"] as? String)
     }
 
     public func clear() throws {
