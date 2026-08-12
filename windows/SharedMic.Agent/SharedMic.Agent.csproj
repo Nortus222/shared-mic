@@ -12,8 +12,8 @@
     <RootNamespace>SharedMic.Agent</RootNamespace>
   </PropertyGroup>
 
-  <ItemGroup>
-    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="10.0.0" />
-  </ItemGroup>
+  <!-- System.Security.Cryptography.ProtectedData needs no PackageReference here:
+       the net10.0-windows shared framework already provides it, and referencing
+       the package raises NU1510. -->
 
 </Project>

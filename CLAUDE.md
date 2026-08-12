@@ -26,23 +26,50 @@ both implementations and the conformance harness. Treat it as an API, not an imp
 
 ## Commands
 
-The Windows and macOS agent projects are created in Phase 1; there is nothing to build for them
-yet. The protocol harness and both Phase 0 probes exist now. Every command below has actually been
-run on this machine — see `harness/README.md` and `docs/superpowers/probes/` for more detail.
+The macOS agent project is created in a later phase; there is nothing to build for it yet. The
+protocol harness, both Phase 0 probes, and the Phase 1 Windows agent exist now.
 
-**Harness (from `harness/`).** There is no bare `python` on this machine's `PATH`, and the system
-`python3` has no `pytest` installed — use the project virtualenv's interpreter explicitly rather
-than relying on `PATH` or activation:
+**Windows agent (from `windows\`, on the Windows host).** Requires the .NET SDK pinned in
+`windows/global.json` (10.0.302). The `net10.0-windows` target framework and WinForms tray mean
+these do not build on macOS. All four were run on the Windows host on 2026-08-11:
 
-```sh
-cd harness
-.venv/bin/python -m pip install -e '.[dev]'   # install (already done in .venv; cryptography builds from source and takes several minutes)
-.venv/bin/python -m pytest -v                 # run the conformance suite (101 tests)
-.venv/bin/python tools/generate_vectors.py    # regenerate protocol/vectors/*.json — a deliberate act, see protocol-v1.md §10
+```powershell
+dotnet build SharedMic.Windows.sln                   # Build succeeded. 0 Warning(s) 0 Error(s)
+dotnet test SharedMic.Windows.sln                    # 228 tests
+dotnet run --project SharedMic.Agent                 # tray icon plus a console log
+dotnet run --project SharedMic.Agent -- --headless   # console only, Ctrl+C to quit
 ```
 
+Other flags: `--port N`, `--no-mic`, `--device-label TEXT`, `--data-dir PATH`, `--loopback-only`.
+Phase 1 is transport and security only — `--no-mic` and `--device-label` are configuration flags,
+not device queries, because there is no capture path yet.
+
+The `.csproj` files are XML: **never put a doubled hyphen inside an `<!-- -->` comment.** It is
+illegal XML and fails the build with `MSB4025`.
+
+**Harness (from `harness/`).** There is no bare `python` on `PATH` on either machine — use the
+project virtualenv's interpreter explicitly rather than relying on `PATH` or activation. Note the
+leading dot in `.venv`; a stale `harness/venv` also exists and is not usable. The interpreter path
+is layout-specific: `\.venv\Scripts\python.exe` on Windows, `.venv/bin/python` on macOS. The
+Windows form below is what was actually run here:
+
+```powershell
+cd harness
+.venv\Scripts\python.exe -m pip install -e ".[dev]"    # already done; cryptography builds from source and takes several minutes
+.venv\Scripts\python.exe -m pytest -q                  # the conformance suite (101 tests)
+.venv\Scripts\python.exe tools\generate_vectors.py     # regenerate protocol/vectors/*.json — a deliberate act, see protocol-v1.md §10
+.venv\Scripts\python.exe tools\drive_windows_agent.py --host 127.0.0.1 --port 47800 `
+    --pairing <pairing-string> --fingerprint <hex> --mode session
+```
+
+`drive_windows_agent.py` points the mock Mac client at a running Windows agent. Its `--mode` values
+are `session` (handshake, heartbeat, idempotent START/STOP, zero audio bytes), `nack` (run the agent
+with `--no-mic`), and `lockout` (five bad-token attempts then the 30-second refusal). Take
+`--pairing` and `--fingerprint` from the agent's startup banner or its tray menu.
+
 **macOS demand-detection probe (from `probes/macos-demand/`).** Built and run on the target Mac
-(macOS 26.6.1); see `docs/superpowers/probes/2026-08-08-macos-demand-findings.md` for full results:
+(macOS 26.6.1) during Phase 0; it cannot be built on the Windows host. See
+`docs/superpowers/probes/2026-08-08-macos-demand-findings.md` for full results:
 
 ```sh
 cd probes/macos-demand
@@ -51,9 +78,9 @@ swiftc -O -o demand-probe DemandProbe.swift
 ```
 
 **Windows WASAPI latency probe (from `probes/windows-wasapi-latency/`).** Written for
-`net10.0-windows` and NAudio, both Windows-only, so it cannot be built on this Mac. The owner has
-built and run it on the actual Windows host (Samson Meteorite Mic, NAudio 2.2.1, 0 warnings /
-0 errors); see `docs/superpowers/probes/2026-08-08-windows-wasapi-findings.md` for the results and
+`net10.0-windows` and NAudio, both Windows-only. The owner has built and run it on the actual
+Windows host (Samson Meteorite Mic, NAudio 2.2.1, 0 warnings / 0 errors); see
+`docs/superpowers/probes/2026-08-08-windows-wasapi-findings.md` for the results and
 `probes/windows-wasapi-latency/README.md` for the procedure:
 
 ```powershell
@@ -61,10 +88,6 @@ cd probes\windows-wasapi-latency\WasapiLatencyProbe
 dotnet build --no-incremental
 dotnet run --project WasapiLatencyProbe -- 20
 ```
-
-The `.csproj` is XML: **never put a doubled hyphen inside an `<!-- -->` comment.** It is illegal XML
-and fails the build with `MSB4025`. Two slipped through review here precisely because nobody in this
-repo could compile the file.
 
 ## Design constraints that are not negotiable
 
