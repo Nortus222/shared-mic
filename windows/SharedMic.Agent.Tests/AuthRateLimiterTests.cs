@@ -140,6 +140,59 @@ public class AuthRateLimiterTests
     }
 
     [Fact]
+    public void FailuresWhileLockedOutAreNotCountedAndDoNotExtendTheLockout()
+    {
+        var clock = new TestClock();
+        var limiter = new AuthRateLimiter(clock: clock.Read);
+
+        for (var i = 0; i < 5; i++)
+        {
+            limiter.RecordFailure();
+        }
+
+        Assert.True(limiter.IsLockedOut);
+        var remainingBefore = limiter.LockoutRemaining;
+
+        // A caller that skips TryBeginAttempt() (e.g. a generic error path that
+        // fires without re-querying the limiter) must not be able to extend or
+        // renew the lockout, and the extra failure must not be counted.
+        limiter.RecordFailure();
+
+        Assert.Equal(remainingBefore, limiter.LockoutRemaining);
+        Assert.Equal(0, limiter.ConsecutiveFailures);
+        Assert.Equal(1, limiter.LockoutCount);
+
+        clock.Advance(TimeSpan.FromSeconds(30));
+        Assert.False(limiter.IsLockedOut);
+
+        for (var i = 0; i < 4; i++)
+        {
+            limiter.RecordFailure();
+        }
+
+        Assert.False(limiter.IsLockedOut);
+
+        limiter.RecordFailure();
+        Assert.True(limiter.IsLockedOut);
+        Assert.Equal(2, limiter.LockoutCount);
+    }
+
+    [Fact]
+    public void LockoutIsOpenAtExactlyTheExpiryInstant()
+    {
+        var clock = new TestClock();
+        var limiter = new AuthRateLimiter(clock: clock.Read);
+
+        for (var i = 0; i < 5; i++)
+        {
+            limiter.RecordFailure();
+        }
+
+        clock.Advance(TimeSpan.FromSeconds(30));
+        Assert.False(limiter.IsLockedOut);
+    }
+
+    [Fact]
     public void ShortLockoutsAreConfigurableSoIntegrationTestsDoNotWaitThirtySeconds()
     {
         var clock = new TestClock();

@@ -100,6 +100,16 @@ public sealed class AuthRateLimiter
         lock (_gate)
         {
             ExpireLockout();
+            if (_clock() < _lockedUntil)
+            {
+                // Still locked out: attempts made while locked out must not be
+                // counted and must not extend or renew the lockout. Callers are
+                // expected to check TryBeginAttempt() first, but this guard makes
+                // the guarantee structural rather than relying on caller
+                // discipline alone.
+                return;
+            }
+
             _consecutiveFailures++;
             if (_consecutiveFailures >= _maxFailures)
             {
