@@ -1,4 +1,6 @@
+using SharedMic.Agent;
 using SharedMic.Agent.Protocol;
+using SharedMic.Agent.Security;
 using Xunit;
 
 namespace SharedMic.Agent.Tests;
@@ -97,5 +99,76 @@ public class ProgramArgumentTests
     public void RejectsAFlagMissingItsValue()
     {
         Assert.Throws<ArgumentException>(() => SharedMic.Agent.Program.ParseArguments(new[] { "--port" }));
+    }
+}
+
+/// <summary>
+/// Startup behaviour that is security-relevant rather than cosmetic: what the
+/// banner is allowed to print, and what happens when the identity file cannot
+/// be decrypted.
+/// </summary>
+public class ProgramStartupTests : IDisposable
+{
+    private readonly string _directory =
+        Path.Combine(Path.GetTempPath(), "sharedmic-startup-" + Guid.NewGuid().ToString("N"));
+
+    public void Dispose()
+    {
+        if (Directory.Exists(_directory))
+        {
+            Directory.Delete(_directory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void TheBannerPrintsThePairingStringOnlyOnTheRunThatMintedTheIdentity()
+    {
+        var options = new AgentOptions { DataDirectory = _directory };
+
+        var firstStore = new IdentityStore(_directory);
+        Assert.True(SharedMic.Agent.Program.TryLoadIdentity(firstStore, out var minted));
+        Assert.True(firstStore.WasNewlyCreated);
+
+        var firstBanner = new StringWriter();
+        SharedMic.Agent.Program.PrintBanner(firstBanner, minted, options, firstStore.WasNewlyCreated);
+        Assert.Contains(minted.PairingString, firstBanner.ToString(), StringComparison.Ordinal);
+
+        // A second start loads the SAME identity - and must not write the live
+        // credential into the log again. The tray menu stays the way to see it.
+        var secondStore = new IdentityStore(_directory);
+        Assert.True(SharedMic.Agent.Program.TryLoadIdentity(secondStore, out var loaded));
+        Assert.False(secondStore.WasNewlyCreated);
+        Assert.Equal(minted.PairingString, loaded.PairingString);
+
+        var secondBanner = new StringWriter();
+        SharedMic.Agent.Program.PrintBanner(secondBanner, loaded, options, secondStore.WasNewlyCreated);
+        var text = secondBanner.ToString();
+        Assert.DoesNotContain(loaded.PairingString, text, StringComparison.Ordinal);
+        Assert.Contains("tray menu", text, StringComparison.Ordinal);
+
+        // The public, non-secret fields are still there both times.
+        Assert.Contains(loaded.Fingerprint, text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void AnUndecryptableIdentityFailsWithAnActionableMessageAndLeavesTheFileAlone()
+    {
+        var store = new IdentityStore(_directory);
+        Assert.True(SharedMic.Agent.Program.TryLoadIdentity(store, out _));
+
+        // Damage the DPAPI blob: the same shape of failure a Windows password
+        // reset or a profile migration produces.
+        var path = store.IdentityFilePath;
+        var onDisk = File.ReadAllBytes(path);
+        File.WriteAllBytes(path, onDisk.AsSpan(0, onDisk.Length / 2).ToArray());
+
+        var broken = new IdentityStore(_directory);
+        Assert.False(SharedMic.Agent.Program.TryLoadIdentity(broken, out var identity));
+        Assert.Null(identity);
+
+        // Never auto-deleted and never silently re-minted: a fresh identity here
+        // would change the fingerprint and strand the Mac at its pinned-cert
+        // hard stop with no explanation.
+        Assert.True(File.Exists(path), "the damaged identity file must be left for the user to delete");
     }
 }

@@ -230,7 +230,10 @@ public sealed class ControlConnection : IAsyncDisposable
             }
             catch (Exception exception) when (exception is IOException or ObjectDisposedException)
             {
-                // Logged, NEVER counted. See NotCountedDroppedConnection below:
+                // Logged, NEVER counted. See FailAuthentication's doc comment
+                // for the §11.4 counting rule this implements, and the test
+                // APeerThatDropsWithoutSendingAnythingIsNotAFailedAttempt that
+                // pins it:
                 // a connection that dropped without ever producing a decoded
                 // control message never consulted the HMAC oracle, so counting
                 // it buys no security and hands anyone on the LAN a lockout

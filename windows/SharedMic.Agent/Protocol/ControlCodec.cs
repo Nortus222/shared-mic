@@ -101,7 +101,12 @@ public static class ControlCodec
         }
         catch (JsonException exception)
         {
-            throw new ProtocolException($"malformed JSON control payload: {exception.Message}");
+            // Quoted, not raw: System.Text.Json's message embeds the offending
+            // token and a "Path: $.<name>" segment built from attacker-supplied
+            // property names, so this is a third site where untrusted bytes
+            // reach a human-readable string. Leaving it raw would falsify
+            // Quote's docstring below.
+            throw new ProtocolException($"malformed JSON control payload: {Quote(exception.Message)}");
         }
 
         using (document)
@@ -202,8 +207,9 @@ public static class ControlCodec
 
     /// <summary>
     /// Render an untrusted decoded value for an exception message that a caller
-    /// will very likely log. The two Validate throw sites above are the only
-    /// places in this codec where a value straight off the wire — arbitrary
+    /// will very likely log. The two Validate throw sites and Decode's
+    /// malformed-JSON throw site above are the only places in this codec where a
+    /// value straight off the wire — arbitrary
     /// JSON, up to the 1 MiB payload ceiling, from a peer that has not
     /// authenticated — reaches a human-readable string. Left raw, a "type"
     /// containing a newline lets an unauthenticated peer forge whole log

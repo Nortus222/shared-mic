@@ -75,7 +75,10 @@ cd harness
 `drive_windows_agent.py` points the mock Mac client at a running Windows agent. Its `--mode` values
 are `session` (handshake, heartbeat, idempotent START/STOP, zero audio bytes), `nack` (run the agent
 with `--no-mic`), and `lockout` (five bad-token attempts then the 30-second refusal). Take
-`--pairing` and `--fingerprint` from the agent's startup banner or its tray menu.
+`--fingerprint` from the agent's startup banner, which prints it on every start. The startup banner
+prints `--pairing` **only on the run that first mints the identity** — it is a live credential and
+`--headless > agent.log` would otherwise write it into a plaintext log on every launch. On later
+starts take it from the tray menu, which still shows it on demand.
 
 **macOS demand-detection probe (from `probes/macos-demand/`).** Per
 `docs/superpowers/probes/2026-08-08-macos-demand-findings.md`, this was built and run on the target

@@ -51,14 +51,34 @@ public sealed class IdentityStore
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "SharedMic");
 
+    /// <summary>
+    /// The single file this store persists. Public so a failure path can name
+    /// the exact path the user has to delete to re-pair - "somewhere under
+    /// LocalAppData" is not an actionable instruction.
+    /// </summary>
+    public string IdentityFilePath => IdentityPath;
+
+    /// <summary>
+    /// True when the most recent <see cref="LoadOrCreate"/> MINTED the identity
+    /// rather than loading an existing one. The startup banner uses this to
+    /// print the pairing string exactly once, on the run that created it:
+    /// printing a live authentication credential on every start writes it into
+    /// the log file of the documented <c>--headless &gt; agent.log</c>
+    /// invocation, for the life of the deployment. The tray menu remains the
+    /// on-demand way to see it.
+    /// </summary>
+    public bool WasNewlyCreated { get; private set; }
+
     private string IdentityPath => Path.Combine(_directory, "identity.dpapi");
 
     public AgentIdentity LoadOrCreate()
     {
         Directory.CreateDirectory(_directory);
 
-        var identity = File.Exists(IdentityPath) ? LoadExisting() : CreateNew();
+        var isNew = !File.Exists(IdentityPath);
+        var identity = isNew ? CreateNew() : LoadExisting();
         _currentCertificate = identity.Certificate;
+        WasNewlyCreated = isNew;
         return identity;
     }
 

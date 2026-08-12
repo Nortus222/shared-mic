@@ -624,7 +624,11 @@ public class ControlConnectionTests
         // pre-auth deadline then ends the read loop and teardown begins. If
         // teardown awaited the writer before disposing the stream, RunAsync
         // would never complete and the connection would leak.
-        await run.WaitAsync(TimeSpan.FromSeconds(5));
+        // 2 s, deliberately BELOW ControlConnection.LoopDrainTimeout (5 s). Under
+        // the wrong teardown ordering RunAsync completes only after that drain
+        // timeout, so a 5 s wait here discriminates by epsilon and would stop
+        // discriminating at all if LoopDrainTimeout were ever shortened.
+        await run.WaitAsync(TimeSpan.FromSeconds(2));
 
         Assert.True(run.IsCompletedSuccessfully);
         Assert.True(stream.IsDisposed);

@@ -110,6 +110,30 @@ public sealed class PrioritySendQueue
         }
     }
 
+    /// <summary>
+    /// Offer one audio frame to the bounded ring, dropping the oldest on
+    /// overflow.
+    ///
+    /// NOT REAL-TIME SAFE. DO NOT CALL THIS FROM AN AUDIO CALLBACK. This method
+    /// is exactly the bounded, drop-oldest, never-blocking audio queue the spec
+    /// describes, which makes it look like the natural sink for a WASAPI capture
+    /// callback. It is not, for three reasons, any one of which is disqualifying
+    /// under the repo's "the audio callback is real-time safe" non-negotiable:
+    ///
+    ///   * it takes the <c>_gate</c> Monitor lock, which can block for an
+    ///     unbounded time behind a preempted sender thread;
+    ///   * <c>Channel.Writer.TryWrite</c> can queue a thread-pool work item to
+    ///     complete a pending reader, on the CALLING thread — i.e. inside the
+    ///     audio callback;
+    ///   * <c>Queue&lt;byte[]&gt;</c> grows its backing array, so the first
+    ///     frames of a session allocate, and the caller must have allocated the
+    ///     <c>byte[]</c> it passes in.
+    ///
+    /// Phase 1 never calls this on a live connection. Phase 2 MUST interpose the
+    /// lock-free <c>PCMRingBuffer</c> the repo conventions name: the capture
+    /// callback writes into that ring buffer only, and an ordinary worker thread
+    /// drains the ring and calls this method.
+    /// </summary>
     public void EnqueueAudio(byte[] frame)
     {
         lock (_gate)
@@ -159,7 +183,15 @@ public sealed class PrioritySendQueue
     {
         while (true)
         {
-            await _signal.Reader.WaitToReadAsync(cancellationToken).ConfigureAwait(false);
+            if (!await _signal.Reader.WaitToReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                // The signal channel was completed. Nothing calls
+                // Writer.Complete today, but ignoring the bool would turn any
+                // future shutdown path that does into a 100%-CPU spin here,
+                // because WaitToReadAsync returns false immediately and forever.
+                throw new ChannelClosedException(
+                    "the send queue's signal channel was completed; no further frames can be dequeued");
+            }
 
             lock (_gate)
             {

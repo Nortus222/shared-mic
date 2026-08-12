@@ -1,3 +1,5 @@
+using System.Diagnostics.CodeAnalysis;
+using System.Security.Cryptography;
 using System.Windows.Forms;
 using SharedMic.Agent.Diagnostics;
 using SharedMic.Agent.Net;
@@ -74,11 +76,19 @@ public static class Program
             return 2;
         }
 
-        var identity = new IdentityStore(options.DataDirectory).LoadOrCreate();
+        // The store is kept in scope, not discarded on the construction line:
+        // the failure path below has to name its file, and WasNewlyCreated has
+        // to survive to the banner.
+        var store = new IdentityStore(options.DataDirectory);
+        if (!TryLoadIdentity(store, out var identity))
+        {
+            return 3;
+        }
+
         var metrics = new AgentMetrics();
         var rateLimiter = new AuthRateLimiter();
 
-        PrintBanner(identity, options);
+        PrintBanner(Console.Out, identity, options, store.WasNewlyCreated);
 
         TrayApp? tray = null;
         var listener = new TlsListener(
@@ -192,19 +202,86 @@ public static class Program
         return 0;
     }
 
-    private static void PrintBanner(AgentIdentity identity, AgentOptions options)
+    /// <summary>
+    /// Load the identity, or explain - in words a user can act on - why it
+    /// cannot be loaded.
+    ///
+    /// A DPAPI blob protected under the current user stops being decryptable
+    /// when an administrator resets that user's Windows password without the
+    /// old one, or when the profile is migrated to another machine. Without
+    /// this, every launch afterwards died with an unhandled
+    /// CryptographicException and a .NET stack trace - in a tray app where the
+    /// user may never see a console at all.
+    ///
+    /// Deliberately does NOT delete the file and silently re-mint. A silent
+    /// re-mint changes the certificate fingerprint, and the Mac treats a pinned
+    /// fingerprint mismatch as a hard stop with no auto-retry and no silent
+    /// re-pair. Turning a readable failure here into an unexplained hard stop
+    /// there is strictly worse. Re-pairing stays an explicit act by the user.
+    /// </summary>
+    internal static bool TryLoadIdentity(IdentityStore store, [NotNullWhen(true)] out AgentIdentity? identity)
+    {
+        try
+        {
+            identity = store.LoadOrCreate();
+            return true;
+        }
+        catch (Exception exception) when (exception is CryptographicException or InvalidDataException)
+        {
+            identity = null;
+
+            AgentLog.Error(
+                $"the stored identity at {store.IdentityFilePath} could not be read " +
+                $"({exception.GetType().Name}: {exception.Message})");
+            AgentLog.Error(
+                "this usually means the file was created under a different Windows user profile, or the " +
+                "account's password was reset by an administrator without the old password, or the file is " +
+                "damaged. It cannot be recovered.");
+            AgentLog.Error(
+                $"to re-pair: quit the agent, delete {store.IdentityFilePath}, then start the agent again. " +
+                "It will mint a NEW identity and print a NEW pairing string, and the Mac must be paired " +
+                "again because its pinned certificate fingerprint will no longer match.");
+
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// The startup banner. Writes to the supplied writer so the pairing-string
+    /// rule below is testable.
+    ///
+    /// The pairing string is printed ONLY on the run that minted the identity.
+    /// It is a live authentication credential with no expiry: under the
+    /// documented <c>--headless &gt; agent.log</c> invocation, printing it every
+    /// start writes it into an unprotected plaintext file on every launch for
+    /// the life of the deployment, and anyone who can read that log can
+    /// authenticate as the Mac. The tray menu still shows it on demand, which is
+    /// the intended way to see it again.
+    /// </summary>
+    internal static void PrintBanner(
+        TextWriter writer, AgentIdentity identity, AgentOptions options, bool identityWasNewlyMinted)
     {
         // Never print the token itself. The pairing string is meant for the
         // user's eyes and the fingerprint is public by construction.
-        Console.WriteLine("shared-mic Windows agent, Phase 1 (transport and security only, no audio capture)");
-        Console.WriteLine($"  serverId:       {identity.ServerId}");
-        Console.WriteLine($"  port:           {options.Port}");
-        Console.WriteLine($"  micPresent:     {options.MicPresent}");
-        Console.WriteLine($"  deviceLabel:    {options.DeviceLabel}");
-        Console.WriteLine($"  data directory: {options.DataDirectory}");
-        Console.WriteLine($"  fingerprint:    {identity.Fingerprint}");
-        Console.WriteLine($"  pairing string: {identity.PairingString}");
-        Console.WriteLine();
+        writer.WriteLine("shared-mic Windows agent, Phase 1 (transport and security only, no audio capture)");
+        writer.WriteLine($"  serverId:       {identity.ServerId}");
+        writer.WriteLine($"  port:           {options.Port}");
+        writer.WriteLine($"  micPresent:     {options.MicPresent}");
+        writer.WriteLine($"  deviceLabel:    {options.DeviceLabel}");
+        writer.WriteLine($"  data directory: {options.DataDirectory}");
+        writer.WriteLine($"  fingerprint:    {identity.Fingerprint}");
+
+        if (identityWasNewlyMinted)
+        {
+            writer.WriteLine($"  pairing string: {identity.PairingString}");
+        }
+        else
+        {
+            writer.WriteLine(
+                "  pairing string: (not printed again for security - open the tray menu to view it)");
+        }
+
+        writer.WriteLine();
     }
 
     private static string Next(string[] args, ref int index, string flag)
