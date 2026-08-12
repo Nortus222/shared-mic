@@ -44,3 +44,58 @@ public class ProjectSetupTests
         Assert.All(VectorFixtures.AudioVectors(), v => Assert.NotEmpty(v.Hex));
     }
 }
+
+public class ProgramArgumentTests
+{
+    [Fact]
+    public void DefaultsMatchTheContract()
+    {
+        var options = SharedMic.Agent.Program.ParseArguments(Array.Empty<string>());
+
+        Assert.Equal(47800, options.Port);
+        Assert.True(options.MicPresent);
+        Assert.False(options.Headless);
+        Assert.False(options.LoopbackOnly);
+        Assert.Equal(TimeSpan.FromSeconds(5), options.HelloDeadline);
+        Assert.Equal(TimeSpan.FromSeconds(45), options.PeerDeadTimeout);
+    }
+
+    [Fact]
+    public void ParsesEveryFlag()
+    {
+        var options = SharedMic.Agent.Program.ParseArguments(new[]
+        {
+            "--port", "47999",
+            "--no-mic",
+            "--device-label", "Samson Meteorite",
+            "--data-dir", @"C:\temp\sharedmic",
+            "--headless",
+            "--loopback-only",
+        });
+
+        Assert.Equal(47999, options.Port);
+        Assert.False(options.MicPresent);
+        Assert.Equal("Samson Meteorite", options.DeviceLabel);
+        Assert.Equal(@"C:\temp\sharedmic", options.DataDirectory);
+        Assert.True(options.Headless);
+        Assert.True(options.LoopbackOnly);
+    }
+
+    [Fact]
+    public void RejectsAnUnknownFlag()
+    {
+        Assert.Throws<ArgumentException>(() => SharedMic.Agent.Program.ParseArguments(new[] { "--wat" }));
+    }
+
+    [Fact]
+    public void RejectsANonNumericPort()
+    {
+        Assert.Throws<ArgumentException>(() => SharedMic.Agent.Program.ParseArguments(new[] { "--port", "eleven" }));
+    }
+
+    [Fact]
+    public void RejectsAFlagMissingItsValue()
+    {
+        Assert.Throws<ArgumentException>(() => SharedMic.Agent.Program.ParseArguments(new[] { "--port" }));
+    }
+}
