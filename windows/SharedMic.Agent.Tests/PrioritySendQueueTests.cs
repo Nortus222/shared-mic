@@ -203,4 +203,104 @@ public class PrioritySendQueueTests
         Assert.Equal(9998, queue.AudioFramesEvicted);
         Assert.True(stopwatch.Elapsed < TimeSpan.FromSeconds(5), $"enqueue took {stopwatch.Elapsed}");
     }
+
+    // Fix round 1, finding I-2: the previous "race" test never actually ran
+    // concurrently. This one drives real producer/consumer/discarder threads
+    // for a bounded duration, then quiesces and checks both the accounting
+    // identity and that no phantom wake-up signals are left outstanding
+    // (finding I-1 shows up here as PendingSignalCountForTests != 0).
+    //
+    // The race that finding I-1 describes lives at the start/stop boundary
+    // of a run (a producer mid-way through Enqueue*, past the lock but not
+    // yet at Release/signal, exactly when a consumer or discarder empties
+    // the queue out from under it), so this runs many short bounded trials
+    // rather than one long one: more boundary crossings, more chances to
+    // observe it, each trial still fixed-duration and deterministic to stop.
+    [Fact]
+    public async Task ConcurrentProducersConsumerAndDiscarderReconcileWithNoPhantomSignals()
+    {
+        const int trials = 25;
+
+        for (var trial = 0; trial < trials; trial++)
+        {
+            var queue = new PrioritySendQueue();
+            var producerCount = Math.Max(4, Environment.ProcessorCount);
+            using var runFor = new CancellationTokenSource(TimeSpan.FromMilliseconds(60));
+
+            var producers = Enumerable.Range(0, producerCount).Select(p => Task.Run(() =>
+            {
+                var i = 0;
+                while (!runFor.IsCancellationRequested)
+                {
+                    if (i % 17 == 0)
+                    {
+                        queue.EnqueueControl(Marker(FrameType.Control, (byte)(i % 256)));
+                    }
+                    else
+                    {
+                        queue.EnqueueAudio(Marker(FrameType.Audio, (byte)(i % 256)));
+                    }
+
+                    i++;
+                }
+            })).ToArray();
+
+            var discarder = Task.Run(() =>
+            {
+                while (!runFor.IsCancellationRequested)
+                {
+                    queue.DiscardAudio();
+                }
+            });
+
+            long received = 0;
+            using var consumerCts = CancellationTokenSource.CreateLinkedTokenSource(runFor.Token);
+            var consumer = Task.Run(async () =>
+            {
+                try
+                {
+                    while (true)
+                    {
+                        await queue.DequeueAsync(consumerCts.Token);
+                        Interlocked.Increment(ref received);
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    // Expected once the run window closes.
+                }
+            });
+
+            await Task.WhenAll(producers);
+            await discarder;
+
+            // Stop the consumer in the same instant the run window closes (no
+            // grace period) so a wake-up signal still in flight from a
+            // producer's delayed Release/signal is not silently absorbed as a
+            // spurious wake before we inspect it. The remaining real items
+            // are mopped up synchronously below, which reconciles
+            // item-backed signals but not phantom (item-less) ones.
+            consumerCts.Cancel();
+            try
+            {
+                await consumer;
+            }
+            catch (OperationCanceledException)
+            {
+                // Expected: cancellation races the consumer's own loop exit.
+            }
+
+            while (queue.TryDequeue(out _))
+            {
+                received++;
+            }
+
+            var offered = queue.ControlFramesQueued + queue.AudioFramesOffered;
+            var accountedFor = received + queue.AudioFramesEvicted + queue.AudioFramesDiscarded;
+
+            Assert.Equal(offered, accountedFor);
+            Assert.Equal(0, queue.ControlDepth + queue.AudioDepth);
+            Assert.Equal(0, queue.PendingSignalCountForTests);
+        }
+    }
 }
