@@ -128,4 +128,29 @@ public class GoldenVectorTests
         Assert.Equal("PONG", ControlCodec.Decode(secondPayload)["type"]);
         Assert.Equal(pong.Length, secondConsumed);
     }
+
+    /// <summary>
+    /// Guards against a weakened or vacuous comparison: mutates a single byte of a
+    /// genuine vector's expected hex (in memory only — the committed vector file is
+    /// never touched) and proves the same comparison the encode tests rely on
+    /// actually fails against the real codec output. If this test ever passes
+    /// while the mutation is in place, the conformance suite's byte comparison is
+    /// no longer byte-sensitive and cannot be trusted as an interoperability gate.
+    /// </summary>
+    [Fact]
+    public void ControlVectorComparisonCatchesASingleFlippedByte()
+    {
+        var vector = VectorFixtures.Control("PING");
+        var message = ControlCodec.FromJsonElement(vector.Message);
+        var actualHex = Convert.ToHexString(
+            FrameCodec.EncodeFrame(FrameType.Control, ControlCodec.Encode(message))).ToLowerInvariant();
+
+        var corrupted = Convert.FromHexString(vector.Hex);
+        var midpoint = corrupted.Length / 2;
+        corrupted[midpoint] ^= 0xFF;
+        var corruptedHex = Convert.ToHexString(corrupted).ToLowerInvariant();
+
+        Assert.NotEqual(corruptedHex, actualHex);
+        Assert.Throws<Xunit.Sdk.EqualException>(() => Assert.Equal(corruptedHex, actualHex));
+    }
 }
