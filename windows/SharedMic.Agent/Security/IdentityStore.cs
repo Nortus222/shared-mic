@@ -59,6 +59,14 @@ public sealed class IdentityStore
     public string IdentityFilePath => IdentityPath;
 
     /// <summary>
+    /// The directory this store lives in, exactly as supplied. Public so the
+    /// unusable-data-directory failure path can echo the offending string back
+    /// verbatim - a shell that mangled it (<c>$env:TEMP</c> typed into bash)
+    /// produces a path the user will not recognise unless it is quoted back.
+    /// </summary>
+    public string DirectoryPath => _directory;
+
+    /// <summary>
     /// True when the most recent <see cref="LoadOrCreate"/> MINTED the identity
     /// rather than loading an existing one. The startup banner uses this to
     /// print the pairing string exactly once, on the run that created it:

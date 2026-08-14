@@ -24,9 +24,7 @@ public static class Program
             switch (args[i])
             {
                 case "--port":
-                    port = int.TryParse(Next(args, ref i, "--port"), out var parsed)
-                        ? parsed
-                        : throw new ArgumentException("--port expects an integer");
+                    port = ParsePort(Next(args, ref i, "--port"));
                     break;
                 case "--no-mic":
                     micPresent = false;
@@ -80,9 +78,9 @@ public static class Program
         // the failure path below has to name its file, and WasNewlyCreated has
         // to survive to the banner.
         var store = new IdentityStore(options.DataDirectory);
-        if (!TryLoadIdentity(store, out var identity))
+        if (!TryLoadIdentity(store, out var identity, out var identityExitCode))
         {
-            return 3;
+            return identityExitCode;
         }
 
         var metrics = new AgentMetrics();
@@ -218,17 +216,29 @@ public static class Program
     /// fingerprint mismatch as a hard stop with no auto-retry and no silent
     /// re-pair. Turning a readable failure here into an unexplained hard stop
     /// there is strictly worse. Re-pairing stays an explicit act by the user.
+    ///
+    /// The two failures are reported separately and exit differently, because
+    /// they are different user problems with opposite remedies. "I cannot use
+    /// this directory" (exit 4) means the --data-dir argument is wrong -
+    /// typically a shell mangled it, e.g. PowerShell's $env:TEMP typed into bash
+    /// collapsing to the literal ":TEMPfoo". "I cannot decrypt your identity"
+    /// (exit 3) means the file must be deleted and the Mac re-paired. Conflating
+    /// them would send a user to delete an identity file that is perfectly fine.
     /// </summary>
-    internal static bool TryLoadIdentity(IdentityStore store, [NotNullWhen(true)] out AgentIdentity? identity)
+    /// <param name="exitCode">The process exit code for the failure; 0 on success.</param>
+    internal static bool TryLoadIdentity(
+        IdentityStore store, [NotNullWhen(true)] out AgentIdentity? identity, out int exitCode)
     {
         try
         {
             identity = store.LoadOrCreate();
+            exitCode = 0;
             return true;
         }
         catch (Exception exception) when (exception is CryptographicException or InvalidDataException)
         {
             identity = null;
+            exitCode = 3;
 
             AgentLog.Error(
                 $"the stored identity at {store.IdentityFilePath} could not be read " +
@@ -241,6 +251,30 @@ public static class Program
                 $"to re-pair: quit the agent, delete {store.IdentityFilePath}, then start the agent again. " +
                 "It will mint a NEW identity and print a NEW pairing string, and the Mac must be paired " +
                 "again because its pinned certificate fingerprint will no longer match.");
+
+            return false;
+        }
+        catch (Exception exception) when (
+            exception is IOException            // includes DirectoryNotFound / PathTooLong
+                or ArgumentException            // malformed path, empty path, illegal characters
+                or NotSupportedException        // e.g. a colon where a drive letter cannot be
+                or UnauthorizedAccessException
+                or System.Security.SecurityException)
+        {
+            identity = null;
+            exitCode = 4;
+
+            AgentLog.Error(
+                $"the data directory '{store.DirectoryPath}' cannot be used " +
+                $"({exception.GetType().Name}: {exception.Message})");
+            AgentLog.Error(
+                "the stored identity was NOT read and NOT changed. This is a bad --data-dir value, not a " +
+                "damaged identity - do not delete anything.");
+            AgentLog.Error(
+                "check the path exists, is writable, and was not mangled by the shell. --data-dir " +
+                @"$env:TEMP\sharedmic is PowerShell syntax; in bash $env does not expand and it collapses " +
+                "to the literal ':TEMPsharedmic'. In bash use a literal path or \"$LOCALAPPDATA/Temp/sharedmic\". " +
+                "Omit --data-dir to use the default.");
 
             return false;
         }
@@ -282,6 +316,30 @@ public static class Program
         }
 
         writer.WriteLine();
+    }
+
+    /// <summary>
+    /// Range-checks the port at parse time so a usage error is reported as one.
+    /// Without the range check, a number outside 1-65535 reaches
+    /// <c>new TcpListener(address, port)</c>, which throws
+    /// ArgumentOutOfRangeException from a code path that only catches
+    /// SocketException and InvalidOperationException - i.e. an unhandled stack
+    /// trace at startup. An in-range port that is already taken still fails
+    /// later, as a handled bind error, which is the correct place for it.
+    /// </summary>
+    private static int ParsePort(string value)
+    {
+        if (!int.TryParse(value, out var port))
+        {
+            throw new ArgumentException("--port expects an integer");
+        }
+
+        if (port is < 1 or > 65535)
+        {
+            throw new ArgumentException($"--port must be between 1 and 65535 (got {port})");
+        }
+
+        return port;
     }
 
     private static string Next(string[] args, ref int index, string flag)

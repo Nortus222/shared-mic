@@ -35,7 +35,7 @@ these do not build on macOS.
 
 ```powershell
 dotnet build SharedMic.Windows.sln                   # Build succeeded. 0 Warning(s) 0 Error(s)
-dotnet test SharedMic.Windows.sln                    # 228 tests
+dotnet test SharedMic.Windows.sln                    # 239 tests
 dotnet run --project SharedMic.Agent                 # tray icon plus a console log
 dotnet run --project SharedMic.Agent -- --headless   # console only, Ctrl+C to quit
 ```
@@ -45,9 +45,18 @@ above; the tray host as `dotnet run --project SharedMic.Agent -- --loopback-only
 --data-dir <temp>` (driven end to end by `drive_windows_agent.py --mode session`); and the headless
 host in Task 14, launched from the built `SharedMic.Agent.exe` rather than through `dotnet run`.
 
-Other flags: `--port N`, `--no-mic`, `--device-label TEXT`, `--data-dir PATH`, `--loopback-only`.
-Phase 1 is transport and security only — `--no-mic` and `--device-label` are configuration flags,
-not device queries, because there is no capture path yet.
+Other flags: `--port N` (1-65535), `--no-mic`, `--device-label TEXT`, `--data-dir PATH`,
+`--loopback-only`. Phase 1 is transport and security only — `--no-mic` and `--device-label` are
+configuration flags, not device queries, because there is no capture path yet.
+
+**The command blocks above are PowerShell.** `$env:TEMP` is PowerShell syntax; in Git Bash it does
+not expand, so `--data-dir $env:TEMP\sharedmic` collapses to the literal `:TEMPsharedmic`. In bash
+use a literal path or `"$LOCALAPPDATA/Temp/sharedmic"`.
+
+Startup exit codes: `0` normal exit, `1` no private interface accepted the bind, `2` usage error
+(unknown flag, missing value, non-numeric or out-of-range `--port`), `3` the stored identity exists
+but cannot be decrypted — the file is left alone and re-pairing is an explicit act, `4` the
+`--data-dir` path is unusable (malformed, unwritable, or too long); nothing was read or written.
 
 The `.csproj` files are XML: **never put a doubled hyphen inside an `<!-- -->` comment.** It is
 illegal XML and fails the build with `MSB4025`.

@@ -100,6 +100,31 @@ public class ProgramArgumentTests
     {
         Assert.Throws<ArgumentException>(() => SharedMic.Agent.Program.ParseArguments(new[] { "--port" }));
     }
+
+    /// <summary>
+    /// An out-of-range port reached new TcpListener(address, port) and died with
+    /// an unhandled ArgumentOutOfRangeException; only SocketException and
+    /// InvalidOperationException were handled there. It is a usage error and is
+    /// now rejected as one.
+    /// </summary>
+    [Theory]
+    [InlineData("0")]
+    [InlineData("-1")]
+    [InlineData("65536")]
+    [InlineData("99999")]
+    public void RejectsAPortOutsideTheLegalRange(string port)
+    {
+        Assert.Throws<ArgumentException>(
+            () => SharedMic.Agent.Program.ParseArguments(new[] { "--port", port }));
+    }
+
+    [Theory]
+    [InlineData("1")]
+    [InlineData("65535")]
+    public void AcceptsThePortRangeEndpoints(string port)
+    {
+        Assert.Equal(int.Parse(port), SharedMic.Agent.Program.ParseArguments(new[] { "--port", port }).Port);
+    }
 }
 
 /// <summary>
@@ -126,7 +151,8 @@ public class ProgramStartupTests : IDisposable
         var options = new AgentOptions { DataDirectory = _directory };
 
         var firstStore = new IdentityStore(_directory);
-        Assert.True(SharedMic.Agent.Program.TryLoadIdentity(firstStore, out var minted));
+        Assert.True(SharedMic.Agent.Program.TryLoadIdentity(firstStore, out var minted, out var firstExit));
+        Assert.Equal(0, firstExit);
         Assert.True(firstStore.WasNewlyCreated);
 
         var firstBanner = new StringWriter();
@@ -136,7 +162,7 @@ public class ProgramStartupTests : IDisposable
         // A second start loads the SAME identity - and must not write the live
         // credential into the log again. The tray menu stays the way to see it.
         var secondStore = new IdentityStore(_directory);
-        Assert.True(SharedMic.Agent.Program.TryLoadIdentity(secondStore, out var loaded));
+        Assert.True(SharedMic.Agent.Program.TryLoadIdentity(secondStore, out var loaded, out _));
         Assert.False(secondStore.WasNewlyCreated);
         Assert.Equal(minted.PairingString, loaded.PairingString);
 
@@ -154,7 +180,7 @@ public class ProgramStartupTests : IDisposable
     public void AnUndecryptableIdentityFailsWithAnActionableMessageAndLeavesTheFileAlone()
     {
         var store = new IdentityStore(_directory);
-        Assert.True(SharedMic.Agent.Program.TryLoadIdentity(store, out _));
+        Assert.True(SharedMic.Agent.Program.TryLoadIdentity(store, out _, out _));
 
         // Damage the DPAPI blob: the same shape of failure a Windows password
         // reset or a profile migration produces.
@@ -163,12 +189,43 @@ public class ProgramStartupTests : IDisposable
         File.WriteAllBytes(path, onDisk.AsSpan(0, onDisk.Length / 2).ToArray());
 
         var broken = new IdentityStore(_directory);
-        Assert.False(SharedMic.Agent.Program.TryLoadIdentity(broken, out var identity));
+        Assert.False(SharedMic.Agent.Program.TryLoadIdentity(broken, out var identity, out var exitCode));
         Assert.Null(identity);
+
+        // Exit 3 is the corrupt-store code and must stay distinct from exit 4,
+        // the unusable-data-directory code: opposite remedies.
+        Assert.Equal(3, exitCode);
 
         // Never auto-deleted and never silently re-minted: a fresh identity here
         // would change the fingerprint and strand the Mac at its pinned-cert
         // hard stop with no explanation.
         Assert.True(File.Exists(path), "the damaged identity file must be left for the user to delete");
+    }
+
+    /// <summary>
+    /// The owner's real failure: `--data-dir $env:TEMP\sharedmic-check4` typed
+    /// into bash, where $env does not expand and the backslash collapses,
+    /// yielding the literal ":TEMPsharedmic-check4". Directory.CreateDirectory
+    /// threw IOException and the process died with a raw stack trace - in tray
+    /// mode, with no console to read it in. It must fail cleanly instead, on its
+    /// own exit code.
+    /// </summary>
+    [Theory]
+    [InlineData(":TEMPsharedmic-check4")]
+    [InlineData("bad|name")]
+    [InlineData("")]
+    public void AnUnusableDataDirectoryFailsCleanlyOnItsOwnExitCode(string directory)
+    {
+        var store = new IdentityStore(directory);
+
+        var loaded = SharedMic.Agent.Program.TryLoadIdentity(store, out var identity, out var exitCode);
+
+        Assert.False(loaded);
+        Assert.Null(identity);
+
+        // 4, not 3: this is a bad argument, not a damaged identity. Sending the
+        // user down the corrupt-store path would have them delete a file that is
+        // fine and re-pair the Mac for nothing.
+        Assert.Equal(4, exitCode);
     }
 }
