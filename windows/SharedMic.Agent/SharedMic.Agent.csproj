@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>SharedMic.Agent</AssemblyName>
+    <RootNamespace>SharedMic.Agent</RootNamespace>
+  </PropertyGroup>
+
+  <!-- System.Security.Cryptography.ProtectedData needs no PackageReference here:
+       it ships in the Microsoft.WindowsDesktop.App framework, which this project
+       references because UseWindowsForms is true. It is NOT in
+       Microsoft.NETCore.App, so moving the identity code into a non-desktop
+       library would need the package back (a compile error, not a silent
+       break). Referencing it here raises NU1510. -->
+
+</Project>
