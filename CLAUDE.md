@@ -26,8 +26,18 @@ both implementations and the conformance harness. Treat it as an API, not an imp
 
 ## Commands
 
-The macOS agent project is created in a later phase; there is nothing to build for it yet. The
-protocol harness, both Phase 0 probes, and the Phase 1 Windows agent exist now.
+The protocol harness, both Phase 0 probes, and the Phase 1 Windows and macOS agents exist
+now. Every command below has actually been run on its respective host — see `harness/README.md`
+and `docs/superpowers/probes/` for more detail.
+
+**macOS agent (from the repo root).** The project is generated, not hand-edited — see
+`macos/project.rb`. This machine's plain `/usr/bin/ruby` (2.6.10) has no `xcodeproj` gem; it lives
+under the RVM-managed Ruby, so invoke the generator through `rvm` rather than a bare `ruby`:
+
+```sh
+~/.rvm/bin/rvm default do ruby macos/project.rb   # regenerate SharedMic.xcodeproj after adding/removing a .swift file
+xcodebuild test -project macos/SharedMic.xcodeproj -scheme SharedMic -destination 'platform=macOS,arch=arm64'
+```
 
 **Windows agent (from `windows\`, on the Windows host).** Requires the .NET SDK pinned in
 `windows/global.json` (10.0.302). The `net10.0-windows` target framework and WinForms tray mean
