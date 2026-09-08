@@ -21,8 +21,12 @@ USB mic → Windows agent ══ one TLS connection ══ macOS agent → Black
 
 ## Status
 
-**Phase 0 complete: protocol and probes. No product code yet** — neither platform agent exists, and
-Phase 1 creates those projects.
+**Phase 1 complete: transport and security on both agents. No audio yet** — the Windows agent
+(`windows/`, C# / .NET, PR #5) and the macOS agent (`macos/`, Swift, PR #6) pair over TLS 1.3,
+authenticate by HMAC challenge-response, and hold a heartbeat-monitored session, verified against
+the golden vectors (239 Windows xUnit tests, 170 macOS XCTest, 101 harness tests). A `START`
+returns `START_ACK` and streams nothing: no WASAPI capture, no BlackHole render, no demand
+detection — those are Phases 2 and 3.
 
 What Phase 0 delivered, and where to start reading:
 
@@ -34,7 +38,7 @@ What Phase 0 delivered, and where to start reading:
   does not yet prove it), so the measured/unmeasured boundary is explicit rather than implied.
 - [`harness/`](harness/) — a Python reference implementation of the protocol that doubles as a
   conformance test double for both sides of the wire, with a 101-test suite. It is what Phase 1 and
-  Phase 2 build against before either agent exists. `harness/README.md` lists its known limitations.
+  Phase 2 build against; both Phase 1 agents are developed and tested against it. `harness/README.md` lists its known limitations.
 - [`docs/superpowers/probes/`](docs/superpowers/probes/) — the two throwaway probes' findings. The
   macOS demand-detection probe
   ([findings](docs/superpowers/probes/2026-08-08-macos-demand-findings.md)) changed the design: it
