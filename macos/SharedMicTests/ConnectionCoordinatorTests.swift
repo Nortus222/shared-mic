@@ -204,51 +204,99 @@ final class ConnectionCoordinatorTests: XCTestCase {
         waitForState(coordinator, description: "idle from stored pairing") { $0 == .idle }
     }
 
-    /// Temporary Phase 1 scaffolding: the manual Start/Stop that Phase 3's demand
-    /// detection replaces.
-    func testManualStartAndStopDriveASession() throws {
+    // MARK: - Phase 3 demand-driven sessions
+
+    private func demandFake() -> FakeCoreAudioQuery {
+        let fake = FakeCoreAudioQuery()
+        fake.procs = [
+            10: FakeCoreAudioQuery.Proc(pid: 501, bundle: "com.example.voice", devices: []),
+            11: FakeCoreAudioQuery.Proc(pid: 1000, bundle: "com.sharedmic.SharedMic", devices: [99]),
+        ]
+        return fake
+    }
+
+    private func demandCoordinator(fake: FakeCoreAudioQuery,
+                                   makeRenderer: (() -> RendererControl)? = nil) -> ConnectionCoordinator {
+        ConnectionCoordinator(
+            store: InMemoryPairingStore(), clientId: "mac-tests",
+            makeRenderer: makeRenderer,
+            demandSettings: InMemoryDemandSettingsStore(DemandSettings(stopDebounceMs: 500)),
+            makeObserver: { onChange in
+                AudioDemandObserver(query: fake, pollInterval: 0.02, onChange: onChange)
+            })
+    }
+
+    private func waitForObserverReady(_ fake: FakeCoreAudioQuery) {
+        let ready = expectation(description: "observer registered listeners")
+        func poll() {
+            if !fake.deviceBlocks.isEmpty {
+                ready.fulfill()
+            } else {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { poll() }
+            }
+        }
+        poll()
+        wait(for: [ready], timeout: 10.0)
+    }
+
+    private func setDemand(_ fake: FakeCoreAudioQuery, _ hasDemand: Bool) {
+        waitForObserverReady(fake)
+        guard let object = fake.procs.first(where: { $0.value.pid == 501 })?.key else {
+            XCTFail("demand fixture process missing")
+            return
+        }
+        fake.procs[object]?.devices = hasDemand ? [99] : []
+        fake.fireDevice(object)
+    }
+
+    private func waitForStreaming(_ coordinator: ConnectionCoordinator) {
+        waitForState(coordinator, description: "streaming") { state in
+            if case .streaming = state { return true }
+            return false
+        }
+    }
+
+    /// Phase 3 replaces the manual Start/Stop scaffolding: demand appearing
+    /// starts a session with no button press, demand clearing stops it after
+    /// the debounce.
+    func testDemandStartsAndStopsASession() throws {
         let server = try MockWindowsServerProcess()
         defer { server.terminate() }
         // Recording renderer: a live session must not open real audio
         // hardware as a test side effect on Macs with BlackHole installed.
-        let coordinator = ConnectionCoordinator(store: InMemoryPairingStore(), clientId: "mac-tests",
-                                                makeRenderer: { RecordingRenderer() })
+        let fake = demandFake()
+        let coordinator = demandCoordinator(fake: fake, makeRenderer: { RecordingRenderer() })
         defer { coordinator.shutdown() }
 
         _ = try pair(coordinator, with: server)
         waitForState(coordinator, description: "idle") { $0 == .idle }
 
-        coordinator.requestStart()
-        waitForState(coordinator, description: "streaming") { state in
-            if case .streaming = state { return true }
-            return false
-        }
+        setDemand(fake, true)
+        waitForStreaming(coordinator)
         XCTAssertGreaterThan(coordinator.audioBytesReceived, 0)
 
-        coordinator.requestStop()
+        setDemand(fake, false)
         waitForState(coordinator, description: "idle again") { $0 == .idle }
     }
 
     /// Plan Task 5: the one control-plane touch, end to end. START opens the
     /// renderer, validated PCM lands in it as whole 1,920-byte frames off the
     /// control queue, STOP drains and STOP_ACK closes, byte counts reconcile.
-    func testManualSessionRendersAudioThroughTheRenderer() throws {
+    /// Phase 3 drives both ends from demand instead of by hand.
+    func testDemandDrivenSessionRendersAudioThroughTheRenderer() throws {
         let server = try MockWindowsServerProcess()
         defer { server.terminate() }
         let recording = RecordingRenderer()
-        let coordinator = ConnectionCoordinator(store: InMemoryPairingStore(), clientId: "mac-tests",
-                                                makeRenderer: { recording })
+        let fake = demandFake()
+        let coordinator = demandCoordinator(fake: fake, makeRenderer: { recording })
         defer { coordinator.shutdown() }
 
         _ = try pair(coordinator, with: server)
         waitForState(coordinator, description: "idle") { $0 == .idle }
         XCTAssertEqual(recording.opened, 0, "idle holds no output unit")
 
-        coordinator.requestStart()
-        waitForState(coordinator, description: "streaming") { state in
-            if case .streaming = state { return true }
-            return false
-        }
+        setDemand(fake, true)
+        waitForStreaming(coordinator)
         let rendering = expectation(description: "audio rendered")
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { rendering.fulfill() }
         wait(for: [rendering], timeout: 5.0)
@@ -261,7 +309,7 @@ final class ConnectionCoordinatorTests: XCTestCase {
 
         let drainedBefore = recording.drained
         let finalizedBefore = recording.finalized
-        coordinator.requestStop()
+        setDemand(fake, false)
         waitForState(coordinator, description: "idle again") { $0 == .idle }
         waitForRecording("STOP drains before close") { recording.drained == drainedBefore + 1 }
         waitForRecording("STOP_ACK closes the renderer") { recording.finalized == finalizedBefore + 1 }
@@ -273,17 +321,14 @@ final class ConnectionCoordinatorTests: XCTestCase {
         let server = try MockWindowsServerProcess()
         defer { server.terminate() }
         let recording = RecordingRenderer()
-        let coordinator = ConnectionCoordinator(store: InMemoryPairingStore(), clientId: "mac-tests",
-                                                makeRenderer: { recording })
+        let fake = demandFake()
+        let coordinator = demandCoordinator(fake: fake, makeRenderer: { recording })
         defer { coordinator.shutdown() }
 
         _ = try pair(coordinator, with: server)
         waitForState(coordinator, description: "idle") { $0 == .idle }
-        coordinator.requestStart()
-        waitForState(coordinator, description: "streaming") { state in
-            if case .streaming = state { return true }
-            return false
-        }
+        setDemand(fake, true)
+        waitForStreaming(coordinator)
         let rendering = expectation(description: "audio rendered")
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { rendering.fulfill() }
         wait(for: [rendering], timeout: 5.0)
@@ -306,8 +351,8 @@ final class ConnectionCoordinatorTests: XCTestCase {
         defer { server.terminate() }
         let recording = RecordingRenderer()
         recording.openError = AudioRendererError.deviceUnavailable(message: BlackHoleDevice.unavailableMessage)
-        let coordinator = ConnectionCoordinator(store: InMemoryPairingStore(), clientId: "mac-tests",
-                                                makeRenderer: { recording })
+        let fake = demandFake()
+        let coordinator = demandCoordinator(fake: fake, makeRenderer: { recording })
         defer { coordinator.shutdown() }
 
         _ = try pair(coordinator, with: server)
@@ -319,7 +364,7 @@ final class ConnectionCoordinatorTests: XCTestCase {
             notice = message
             guided.fulfill()
         }
-        coordinator.requestStart()
+        setDemand(fake, true)
         wait(for: [guided], timeout: 10.0)
         XCTAssertTrue(notice?.contains("BlackHole") ?? false,
                       "expected setup guidance")

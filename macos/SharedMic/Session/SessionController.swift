@@ -1,8 +1,11 @@
 import Foundation
 
-/// Observability spec §11 names the states the UI must show. Phase 1 implements
-/// every one except `Disabled` and `Held`, which are the Phase 3 kill switch and
-/// force-on hold.
+/// Observability spec §11 names the states the UI must show. Phase 3 adds
+/// `stopPending` (the 1000 ms stop-debounce transient) and `disabled` (the
+/// kill switch). `Held` is a UI indication, not a machine node: spec §5.2
+/// routes force-on through STARTING/ACTIVE while §11 requires a Held display,
+/// so the coordinator exposes `holdRemaining` and the menu renders Held
+/// whenever a hold is active (see `holdActive` below).
 public enum AgentState: Equatable {
     case unpaired
     case disconnected
@@ -10,8 +13,17 @@ public enum AgentState: Equatable {
     case idle
     case starting(requestId: String)
     case streaming(sessionId: String)
+    /// Stop-debounce window (spec §5.2): demand went away but the STOP has
+    /// not been sent yet. Still ACTIVE for audio purposes — the renderer
+    /// stays open. Demand (or hold) returning cancels back to `streaming`;
+    /// expiry moves to `stopping`. Transient; never persisted.
+    case stopPending(sessionId: String)
     case stopping(requestId: String, sessionId: String)
     case degraded(reason: String)
+    /// Kill switch (spec §5.3). Persists across restarts via DemandSettings.
+    /// No START is ever emitted from here; only `userEnabled` (or an
+    /// explicit unpair/re-pair ceremony) leaves it.
+    case disabled
     /// Terminal until the user re-pairs. Reached only by a pinned-fingerprint
     /// mismatch, which protocol-v1 §2 forbids recovering from automatically.
     case hardStop(reason: String)
@@ -24,8 +36,10 @@ public enum AgentState: Equatable {
         case .idle: return "Idle"
         case .starting: return "Starting"
         case .streaming: return "Streaming"
+        case .stopPending: return "Stop pending"
         case .stopping: return "Stopping"
         case .degraded: return "Degraded"
+        case .disabled: return "Disabled"
         case .hardStop: return "Certificate mismatch"
         }
     }
@@ -43,14 +57,14 @@ public enum SessionEvent: Equatable {
     case paired
     case connectAttemptStarted
     case authenticated(micPresent: Bool, deviceLabel: String)
-    // Temporary Phase 1 scaffolding: `userRequestedStart`/`userRequestedStop`
-    // exist only so a session can be driven by hand while there is no demand
-    // detection. Phase 3's `AudioDemandObserver` replaces the manual trigger
-    // and drives these same two events instead.
+    // Retained for compat: nothing drives these by hand anymore (Phase 3
+    // deleted the menu's Start/Stop and `requestStart/requestStop`), but the
+    // machine still honors them so earlier tests keep passing unmodified.
     case userRequestedStart(requestId: String)
     case startAcked(requestId: String, sessionId: String)
     case startNacked(requestId: String, reason: String)
     case startTimedOut(requestId: String)
+    // Retained for compat, same as above.
     case userRequestedStop(requestId: String)
     case stopAcked(requestId: String)
     case stopTimedOut(requestId: String)
@@ -58,6 +72,16 @@ public enum SessionEvent: Equatable {
     case connectionLost(reason: String)
     case fingerprintMismatch(expected: String, presented: String)
     case unpairedByUser
+    /// Phase 3 demand trigger. `requestId` is consumed only on branches that
+    /// must send START or STOP; level-only branches just record the flag.
+    case demandChanged(hasDemand: Bool, requestId: String)
+    case holdBegan(requestId: String)
+    case holdExpired(requestId: String)
+    /// Fires when the coordinator's stop-debounce timer fires. `sessionId`
+    /// must match the pending session or the event is stale and ignored.
+    case stopDebounceExpired(requestId: String, sessionId: String)
+    case userDisabled(requestId: String)
+    case userEnabled
 }
 
 public enum SessionAction: Equatable {
@@ -72,6 +96,11 @@ public enum SessionAction: Equatable {
     /// `.stopping`) forever with no armed way out.
     case cancelStartTimeout(requestId: String)
     case cancelStopTimeout(requestId: String)
+    /// Phase 3 stop debounce. Arming carries the session so a stale expiry
+    /// for an older session cannot stop a newer one; cancelling is
+    /// idempotent and needs no identity.
+    case armStopDebounce(sessionId: String, seconds: TimeInterval)
+    case cancelStopDebounce
     case scheduleReconnect
     case closeConnection
     /// Phase 2 render lifecycle. `.openRenderer` fires on entry to
@@ -93,23 +122,44 @@ public enum SessionAction: Equatable {
 /// Pure transition function. No sockets, no timers, no UI — the coordinator
 /// performs the returned actions and feeds the results back in as events.
 public struct SessionController {
+    public static let minStopDebounceSeconds: TimeInterval = 0.5
+    public static let defaultStopDebounceSeconds: TimeInterval = 1.0
+    public static let maxStopDebounceSeconds: TimeInterval = 2.0
+
     public private(set) var state: AgentState
     public private(set) var micPresent: Bool = false
     public private(set) var deviceLabel: String = ""
+    public private(set) var hasDemand: Bool = false
+    public private(set) var holdActive: Bool = false
+    public private(set) var stopDebounceSeconds: TimeInterval
+    private var pendingDisabled = false
 
     private static let micUnavailableMessage = "The Windows microphone is unavailable."
     private static let micDisconnectedMessage = "The Windows microphone was disconnected."
     private static let startTimeoutMessage = "The Windows agent did not answer START within 2 s."
     private static let stopTimeoutMessage = "STOP went unanswered; the session is treated as ended."
+    private static let connectionLostMessage = "The connection to the Windows agent was lost while the microphone was in use."
     private static let hardStopMessage = "The Windows agent presented a different certificate than the one paired. Re-pair explicitly to continue."
 
-    public init(state: AgentState = .unpaired) {
+    public init(state: AgentState = .unpaired,
+                stopDebounceSeconds: TimeInterval = SessionController.defaultStopDebounceSeconds) {
         self.state = state
+        self.stopDebounceSeconds = Self.clampDebounce(stopDebounceSeconds)
+    }
+
+    public mutating func setStopDebounceSeconds(_ seconds: TimeInterval) {
+        stopDebounceSeconds = Self.clampDebounce(seconds)
+    }
+
+    public static func clampDebounce(_ seconds: TimeInterval) -> TimeInterval {
+        min(max(seconds, minStopDebounceSeconds), maxStopDebounceSeconds)
     }
 
     public var activeSessionId: String? {
         switch state {
         case .streaming(let sessionId):
+            return sessionId
+        case .stopPending(let sessionId):
             return sessionId
         case .stopping(_, let sessionId):
             return sessionId.isEmpty ? nil : sessionId
@@ -118,9 +168,30 @@ public struct SessionController {
         }
     }
 
+    private var shouldNotify: Bool { hasDemand || holdActive }
+
+    private mutating func enterStopping(requestId: String, sessionId: String) -> [SessionAction] {
+        state = .stopping(requestId: requestId, sessionId: sessionId)
+        return [
+            .sendStop(requestId: requestId, sessionId: sessionId),
+            .armStopTimeout(requestId: requestId, seconds: SharedMicProtocol.stopTimeout),
+            .closeRendererAfterDrain
+        ]
+    }
+
+    private mutating func enterStarting(requestId: String) -> [SessionAction] {
+        guard micPresent else {
+            return [.notify(Self.micUnavailableMessage)]
+        }
+        state = .starting(requestId: requestId)
+        return [
+            .sendStart(requestId: requestId),
+            .armStartTimeout(requestId: requestId, seconds: SharedMicProtocol.startTimeout),
+            .openRenderer
+        ]
+    }
+
     public mutating func handle(_ event: SessionEvent) -> [SessionAction] {
-        // A hard stop is terminal. Only an explicit re-pair (or an explicit
-        // unpair) leaves it — nothing automatic, by design.
         if case .hardStop = state {
             switch event {
             case .paired:
@@ -134,16 +205,34 @@ public struct SessionController {
             }
         }
 
+        if case .disabled = state {
+            switch event {
+            case .userEnabled:
+                state = .idle
+                return []
+            case .unpairedByUser:
+                state = .unpaired
+                return [.closeConnection]
+            case .fingerprintMismatch(let expected, let presented):
+                state = .hardStop(reason: Self.hardStopMessage)
+                return [.closeConnection, .warnFingerprintMismatch(expected: expected, presented: presented)]
+            default:
+                return []
+            }
+        }
+
         switch event {
         case .paired:
             state = .disconnected
             return []
 
         case .unpairedByUser:
+            pendingDisabled = false
             state = .unpaired
             return [.closeConnection]
 
         case .fingerprintMismatch(let expected, let presented):
+            pendingDisabled = false
             state = .hardStop(reason: Self.hardStopMessage)
             return [.closeConnection, .warnFingerprintMismatch(expected: expected, presented: presented)]
 
@@ -157,28 +246,29 @@ public struct SessionController {
             state = .idle
             return []
 
-        case .connectionLost:
-            state = .disconnected
-            return [.scheduleReconnect]
+        case .connectionLost(let reason):
+            switch state {
+            case .starting, .streaming, .stopPending, .stopping:
+                pendingDisabled = false
+                state = .degraded(reason: reason)
+                var actions: [SessionAction] = [.cancelStopDebounce, .scheduleReconnect]
+                if shouldNotify {
+                    actions.append(.notify(Self.connectionLostMessage))
+                }
+                return actions
+            default:
+                state = .disconnected
+                return [.scheduleReconnect]
+            }
 
-        // Temporary Phase 1 scaffolding: drives a session by hand while there is
-        // no demand detection. Phase 3's `AudioDemandObserver` fires this same
-        // event instead of a manual trigger.
         case .userRequestedStart(let requestId):
             switch state {
             case .idle:
-                guard micPresent else {
-                    return [.notify(Self.micUnavailableMessage)]
-                }
-                state = .starting(requestId: requestId)
-                return [
-                    .sendStart(requestId: requestId),
-                    .armStartTimeout(requestId: requestId, seconds: SharedMicProtocol.startTimeout),
-                    .openRenderer
-                ]
+                return enterStarting(requestId: requestId)
+            case .stopPending(let sessionId):
+                state = .streaming(sessionId: sessionId)
+                return [.cancelStopDebounce]
             default:
-                // Already starting, already streaming, stopping, disconnected, or
-                // degraded: a user Start is a no-op rather than a second session.
                 return []
             }
 
@@ -196,45 +286,36 @@ public struct SessionController {
         case .startTimedOut(let requestId):
             guard case .starting(let pending) = state, pending == requestId else { return [] }
             state = .degraded(reason: Self.startTimeoutMessage)
-            return [.closeConnection, .scheduleReconnect, .closeRenderer]
+            var actions: [SessionAction] = [.closeConnection, .scheduleReconnect, .closeRenderer]
+            if shouldNotify {
+                actions.append(.notify(Self.startTimeoutMessage))
+            }
+            return actions
 
-        // Temporary Phase 1 scaffolding: drives a session by hand while there is
-        // no demand detection. Phase 3's `AudioDemandObserver` fires this same
-        // event instead of a manual trigger.
         case .userRequestedStop(let requestId):
             switch state {
             case .streaming(let sessionId):
-                state = .stopping(requestId: requestId, sessionId: sessionId)
-                return [
-                    .sendStop(requestId: requestId, sessionId: sessionId),
-                    .armStopTimeout(requestId: requestId, seconds: SharedMicProtocol.stopTimeout),
-                    .closeRendererAfterDrain
-                ]
+                return enterStopping(requestId: requestId, sessionId: sessionId)
+            case .stopPending(let sessionId):
+                return enterStopping(requestId: requestId, sessionId: sessionId)
             case .starting, .idle:
-                // protocol-v1 §7: STOP always means "make sure no session is
-                // active"; an empty sessionId is explicitly allowed.
-                state = .stopping(requestId: requestId, sessionId: "")
-                return [
-                    .sendStop(requestId: requestId, sessionId: ""),
-                    .armStopTimeout(requestId: requestId, seconds: SharedMicProtocol.stopTimeout),
-                    .closeRendererAfterDrain
-                ]
+                return enterStopping(requestId: requestId, sessionId: "")
             default:
                 return []
             }
 
         case .stopAcked(let requestId):
             guard case .stopping(let pending, _) = state, pending == requestId else { return [] }
-            state = .idle
-            // The STOPPING window was the drain; STOP_ACK is the close.
+            let wasDisabled = pendingDisabled
+            pendingDisabled = false
+            state = wasDisabled ? .disabled : .idle
             return [.cancelStopTimeout(requestId: requestId), .closeRenderer]
 
         case .stopTimedOut(let requestId):
             guard case .stopping(let pending, _) = state, pending == requestId else { return [] }
-            state = .idle
-            // The renderer close rides the timeout path too: `.idle` does not
-            // guarantee a quiet wire, so a STOP that went unanswered must not
-            // leave the unit open waiting for a drain that never completes.
+            let wasDisabled = pendingDisabled
+            pendingDisabled = false
+            state = wasDisabled ? .disabled : .idle
             return [.notify(Self.stopTimeoutMessage), .closeRenderer]
 
         case .statusReceived(let mic, _, let label):
@@ -242,9 +323,14 @@ public struct SessionController {
             deviceLabel = label
             if !mic {
                 switch state {
-                case .starting, .streaming, .stopping:
+                case .starting, .streaming, .stopPending, .stopping:
+                    pendingDisabled = false
                     state = .degraded(reason: Self.micDisconnectedMessage)
-                    return [.notify(Self.micDisconnectedMessage), .closeRenderer]
+                    var actions: [SessionAction] = [.cancelStopDebounce, .closeRenderer]
+                    if shouldNotify {
+                        actions.append(.notify(Self.micDisconnectedMessage))
+                    }
+                    return actions
                 default:
                     return []
                 }
@@ -252,6 +338,87 @@ public struct SessionController {
             if case .degraded = state {
                 state = .idle
             }
+            return []
+
+        case .demandChanged(let has, let requestId):
+            hasDemand = has
+            if has {
+                switch state {
+                case .idle:
+                    return enterStarting(requestId: requestId)
+                case .stopPending(let sessionId):
+                    state = .streaming(sessionId: sessionId)
+                    return [.cancelStopDebounce]
+                default:
+                    return []
+                }
+            } else {
+                switch state {
+                case .streaming(let sessionId):
+                    guard !holdActive else { return [] }
+                    state = .stopPending(sessionId: sessionId)
+                    return [.armStopDebounce(sessionId: sessionId, seconds: stopDebounceSeconds)]
+                case .starting:
+                    guard !holdActive else { return [] }
+                    return enterStopping(requestId: requestId, sessionId: "")
+                default:
+                    return []
+                }
+            }
+
+        case .holdBegan(let requestId):
+            holdActive = true
+            switch state {
+            case .idle:
+                return enterStarting(requestId: requestId)
+            case .stopPending(let sessionId):
+                state = .streaming(sessionId: sessionId)
+                return [.cancelStopDebounce]
+            default:
+                return []
+            }
+
+        case .holdExpired(let requestId):
+            holdActive = false
+            switch state {
+            case .streaming(let sessionId):
+                guard !hasDemand else { return [] }
+                state = .stopPending(sessionId: sessionId)
+                return [.armStopDebounce(sessionId: sessionId, seconds: stopDebounceSeconds)]
+            case .starting:
+                guard !hasDemand else { return [] }
+                return enterStopping(requestId: requestId, sessionId: "")
+            default:
+                return []
+            }
+
+        case .stopDebounceExpired(let requestId, let sessionId):
+            guard case .stopPending(let pending) = state, pending == sessionId else { return [] }
+            return enterStopping(requestId: requestId, sessionId: sessionId)
+
+        case .userDisabled(let requestId):
+            holdActive = false
+            switch state {
+            case .idle, .disconnected, .connecting, .degraded, .unpaired:
+                state = .disabled
+                return [.cancelStopDebounce]
+            case .streaming(let sessionId):
+                pendingDisabled = true
+                return enterStopping(requestId: requestId, sessionId: sessionId)
+            case .stopPending(let sessionId):
+                pendingDisabled = true
+                return enterStopping(requestId: requestId, sessionId: sessionId)
+            case .starting:
+                pendingDisabled = true
+                return enterStopping(requestId: requestId, sessionId: "")
+            case .stopping:
+                pendingDisabled = true
+                return []
+            case .disabled, .hardStop:
+                return []
+            }
+
+        case .userEnabled:
             return []
         }
     }
