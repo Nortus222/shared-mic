@@ -429,6 +429,41 @@ Spec §9 rows this phase owes. Automation proves the plumbing; the verdicts need
 | Dictation / Chrome / ChatGPT / Zoom / Teams | Task 6 matrix (§13 Q1) | Owner-gated, fallback is documented force-on |
 | WebKit-retains-BlackHole-as-default unknown | House note: requires BlackHole-as-default run, NOT the §3.4 run | Explicitly unmeasured, do not assume |
 
+### Headless harness results (2026-09-08, `MeasurementTests` + `DemandDriver`)
+
+Run on the target Mac (macOS 26.6.1, BlackHole 2ch id 99). Mock legs are
+Mac-side-only; the live leg is a real cross-process edge.
+
+- Debounce: gap-inside-window produces no second session and no fire;
+  gap-past-window fires exactly once (`debounceFireCount == 1`) and the next
+  demand starts session 2. The spec's "does it fire at all" is answered yes.
+- Activation latency, 5 rounds vs mock: 0.9, 2.0, 2.1, 2.5, 4.0 ms
+  (min 0.9 / p50 2.0 / p95 2.5 / max 4.0, budget 300). The 100-round and
+  real-agent runs are `SHAREDMIC_MEASURE_ROUNDS=100` +
+  `SHAREDMIC_MEASURE_HOST/PORT/PAIRING` away.
+- Onset content vs mock: first two rendered frames equal the session-start
+  440 Hz sine within ±1 LSB — zero Mac-side clipping at onset.
+- Demand-detection latency, live `DemandDriver` process observed through the
+  production `LiveCoreAudioQuery` path: **14 ms** open-to-snapshot. This
+  replaces the synthetic 5 ms §6.3 row with a real cross-process figure
+  (single sitting, one machine — not a distribution).
+  Repeat run the same day: 11 ms.
+
+### Real-agent verdict run (2026-09-08, 100 activations vs Windows agent)
+
+`SHAREDMIC_MEASURE_ROUNDS=100` with the real Windows agent on the LAN
+(Samson Meteorite Mic). n=100: min 134.7 / p50 147.9 / p95 184.8 /
+max 235.6 ms against the 300 ms budget — pass, with ~65 ms of headroom
+at p95. Debounce cancel/fire legs pass against the real agent unchanged.
+Method note: `xcodebuild test` does not propagate the parent shell
+environment to the test host in this setup (verified with a bogus-host
+probe), so real-agent runs take config from `/tmp/sharedmic-measure.json`
+(env first, file second); the file carries the bearer pairing string and
+must be deleted after the run.
+
+Still owner-gated: the real-app matrix, the 100-round and real-agent
+activation runs, 10-min idle counter, hold-expiry elapsed check.
+
 ## Phase 3 completion checklist
 
 - [ ] `ruby macos/project.rb` regenerates with no leftover diff
