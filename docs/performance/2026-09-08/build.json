@@ -1,0 +1,6 @@
+﻿{
+    "command":  "dotnet build SharedMic.Windows.sln -c Release",
+    "exitCode":  0,
+    "wallSeconds":  3.8633656,
+    "sdk":  "10.0.400"
+}

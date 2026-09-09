@@ -1,0 +1,5 @@
+Test run for C:\Users\nortu\.t3\worktrees\shared-mic\t3code-296a625c\windows\SharedMic.Agent.Tests\bin\Release\net10.0-windows\SharedMic.Agent.Tests.dll (.NETCoreApp,Version=v10.0)
+A total of 1 test files matched the specified pattern.
+Results File: C:\Users\nortu\.t3\worktrees\shared-mic\t3code-296a625c\docs\performance\2026-09-08\windows-tests.trx
+
+Passed!  - Failed:     0, Passed:   274, Skipped:     0, Total:   274, Duration: 10 s - SharedMic.Agent.Tests.dll (net10.0)

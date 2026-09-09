@@ -1,0 +1,14 @@
+........................................................................ [ 71%]
+.............................                                            [100%]
+============================ slowest 10 durations =============================
+1.02s call     tests/test_tls.py::test_tls_handshake_is_bounded_not_infinite
+0.90s call     tests/test_loopback.py::test_audio_flows_only_between_start_and_stop
+0.66s call     tests/test_loopback.py::test_mic_unplug_mid_session_stops_capture_and_sends_status
+0.52s call     tests/test_server.py::test_server_closes_idle_connection_after_hello_timeout
+0.51s call     tests/test_loopback.py::test_no_audio_before_start
+0.48s call     tests/test_loopback.py::test_audio_sequence_has_no_gaps
+0.33s call     tests/test_loopback.py::test_full_lifecycle_leaves_no_sequence_gaps
+0.31s call     tests/test_loopback.py::test_frame_counters_reconcile_across_a_session
+0.24s call     tests/test_client.py::test_wait_for_audio_frames_fails_fast_when_connection_drops
+0.22s call     tests/test_tls.py::test_tls_accept_path_tracks_wrapped_connection_across_sessions
+101 passed in 7.97s

@@ -1,0 +1,15 @@
+﻿{
+    "sourceCommit":  "53c032e4d7327d08a7d61225ef80f97cca677851",
+    "branch":  "t3code/performance-report-html",
+    "localDate":  "2026-09-08",
+    "generatedUtc":  "2026-09-09T02:11:24.4222984Z",
+    "cpu":  "AMD Ryzen 7 3700X 8-Core Processor             ",
+    "logicalProcessors":  16,
+    "os":  "Microsoft Windows 11 Home",
+    "osVersion":  "10.0.22621",
+    "memoryBytes":  17087582208,
+    "benchmarkTieredCompilation":  "0",
+    "benchmarkConfiguration":  "Release",
+    "model":  "GPT-6",
+    "harness":  "Codex"
+}
