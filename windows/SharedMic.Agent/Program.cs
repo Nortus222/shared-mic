@@ -1,6 +1,7 @@
 using System.Diagnostics.CodeAnalysis;
 using System.Security.Cryptography;
 using System.Windows.Forms;
+using SharedMic.Agent.Audio;
 using SharedMic.Agent.Diagnostics;
 using SharedMic.Agent.Net;
 using SharedMic.Agent.Security;
@@ -18,6 +19,7 @@ public static class Program
         var dataDirectory = IdentityStore.DefaultDirectory;
         var headless = false;
         var loopbackOnly = false;
+        var channelMode = Audio.ChannelMode.Mix;
 
         for (var i = 0; i < args.Length; i++)
         {
@@ -41,6 +43,9 @@ public static class Program
                 case "--loopback-only":
                     loopbackOnly = true;
                     break;
+                case "--channel-mode":
+                    channelMode = ParseChannelMode(Next(args, ref i, "--channel-mode"));
+                    break;
                 default:
                     throw new ArgumentException($"unknown argument '{args[i]}'");
             }
@@ -54,6 +59,7 @@ public static class Program
             DataDirectory = dataDirectory,
             Headless = headless,
             LoopbackOnly = loopbackOnly,
+            ChannelMode = channelMode,
         };
     }
 
@@ -70,7 +76,7 @@ public static class Program
             Console.Error.WriteLine(exception.Message);
             Console.Error.WriteLine(
                 "usage: SharedMic.Agent [--port N] [--no-mic] [--device-label TEXT] " +
-                "[--data-dir PATH] [--headless] [--loopback-only]");
+                "[--data-dir PATH] [--headless] [--loopback-only] [--channel-mode mix|left|right]");
             return 2;
         }
 
@@ -87,6 +93,20 @@ public static class Program
         var rateLimiter = new AuthRateLimiter();
 
         PrintBanner(Console.Out, identity, options, store.WasNewlyCreated);
+
+        AudioContext? audio = null;
+        try
+        {
+            var devices = new DeviceManager(new NAudioEndpointProvider());
+            audio = new AudioContext(devices, new WasapiAudioCaptureFactory(), options.ChannelMode);
+            AgentLog.Info(
+                $"microphone: {(devices.IsMicPresent ? devices.DeviceLabel : DeviceManager.AbsentLabel)} [{devices.EndpointId}]");
+        }
+        catch (Exception exception)
+        {
+            AgentLog.Warn(
+                $"audio capture is unavailable ({exception.GetType().Name}); sessions will stream no audio");
+        }
 
         TrayApp? tray = null;
         var listener = new TlsListener(
@@ -138,7 +158,8 @@ public static class Program
                     : detail;
 
                 tray?.SetStatus(status, shown);
-            });
+            },
+            audio);
 
         // Constructed BEFORE Start(). The other order loses a status: a Mac that
         // reconnects the instant the listener binds publishes Idle into a null
@@ -156,7 +177,7 @@ public static class Program
                 // for why the order is load-bearing.
                 await listener.DisposeAsync();
                 AgentLog.Info($"final counters: {metrics.Snapshot()}");
-            });
+            }, audio);
             tray.SetStatus(AgentStatus.Disconnected, $"port {options.Port}");
         }
 
@@ -170,6 +191,7 @@ public static class Program
 
             // The bind failed, so the tray must not linger as a dead icon.
             tray?.Dispose();
+            audio?.Dispose();
             return 1;
         }
 
@@ -177,6 +199,7 @@ public static class Program
         {
             AgentLog.Info("running with a tray icon. Use the tray menu to quit.");
             Application.Run(tray);
+            audio?.Dispose();
             return 0;
         }
 
@@ -196,6 +219,7 @@ public static class Program
         // listener has drained makes it "counters as of shortly before the end",
         // which is exactly the misreading it is there to prevent.
         listener.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        audio?.Dispose();
         AgentLog.Info($"final counters: {metrics.Snapshot()}");
         return 0;
     }
@@ -297,7 +321,7 @@ public static class Program
     {
         // Never print the token itself. The pairing string is meant for the
         // user's eyes and the fingerprint is public by construction.
-        writer.WriteLine("shared-mic Windows agent, Phase 1 (transport and security only, no audio capture)");
+        writer.WriteLine("shared-mic Windows agent, Phase 2 (transport, security, and microphone audio)");
         writer.WriteLine($"  serverId:       {identity.ServerId}");
         writer.WriteLine($"  port:           {options.Port}");
         writer.WriteLine($"  micPresent:     {options.MicPresent}");
@@ -327,6 +351,15 @@ public static class Program
     /// trace at startup. An in-range port that is already taken still fails
     /// later, as a handled bind error, which is the correct place for it.
     /// </summary>
+    private static Audio.ChannelMode ParseChannelMode(string value) =>
+        value.ToLowerInvariant() switch
+        {
+            "mix" => Audio.ChannelMode.Mix,
+            "left" => Audio.ChannelMode.Left,
+            "right" => Audio.ChannelMode.Right,
+            _ => throw new ArgumentException($"--channel-mode must be mix, left, or right (got '{value}')"),
+        };
+
     private static int ParsePort(string value)
     {
         if (!int.TryParse(value, out var port))

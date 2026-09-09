@@ -1,3 +1,4 @@
+using SharedMic.Agent.Audio;
 using SharedMic.Agent.Protocol;
 using SharedMic.Agent.Security;
 
@@ -9,15 +10,18 @@ namespace SharedMic.Agent;
 /// harness does the same for the 5 s pre-auth deadline so the suite does not
 /// pay it in wall time.
 ///
-/// MicPresent is a configuration flag in Phase 1, not a device query. There is
-/// no DeviceManager yet; the flag exists so the START_NACK and micPresent paths
-/// are exercisable before Phase 2 wires a real WASAPI device.
+/// MicPresent is a configuration override, not a device query: the live
+/// presence comes from DeviceManager, and the effective microphone state is
+/// this flag ANDed with the hardware reading. --no-mic forces absence for the
+/// harness nack mode.
 /// </summary>
 public sealed class AgentOptions
 {
     public int Port { get; init; } = ProtocolConstants.DefaultPort;
 
     public bool MicPresent { get; init; } = true;
+
+    public ChannelMode ChannelMode { get; init; } = ChannelMode.Mix;
 
     public string DeviceLabel { get; init; } = "(no device selected)";
 
@@ -36,3 +40,4 @@ public sealed class AgentOptions
 
     public TimeSpan TlsHandshakeTimeout { get; init; } = TimeSpan.FromSeconds(5);
 }
+

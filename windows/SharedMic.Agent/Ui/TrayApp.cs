@@ -1,5 +1,6 @@
 using System.Drawing;
 using System.Windows.Forms;
+using SharedMic.Agent.Audio;
 using SharedMic.Agent.Diagnostics;
 using SharedMic.Agent.Security;
 
@@ -33,10 +34,15 @@ public sealed class TrayApp : ApplicationContext
     /// BeginInvoke is always legal and always a post.
     /// </summary>
     private readonly Control _marshal;
+    private readonly AudioContext? _audio;
+    private readonly System.Windows.Forms.Timer _levelTimer;
+    private readonly ToolStripMenuItem _meterItem;
+    private readonly Dictionary<ChannelMode, ToolStripMenuItem> _channelItems = new();
 
-    public TrayApp(AgentIdentity identity, AgentOptions options, Func<Task> onQuitAsync)
+    public TrayApp(AgentIdentity identity, AgentOptions options, Func<Task> onQuitAsync, AudioContext? audio = null)
     {
         _onQuitAsync = onQuitAsync;
+        _audio = audio;
 
         _marshal = new Control();
         _ = _marshal.Handle; // Forces handle creation on this (UI) thread.
@@ -70,6 +76,33 @@ public sealed class TrayApp : ApplicationContext
         _menu.Items.Add(new ToolStripSeparator());
         _menu.Items.Add(fingerprintHeader);
         _menu.Items.Add(fingerprintValue);
+
+        _meterItem = new ToolStripMenuItem("Input level: -") { Enabled = false };
+        if (_audio?.Capture is not null)
+        {
+            var channelMenu = new ToolStripMenuItem("Channel mode");
+            foreach (var mode in new[] { ChannelMode.Mix, ChannelMode.Left, ChannelMode.Right })
+            {
+                var item = new ToolStripMenuItem(mode.ToString()) { Checked = mode == _audio.Capture.Mode };
+                var selected = mode;
+                item.Click += (_, _) => SelectChannelMode(selected);
+                _channelItems[mode] = item;
+                channelMenu.DropDownItems.Add(item);
+            }
+
+            _menu.Items.Add(new ToolStripSeparator());
+            _menu.Items.Add(channelMenu);
+            _menu.Items.Add(_meterItem);
+
+            _levelTimer = new System.Windows.Forms.Timer { Interval = 500 };
+            _levelTimer.Tick += (_, _) => RefreshMeter();
+            _levelTimer.Start();
+        }
+        else
+        {
+            _levelTimer = new System.Windows.Forms.Timer { Interval = 500 };
+        }
+
         _menu.Items.Add(new ToolStripSeparator());
         _menu.Items.Add(quit);
 
@@ -164,12 +197,41 @@ public sealed class TrayApp : ApplicationContext
     {
         if (disposing)
         {
+            _levelTimer.Stop();
+            _levelTimer.Dispose();
             _icon.Visible = false;
             _icon.Dispose();
             _marshal.Dispose();
         }
 
         base.Dispose(disposing);
+    }
+
+    internal void SelectChannelMode(ChannelMode mode)
+    {
+        if (_audio?.Capture is not null)
+        {
+            _audio.Capture.Mode = mode;
+            AgentLog.Info($"channel mode set to {mode}");
+        }
+
+        foreach (var entry in _channelItems)
+        {
+            entry.Value.Checked = entry.Key == mode;
+        }
+    }
+
+    internal void RefreshMeter()
+    {
+        if (_audio?.Capture is { } capture && capture.IsRunning)
+        {
+            int filled = (int)Math.Round(Math.Clamp(capture.LastPeak, 0f, 1f) * 10f);
+            _meterItem.Text = $"Input level [{new string('#', filled)}{new string('-', 10 - filled)}]";
+        }
+        else
+        {
+            _meterItem.Text = "Input level: -";
+        }
     }
 
     private async Task QuitAsync()

@@ -3,8 +3,10 @@ using System.Net.Security;
 using System.Net.Sockets;
 using System.Security.Authentication;
 using System.Security.Cryptography.X509Certificates;
+using SharedMic.Agent.Audio;
 using SharedMic.Agent.Diagnostics;
 using SharedMic.Agent.Security;
+using SharedMic.Agent.Session;
 
 namespace SharedMic.Agent.Net;
 
@@ -39,6 +41,9 @@ public sealed class TlsListener : IAsyncDisposable
     private readonly object _gate = new();
 
     private ControlConnection? _current;
+    private SessionState _currentSession;
+    private bool _currentMicPresent = true;
+    private readonly AudioContext? _audio;
     private bool _started;
     private bool _disposed;
 
@@ -47,13 +52,15 @@ public sealed class TlsListener : IAsyncDisposable
         AgentOptions options,
         AuthRateLimiter rateLimiter,
         AgentMetrics metrics,
-        Action<AgentStatus, string?> onStatus)
+        Action<AgentStatus, string?> onStatus,
+        AudioContext? audio = null)
     {
         _identity = identity;
         _options = options;
         _rateLimiter = rateLimiter;
         _metrics = metrics;
         _onStatus = onStatus;
+        _audio = audio;
     }
 
     public IReadOnlyList<IPEndPoint> Endpoints { get; private set; } = Array.Empty<IPEndPoint>();
@@ -117,6 +124,12 @@ public sealed class TlsListener : IAsyncDisposable
         // Disconnected would overwrite its Idle with nothing to correct it.
         _onStatus(AgentStatus.Disconnected, null);
 
+        if (_audio is not null)
+        {
+            _audio.PresenceChanged += OnAudioPresenceChanged;
+            _audio.CaptureLost += OnAudioCaptureLost;
+        }
+
         foreach (var listener in _listeners)
         {
             _acceptLoops.Add(Task.Run(() => AcceptLoopAsync(listener, _stopping.Token), CancellationToken.None));
@@ -154,6 +167,12 @@ public sealed class TlsListener : IAsyncDisposable
         {
             current = _current;
             _current = null;
+        }
+
+        if (_audio is not null)
+        {
+            _audio.PresenceChanged -= OnAudioPresenceChanged;
+            _audio.CaptureLost -= OnAudioCaptureLost;
         }
 
         current?.Close();
@@ -268,11 +287,12 @@ public sealed class TlsListener : IAsyncDisposable
             // a negotiated version other than Tls13 has to be visible.
             AgentLog.Info($"TLS handshake with {remote} negotiated {ssl.SslProtocol}");
 
-            connection = new ControlConnection(ssl, _identity, _options, _rateLimiter, _metrics)
+            connection = new ControlConnection(ssl, _identity, _options, _rateLimiter, _metrics, _audio)
             {
                 RemoteDescription = remote,
             };
             connection.Authenticated += Adopt;
+            connection.SessionStateChanged += OnConnectionSessionState;
 
             // Immediately after the handshake, with no work in between: the
             // section 6 pre-auth deadline is measured from RunAsync entry, so
@@ -298,6 +318,7 @@ public sealed class TlsListener : IAsyncDisposable
             if (connection is not null)
             {
                 connection.Authenticated -= Adopt;
+                connection.SessionStateChanged -= OnConnectionSessionState;
                 lock (_gate)
                 {
                     if (ReferenceEquals(_current, connection))
@@ -347,6 +368,8 @@ public sealed class TlsListener : IAsyncDisposable
         {
             previous = _current;
             _current = connection;
+            _currentSession = SessionState.Idle;
+            _currentMicPresent = true;
 
             // Published inside the swap's critical section, so no other
             // publisher can interleave between installing this connection and
@@ -376,7 +399,69 @@ public sealed class TlsListener : IAsyncDisposable
     {
         lock (_gate)
         {
-            _onStatus(_current is not null ? AgentStatus.Idle : AgentStatus.Disconnected, null);
+            PublishStatusLocked();
         }
     }
+
+    private void PublishStatusLocked()
+    {
+        if (_current is null)
+        {
+            _onStatus(AgentStatus.Disconnected, null);
+            return;
+        }
+
+        if (_currentSession == SessionState.Active)
+        {
+            _onStatus(AgentStatus.Streaming, null);
+            return;
+        }
+
+        _onStatus(_currentMicPresent ? AgentStatus.Idle : AgentStatus.Degraded, null);
+    }
+
+    private void OnConnectionSessionState(ControlConnection connection, SessionState state, bool micPresent)
+    {
+        lock (_gate)
+        {
+            if (!ReferenceEquals(_current, connection))
+            {
+                return;
+            }
+
+            _currentSession = state;
+            _currentMicPresent = micPresent;
+            PublishStatusLocked();
+        }
+    }
+
+    private void OnAudioPresenceChanged(bool present)
+    {
+        ControlConnection? current;
+        lock (_gate)
+        {
+            current = _current;
+        }
+
+        current?.OnDevicePresenceChanged(present);
+    }
+
+    private void OnAudioCaptureLost()
+    {
+        ControlConnection? current;
+        lock (_gate)
+        {
+            current = _current;
+        }
+
+        current?.OnServiceCaptureLost();
+    }
 }
+
+
+
+
+
+
+
+

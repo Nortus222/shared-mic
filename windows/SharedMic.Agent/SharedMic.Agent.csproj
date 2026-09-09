@@ -12,6 +12,10 @@
     <RootNamespace>SharedMic.Agent</RootNamespace>
   </PropertyGroup>
 
+  <ItemGroup>
+    <PackageReference Include="NAudio" Version="2.2.1" />
+  </ItemGroup>
+
   <!-- System.Security.Cryptography.ProtectedData needs no PackageReference here:
        it ships in the Microsoft.WindowsDesktop.App framework, which this project
        references because UseWindowsForms is true. It is NOT in

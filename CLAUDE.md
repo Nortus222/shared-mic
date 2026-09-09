@@ -55,9 +55,9 @@ above; the tray host as `dotnet run --project SharedMic.Agent -- --loopback-only
 --data-dir <temp>` (driven end to end by `drive_windows_agent.py --mode session`); and the headless
 host in Task 14, launched from the built `SharedMic.Agent.exe` rather than through `dotnet run`.
 
-Other flags: `--port N` (1-65535), `--no-mic`, `--device-label TEXT`, `--data-dir PATH`,
-`--loopback-only`. Phase 1 is transport and security only — `--no-mic` and `--device-label` are
-configuration flags, not device queries, because there is no capture path yet.
+Other flags: `--port N` (1-65535), `--no-mic`, `--device-label TEXT`, `--data-dir PATH`, `--channel-mode mix|left|right`,
+`--loopback-only`. Phase 2 streams microphone audio: live presence and the hardware label come from DeviceManager;
+`--no-mic` forces absence for the harness nack mode, `--device-label` is a fallback used only with no DeviceManager.
 
 **The command blocks above are PowerShell.** `$env:TEMP` is PowerShell syntax; in Git Bash it does
 not expand, so `--data-dir $env:TEMP\sharedmic` collapses to the literal `:TEMPsharedmic`. In bash
@@ -143,3 +143,6 @@ decision.
 - Keep network code out of audio callbacks and audio code out of network paths. The three pure
   units (`PcmNormalizer`, `SessionStateMachine`, `PCMRingBuffer`) hold the tricky logic and carry
   real unit tests; everything touching Core Audio, WASAPI, or sockets is a thin shell around them.
+
+
+
