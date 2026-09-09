@@ -141,5 +141,5 @@ decision.
 - Resolve audio devices by stable identifier — macOS device UID, Windows MMDevice endpoint ID —
   never by display name.
 - Keep network code out of audio callbacks and audio code out of network paths. The three pure
-  units (`PcmNormalizer`, `SessionStateMachine`, `PCMRingBuffer`) hold the tricky logic and carry
+  units (`PcmNormalizer`, `SessionStateMachine`, `PCMRingBuffer`, `DriftController`) hold the tricky logic and carry
   real unit tests; everything touching Core Audio, WASAPI, or sockets is a thin shell around them.

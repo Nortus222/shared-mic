@@ -190,7 +190,10 @@ final class ConnectionCoordinatorTests: XCTestCase {
     func testManualStartAndStopDriveASession() throws {
         let server = try MockWindowsServerProcess()
         defer { server.terminate() }
-        let coordinator = ConnectionCoordinator(store: InMemoryPairingStore(), clientId: "mac-tests")
+        // Recording renderer: a live session must not open real audio
+        // hardware as a test side effect on Macs with BlackHole installed.
+        let coordinator = ConnectionCoordinator(store: InMemoryPairingStore(), clientId: "mac-tests",
+                                                makeRenderer: { RecordingRenderer() })
         defer { coordinator.shutdown() }
 
         _ = try pair(coordinator, with: server)
@@ -205,6 +208,102 @@ final class ConnectionCoordinatorTests: XCTestCase {
 
         coordinator.requestStop()
         waitForState(coordinator, description: "idle again") { $0 == .idle }
+    }
+
+    /// Plan Task 5: the one control-plane touch, end to end. START opens the
+    /// renderer, validated PCM lands in it as whole 1,920-byte frames off the
+    /// control queue, STOP drains and STOP_ACK closes, byte counts reconcile.
+    func testManualSessionRendersAudioThroughTheRenderer() throws {
+        let server = try MockWindowsServerProcess()
+        defer { server.terminate() }
+        let recording = RecordingRenderer()
+        let coordinator = ConnectionCoordinator(store: InMemoryPairingStore(), clientId: "mac-tests",
+                                                makeRenderer: { recording })
+        defer { coordinator.shutdown() }
+
+        _ = try pair(coordinator, with: server)
+        waitForState(coordinator, description: "idle") { $0 == .idle }
+        XCTAssertEqual(recording.opened, 0, "idle holds no output unit")
+
+        coordinator.requestStart()
+        waitForState(coordinator, description: "streaming") { state in
+            if case .streaming = state { return true }
+            return false
+        }
+        let rendering = expectation(description: "audio rendered")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { rendering.fulfill() }
+        wait(for: [rendering], timeout: 5.0)
+
+        XCTAssertEqual(recording.opened, 1, "entry to STARTING opens the renderer")
+        XCTAssertGreaterThan(recording.enqueuedPCM.count, 10, "expected ~50 frames/second")
+        XCTAssertTrue(recording.enqueuedPCM.allSatisfy { $0.count == SharedMicProtocol.audioPCMBytes })
+        XCTAssertEqual(coordinator.audioBytesReceived,
+                       recording.enqueuedPCM.count * SharedMicProtocol.audioPCMBytes)
+
+        let drainedBefore = recording.drained
+        let finalizedBefore = recording.finalized
+        coordinator.requestStop()
+        waitForState(coordinator, description: "idle again") { $0 == .idle }
+        XCTAssertEqual(recording.drained, drainedBefore + 1, "STOP drains before close")
+        XCTAssertEqual(recording.finalized, finalizedBefore + 1, "STOP_ACK closes the renderer")
+    }
+
+    /// Mic loss mid-session takes the abnormal exit: no drain window, the
+    /// renderer closes immediately with the session.
+    func testMicLossMidSessionClosesTheRenderer() throws {
+        let server = try MockWindowsServerProcess()
+        defer { server.terminate() }
+        let recording = RecordingRenderer()
+        let coordinator = ConnectionCoordinator(store: InMemoryPairingStore(), clientId: "mac-tests",
+                                                makeRenderer: { recording })
+        defer { coordinator.shutdown() }
+
+        _ = try pair(coordinator, with: server)
+        waitForState(coordinator, description: "idle") { $0 == .idle }
+        coordinator.requestStart()
+        waitForState(coordinator, description: "streaming") { state in
+            if case .streaming = state { return true }
+            return false
+        }
+        let rendering = expectation(description: "audio rendered")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { rendering.fulfill() }
+        wait(for: [rendering], timeout: 5.0)
+        XCTAssertGreaterThan(recording.enqueuedPCM.count, 0)
+
+        let finalizedBefore = recording.finalized
+        server.setMicPresent(false)
+        waitForState(coordinator, description: "degraded") { state in
+            if case .degraded = state { return true }
+            return false
+        }
+        XCTAssertEqual(recording.finalized, finalizedBefore + 1)
+    }
+
+    /// A renderer that cannot open (BlackHole missing) must surface guidance,
+    /// not silence: the session still proceeds, but the user is told why no
+    /// audio arrives.
+    func testRendererOpenFailureSurfacesGuidance() throws {
+        let server = try MockWindowsServerProcess()
+        defer { server.terminate() }
+        let recording = RecordingRenderer()
+        recording.openError = AudioRendererError.deviceUnavailable(message: BlackHoleDevice.unavailableMessage)
+        let coordinator = ConnectionCoordinator(store: InMemoryPairingStore(), clientId: "mac-tests",
+                                                makeRenderer: { recording })
+        defer { coordinator.shutdown() }
+
+        _ = try pair(coordinator, with: server)
+        waitForState(coordinator, description: "idle") { $0 == .idle }
+
+        let guided = expectation(description: "guidance notice")
+        var notice: String?
+        coordinator.onNotice = { message in
+            notice = message
+            guided.fulfill()
+        }
+        coordinator.requestStart()
+        wait(for: [guided], timeout: 10.0)
+        XCTAssertTrue(notice?.contains("BlackHole") ?? false,
+                      "expected setup guidance")
     }
 
     /// Design spec §8: network drops mid-session — the Mac reconnects with backoff.

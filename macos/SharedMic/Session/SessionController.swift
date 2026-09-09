@@ -74,6 +74,18 @@ public enum SessionAction: Equatable {
     case cancelStopTimeout(requestId: String)
     case scheduleReconnect
     case closeConnection
+    /// Phase 2 render lifecycle. `.openRenderer` fires on entry to
+    /// `.starting` (the writer opens, never held open at idle);
+    /// `.closeRendererAfterDrain` on entry to `.stopping` (queued audio
+    /// still plays; the close lands on STOP_ACK); `.closeRenderer` ends a
+    /// session that never drains — refused/timed-out START, timed-out STOP,
+    /// mic loss — so no abnormal exit leaks an open output unit. The
+    /// remaining exits (connection loss, unpair, shutdown) tear the whole
+    /// connection down, and `ConnectionCoordinator.teardownConnection()`
+    /// closes the renderer there, so the machine does not repeat it.
+    case openRenderer
+    case closeRendererAfterDrain
+    case closeRenderer
     case warnFingerprintMismatch(expected: String, presented: String)
     case notify(String)
 }
@@ -161,7 +173,8 @@ public struct SessionController {
                 state = .starting(requestId: requestId)
                 return [
                     .sendStart(requestId: requestId),
-                    .armStartTimeout(requestId: requestId, seconds: SharedMicProtocol.startTimeout)
+                    .armStartTimeout(requestId: requestId, seconds: SharedMicProtocol.startTimeout),
+                    .openRenderer
                 ]
             default:
                 // Already starting, already streaming, stopping, disconnected, or
@@ -177,12 +190,13 @@ public struct SessionController {
         case .startNacked(let requestId, let reason):
             guard case .starting(let pending) = state, pending == requestId else { return [] }
             state = .idle
-            return [.cancelStartTimeout(requestId: requestId), .notify("Start refused: \(reason)")]
+            return [.cancelStartTimeout(requestId: requestId), .notify("Start refused: \(reason)"),
+                    .closeRenderer]
 
         case .startTimedOut(let requestId):
             guard case .starting(let pending) = state, pending == requestId else { return [] }
             state = .degraded(reason: Self.startTimeoutMessage)
-            return [.closeConnection, .scheduleReconnect]
+            return [.closeConnection, .scheduleReconnect, .closeRenderer]
 
         // Temporary Phase 1 scaffolding: drives a session by hand while there is
         // no demand detection. Phase 3's `AudioDemandObserver` fires this same
@@ -193,7 +207,8 @@ public struct SessionController {
                 state = .stopping(requestId: requestId, sessionId: sessionId)
                 return [
                     .sendStop(requestId: requestId, sessionId: sessionId),
-                    .armStopTimeout(requestId: requestId, seconds: SharedMicProtocol.stopTimeout)
+                    .armStopTimeout(requestId: requestId, seconds: SharedMicProtocol.stopTimeout),
+                    .closeRendererAfterDrain
                 ]
             case .starting, .idle:
                 // protocol-v1 §7: STOP always means "make sure no session is
@@ -201,7 +216,8 @@ public struct SessionController {
                 state = .stopping(requestId: requestId, sessionId: "")
                 return [
                     .sendStop(requestId: requestId, sessionId: ""),
-                    .armStopTimeout(requestId: requestId, seconds: SharedMicProtocol.stopTimeout)
+                    .armStopTimeout(requestId: requestId, seconds: SharedMicProtocol.stopTimeout),
+                    .closeRendererAfterDrain
                 ]
             default:
                 return []
@@ -210,12 +226,16 @@ public struct SessionController {
         case .stopAcked(let requestId):
             guard case .stopping(let pending, _) = state, pending == requestId else { return [] }
             state = .idle
-            return [.cancelStopTimeout(requestId: requestId)]
+            // The STOPPING window was the drain; STOP_ACK is the close.
+            return [.cancelStopTimeout(requestId: requestId), .closeRenderer]
 
         case .stopTimedOut(let requestId):
             guard case .stopping(let pending, _) = state, pending == requestId else { return [] }
             state = .idle
-            return [.notify(Self.stopTimeoutMessage)]
+            // The renderer close rides the timeout path too: `.idle` does not
+            // guarantee a quiet wire, so a STOP that went unanswered must not
+            // leave the unit open waiting for a drain that never completes.
+            return [.notify(Self.stopTimeoutMessage), .closeRenderer]
 
         case .statusReceived(let mic, _, let label):
             micPresent = mic
@@ -224,7 +244,7 @@ public struct SessionController {
                 switch state {
                 case .starting, .streaming, .stopping:
                     state = .degraded(reason: Self.micDisconnectedMessage)
-                    return [.notify(Self.micDisconnectedMessage)]
+                    return [.notify(Self.micDisconnectedMessage), .closeRenderer]
                 default:
                     return []
                 }

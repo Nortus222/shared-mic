@@ -97,7 +97,10 @@ final class AppModelTests: XCTestCase {
     func testAudioByteReadoutRefreshesDuringASessionWithoutAStateChange() throws {
         let server = try MockWindowsServerProcess()
         defer { server.terminate() }
-        let model = AppModel(store: InMemoryPairingStore(), clientId: "mac-tests", autoStart: false)
+        // Recording renderer: this drives a live session, which must not
+        // open real audio hardware as a test side effect.
+        let model = AppModel(store: InMemoryPairingStore(), clientId: "mac-tests", autoStart: false,
+                             makeRenderer: { RecordingRenderer() })
         model.hostField = "127.0.0.1"
         model.portField = String(server.port)
         model.pairingField = server.pairingString

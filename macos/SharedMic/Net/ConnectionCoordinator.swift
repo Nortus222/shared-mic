@@ -39,6 +39,12 @@ public final class ConnectionCoordinator: ControlClientDelegate {
     private let store: PairingStore
     private let clientId: String
     private let queue = DispatchQueue(label: "com.sharedmic.coordinator")
+    /// Phase 2 render path (plan Task 5). All renderer calls happen on this
+    /// queue — never on the control queue, which also services the heartbeat
+    /// and handshake deadlines. `renderer` itself is immutable after init so
+    /// the audio sink can capture it from any queue safely.
+    private let rendererQueue = DispatchQueue(label: "com.sharedmic.renderer")
+    private let renderer: RendererControl
 
     private var controller = SessionController()
     private var backoff = ReconnectPolicy()
@@ -73,9 +79,12 @@ public final class ConnectionCoordinator: ControlClientDelegate {
     /// from under whatever attempt is actually current.
     private var connectionGeneration = 0
 
-    public init(store: PairingStore, clientId: String = Host.current().localizedName ?? "mac") {
+    public init(store: PairingStore,
+                clientId: String = Host.current().localizedName ?? "mac",
+                makeRenderer: (() -> RendererControl)? = nil) {
         self.store = store
         self.clientId = clientId
+        self.renderer = makeRenderer?() ?? AudioRenderer()
         if let loaded = try? store.load() {
             self.record = loaded
             self.controller = SessionController(state: .disconnected)
@@ -209,6 +218,7 @@ public final class ConnectionCoordinator: ControlClientDelegate {
         self.client = client
         self.pendingPairingRecord = candidate
         client.delegate = self
+        self.wireAudioSink(client)
         client.begin()
     }
 
@@ -314,6 +324,7 @@ public final class ConnectionCoordinator: ControlClientDelegate {
                                                clientId: self.clientId)
                     self.client = client
                     client.delegate = self
+                    self.wireAudioSink(client)
                     client.begin()
                 case .failure(let error):
                     if case .fingerprintMismatch(let expected, let presented) = (error as? TransportError) {
@@ -337,6 +348,40 @@ public final class ConnectionCoordinator: ControlClientDelegate {
         client = nil
         transport?.close()
         transport = nil
+        // The renderer is connection-scoped like the client: every teardown —
+        // connection loss, unpair, shutdown, re-pair — closes it. Async on
+        // the renderer queue, ordered after the client stop, so sink blocks
+        // already queued run first (FIFO); the next `open()` clears the
+        // bridge, so nothing stale survives into the next session.
+        let renderer = self.renderer
+        rendererQueue.async { renderer.finalizeClose() }
+    }
+
+    /// Phase 2 render handoff (plan Task 5): validated PCM crosses from the
+    /// control queue to the renderer queue async — the renderer's bridge
+    /// drops oldest with a counter when full, so audio bursts never
+    /// back-pressure the heartbeat.
+    private func wireAudioSink(_ client: ControlClient) {
+        client.audioSink = { [weak self] pcm in
+            guard let self else { return }
+            let renderer = self.renderer
+            self.rendererQueue.async { renderer.enqueue(pcm: pcm) }
+        }
+    }
+
+    /// Surfaces a renderer `open()` failure (missing output device above all) on
+    /// the coordinator queue so it goes through the normal notice pipeline.
+    private func failRendererOpen(_ error: Error) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            if let rendererError = error as? AudioRendererError,
+               case .deviceUnavailable(let guidance) = rendererError {
+                self.apply([.notify(guidance)])
+            } else {
+                self.apply([.notify("Audio output unavailable: \(String(describing: error))")])
+            }
+            self.publishState()
+        }
     }
 
     /// The single place that both records a fingerprint mismatch (so a relaunch
@@ -381,6 +426,21 @@ public final class ConnectionCoordinator: ControlClientDelegate {
                 scheduleReconnect()
             case .closeConnection:
                 teardownConnection()
+            case .openRenderer:
+                let renderer = self.renderer
+                rendererQueue.async { [weak self] in
+                    do {
+                        try renderer.open()
+                    } catch {
+                        self?.failRendererOpen(error)
+                    }
+                }
+            case .closeRendererAfterDrain:
+                let renderer = self.renderer
+                rendererQueue.async { renderer.closeAfterDrain() }
+            case .closeRenderer:
+                let renderer = self.renderer
+                rendererQueue.async { renderer.finalizeClose() }
             case .warnFingerprintMismatch(let expected, let presented):
                 DispatchQueue.main.async { [weak self] in
                     self?.onFingerprintWarning?(expected, presented)

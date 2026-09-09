@@ -24,8 +24,10 @@ public final class AppModel: ObservableObject {
 
     public init(store: PairingStore = KeychainPairingStore(),
                 clientId: String = Host.current().localizedName ?? "mac",
-                autoStart: Bool = true) {
-        coordinator = ConnectionCoordinator(store: store, clientId: clientId)
+                autoStart: Bool = true,
+                makeRenderer: (() -> RendererControl)? = nil) {
+        coordinator = ConnectionCoordinator(store: store, clientId: clientId,
+                                            makeRenderer: makeRenderer)
         pairedHost = coordinator.pairedHost
         hostField = coordinator.pairedHost ?? ""
         state = coordinator.state
