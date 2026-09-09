@@ -1,0 +1,56 @@
+NAudio assembly : NAudio.Wasapi 2.2.1.0
+Capture type    : NAudio.CoreAudioApi.WasapiCapture
+
+Capture devices:
+  [0] Microphone (Steam Streaming Microphone)
+      endpoint id: {0.0.1.00000000}.{6975e4f8-9d9f-442f-8d4d-a7f2564b7d37}
+  [1] Microphone (Samson Meteorite Mic)
+      endpoint id: {0.0.1.00000000}.{dcea823c-c06f-40bf-8f35-9de9fb96acfd}
+
+Select device [0-1]:
+Selected device : Microphone (Samson Meteorite Mic)
+Endpoint id     : {0.0.1.00000000}.{dcea823c-c06f-40bf-8f35-9de9fb96acfd}
+Shared mix fmt  : 48000 Hz, 32-bit, 2 ch, encoding=Extensible
+(Record the endpoint id above exactly as printed -- Phase 1 persists that exact string.)
+
+Measuring 20 open cycles.
+Latency is measured from constructing the capture object to the first
+DataAvailable callback carrying non-zero bytes.
+
+  run  1:   130.2 ms   <- cold
+  run  2:    78.5 ms
+  run  3:    78.3 ms
+  run  4:    76.8 ms
+  run  5:    76.9 ms
+  run  6:    79.2 ms
+  run  7:    78.7 ms
+  run  8:    79.1 ms
+  run  9:    79.1 ms
+  run 10:    79.3 ms
+  run 11:    78.1 ms
+  run 12:    78.8 ms
+  run 13:    77.8 ms
+  run 14:    78.2 ms
+  run 15:    78.0 ms
+  run 16:    79.5 ms
+  run 17:    77.7 ms
+  run 18:    79.3 ms
+  run 19:    77.9 ms
+  run 20:    78.5 ms
+
+  attempted : 20
+  succeeded : 20
+  conflicts : 0   (capture stopped before any data arrived -- this, not a `failed` line, is the shared-mode-conflict signal; see README)
+  timed out : 0
+  failed    : 0
+  cold      :   130.2 ms
+  min       :    76.8 ms
+  p50       :    78.5 ms
+  p95       :    79.5 ms
+  max       :   130.2 ms
+
+  spec assumes 20-80 ms for this stage. The line below adds an assumed
+  ~100 ms for network transit, remote capture, and prefill -- that 100 ms is
+  an unverified placeholder from the design budget, not something this probe
+  measures. Treat this line as illustrative arithmetic, not a measurement:
+  121 ms nominal headroom to the 300 ms p95 target.
