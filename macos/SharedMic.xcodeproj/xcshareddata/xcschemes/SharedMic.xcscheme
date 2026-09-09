@@ -14,7 +14,7 @@
             buildForAnalyzing = "YES">
             <BuildableReference
                BuildableIdentifier = "primary"
-               BlueprintIdentifier = "CDDB5550533B87F6C4863DFF"
+               BlueprintIdentifier = "5D66B6CDA69E2CFDCDDFDE7D"
                BuildableName = "SharedMic.app"
                BlueprintName = "SharedMic"
                ReferencedContainer = "container:SharedMic.xcodeproj">
@@ -30,7 +30,7 @@
       <MacroExpansion>
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "CDDB5550533B87F6C4863DFF"
+            BlueprintIdentifier = "5D66B6CDA69E2CFDCDDFDE7D"
             BuildableName = "SharedMic.app"
             BlueprintName = "SharedMic"
             ReferencedContainer = "container:SharedMic.xcodeproj">
@@ -41,7 +41,7 @@
             skipped = "NO">
             <BuildableReference
                BuildableIdentifier = "primary"
-               BlueprintIdentifier = "5E574B0229667C8A7FD8430B"
+               BlueprintIdentifier = "BEF424486680CEA949501F73"
                BuildableName = "SharedMicTests.xctest"
                BlueprintName = "SharedMicTests"
                ReferencedContainer = "container:SharedMic.xcodeproj">
@@ -63,7 +63,7 @@
          runnableDebuggingMode = "0">
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "CDDB5550533B87F6C4863DFF"
+            BlueprintIdentifier = "5D66B6CDA69E2CFDCDDFDE7D"
             BuildableName = "SharedMic.app"
             BlueprintName = "SharedMic"
             ReferencedContainer = "container:SharedMic.xcodeproj">
@@ -80,7 +80,7 @@
          runnableDebuggingMode = "0">
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "CDDB5550533B87F6C4863DFF"
+            BlueprintIdentifier = "5D66B6CDA69E2CFDCDDFDE7D"
             BuildableName = "SharedMic.app"
             BlueprintName = "SharedMic"
             ReferencedContainer = "container:SharedMic.xcodeproj">
