@@ -1,3 +1,4 @@
+import AppKit
 import XCTest
 @testable import SharedMic
 
@@ -278,5 +279,72 @@ final class AppModelTests: XCTestCase {
         waitUntil("unpaired") { model.state == .unpaired }
         XCTAssertNil(model.pairedHost)
         XCTAssertNil(try store.load())
+    }
+
+    /// Phase 4 Task 2: the menu's diagnostics snapshot is published from the
+    /// same 1 Hz refresh as the menu rows, so the numbers reconcile by
+    /// construction rather than by parallel bookkeeping.
+    func testDiagnosticsSnapshotReconcilesWithMenuRows() throws {
+        let server = try MockWindowsServerProcess()
+        defer { server.terminate() }
+        let fake = makeFake()
+        let model = demandModel(fake: fake)
+        pair(model, with: server)
+
+        setDemand(fake, true)
+        waitUntil("streaming") {
+            if case .streaming = model.state { return true }
+            return false
+        }
+        setDemand(fake, false)
+        waitUntil("idle again") { model.state == .idle }
+        waitUntil("diagnostics catch up") { model.diagnostics.sessionCount == 1 }
+
+        XCTAssertEqual(model.diagnostics.sessionCount, model.sessionCount)
+        XCTAssertEqual(model.diagnostics.audioBytesReceived, model.audioBytesReceived)
+        XCTAssertEqual(model.diagnostics.debounceFireCount, model.debounceFireCount)
+        XCTAssertEqual(model.diagnostics.activationLatency?.count, 1)
+    }
+
+    /// Phase 4 Task 3: the 1 Hz refresh surfaces the rendered peak as the
+    /// menu meter level.
+    func testInputLevelPollSurfacesRendererPeak() {
+        let recording = RecordingRenderer()
+        recording.stubPeak = 0.5
+        let fake = makeFake()
+        let model = AppModel(store: InMemoryPairingStore(), clientId: "mac-tests", autoStart: false,
+                             makeRenderer: { recording },
+                             demandSettings: InMemoryDemandSettingsStore(),
+                             makeObserver: { onChange in
+                                 AudioDemandObserver(query: fake, pollInterval: 0.02, onChange: onChange)
+                             },
+                             readSystemInput: { nil })
+        waitUntil("level poll") { model.inputLevel == 0.5 }
+    }
+
+    /// Phase 4 Task 4: the system wake notification reaches the demand
+    /// observer as a forced rescan.
+    func testWakeNotificationTriggersDemandRescan() {
+        let fake = makeFake()
+        // Held for the whole test: the wake is delivered to the model.
+        let model = AppModel(store: InMemoryPairingStore(), clientId: "mac-tests", autoStart: false,
+                             demandSettings: InMemoryDemandSettingsStore(),
+                             makeObserver: { onChange in
+                                 AudioDemandObserver(query: fake, pollInterval: 0.02, onChange: onChange)
+                             },
+                             readSystemInput: { nil })
+        _ = model
+        waitUntil("observer ready") { !fake.deviceBlocks.isEmpty }
+        let before = fake.fullEnumerations
+        NSWorkspace.shared.notificationCenter.post(name: NSWorkspace.didWakeNotification, object: nil)
+        waitUntil("rescan after wake") { fake.fullEnumerations > before }
+    }
+
+    func testDiagnosticsStartEmpty() {
+        let model = quietModel()
+        XCTAssertEqual(model.diagnostics.sessionCount, 0)
+        XCTAssertNil(model.diagnostics.activationLatency)
+        XCTAssertEqual(model.diagnostics.reconnectCount, 0)
+        XCTAssertEqual(model.diagnostics.authFailureCount, 0)
     }
 }

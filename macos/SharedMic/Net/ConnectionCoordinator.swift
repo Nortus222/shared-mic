@@ -69,6 +69,14 @@ public final class ConnectionCoordinator: ControlClientDelegate {
     private var lastActivationLatency: Double?
     private var startSentAt: Date?
     private var awaitingFirstFrame = false
+    /// Phase 4 diagnostics (spec §11). All confined to `queue`.
+    private var reconnectCount = 0
+    private var authFailureCount = 0
+    private var latencySamplesMs: [Double] = []
+    private var sessionBeganAt: Date?
+    private var totalSessionSeconds = 0.0
+    private var accumulatedRenderer = RendererCounters()
+    private static let maxLatencySamples = 50
     /// Non-nil for exactly as long as a `pair(...)` ceremony is in flight. It is
     /// both the "already pairing" interlock and the only place that attempt's
     /// completion lives, so every way an attempt can end — success, peer
@@ -142,6 +150,41 @@ public final class ConnectionCoordinator: ControlClientDelegate {
     public var sessionCountValue: Int { queue.sync { startedSessions } }
     public var debounceFireCount: Int { queue.sync { debounceFires } }
     public var lastActivationLatencyMs: Double? { queue.sync { lastActivationLatency } }
+    /// This second's rendered-PCM peak for the menu meter. Read-and-clear:
+    /// each call takes what rendered since the previous one, which is exactly
+    /// the 1 Hz menu poll's cadence. Main-thread callers only (see
+    /// `diagnosticsSnapshot()` for why the renderer-queue hop is safe).
+    public var renderedPeak: Float { rendererQueue.sync { renderer.takeRenderedPeak() } }
+    public var reconnectCountValue: Int { queue.sync { reconnectCount } }
+    public var authFailureCountValue: Int { queue.sync { authFailureCount } }
+    public var totalSessionSecondsValue: Double {
+        queue.sync { totalSessionSeconds + openSessionElapsedLocked() }
+    }
+
+    /// One consistent read of every §11 row the diagnostics view displays.
+    /// The renderer read hops to `rendererQueue` synchronously: safe from any
+    /// thread except `rendererQueue` itself (the renderer never calls back
+    /// into this queue synchronously, so no cycle). Main-thread callers only.
+    public func diagnosticsSnapshot() -> DiagnosticsSnapshot {
+        queue.sync {
+            let live = rendererQueue.sync { renderer.readCounters() }
+            return DiagnosticsSnapshot(
+                sessionCount: startedSessions,
+                totalSessionSeconds: totalSessionSeconds + openSessionElapsedLocked(),
+                activationLatency: ActivationLatencyStats.compute(samples: latencySamplesMs),
+                renderer: accumulatedRenderer.adding(live),
+                reconnectCount: reconnectCount,
+                authFailureCount: authFailureCount,
+                debounceFireCount: debounceFires,
+                audioBytesReceived: totalAudioBytes + (client?.audioBytesReceived ?? 0))
+        }
+    }
+
+    /// In-progress session age for the snapshot. Must be called on `queue`.
+    private func openSessionElapsedLocked() -> Double {
+        guard let began = sessionBeganAt else { return 0 }
+        return Date().timeIntervalSince(began)
+    }
     public var isDisabled: Bool {
         queue.sync { if case .disabled = controller.state { return true }; return false }
     }
@@ -157,6 +200,26 @@ public final class ConnectionCoordinator: ControlClientDelegate {
         queue.async { [weak self] in
             guard let self, self.record != nil else { return }
             self.openConnection()
+        }
+    }
+
+    /// Sleep/wake recovery (spec §12 Phase 4). Stale AudioObjectIDs must never
+    /// survive a sleep cycle, so every wake forces the BlackHole UID
+    /// re-resolve plus a full demand rescan — `rescanNow()` already does
+    /// exactly that. Transport recovery rides the existing backoff: a live
+    /// connection (or its already-pending reconnect) owns it, and demand
+    /// re-fires on re-auth through the normal `refireIfIdleWithDemand` path.
+    /// Repeated wakes cannot stack reconnects: a pending attempt suppresses
+    /// a new one, and the backoff sequence is never reset here.
+    public func handleWake() {
+        queue.async { [weak self] in
+            guard let self, !self.shuttingDown else { return }
+            self.demandObserver?.rescanNow()
+            guard self.record != nil,
+                  self.client == nil,
+                  self.reconnectTimer == nil else { return }
+            if case .hardStop = self.controller.state { return }
+            self.scheduleReconnect()
         }
     }
 
@@ -277,6 +340,11 @@ public final class ConnectionCoordinator: ControlClientDelegate {
     /// wins and no later path can double-fire it.
     @discardableResult
     private func resolvePairing(_ result: Result<PairingRecord, Error>) -> Bool {
+        if case .failure(let error) = result,
+           case .authenticationFailed = (error as? PairingError) {
+            // On `queue` in every caller: pair-flow failures resolve here.
+            authFailureCount += 1
+        }
         guard let completion = pairingCompletion else { return false }
         pairingCompletion = nil
         pendingPairingRecord = nil
@@ -554,6 +622,8 @@ public final class ConnectionCoordinator: ControlClientDelegate {
         // already queued run first (FIFO); the next `open()` clears the
         // bridge, so nothing stale survives into the next session.
         let renderer = self.renderer
+        noteSessionEnded()
+        accumulatedRenderer = accumulatedRenderer.adding(rendererQueue.sync { renderer.readCounters() })
         rendererQueue.async { renderer.finalizeClose() }
     }
 
@@ -575,7 +645,27 @@ public final class ConnectionCoordinator: ControlClientDelegate {
     private func noteFirstFrame() {
         guard awaitingFirstFrame, let sent = startSentAt else { return }
         awaitingFirstFrame = false
-        lastActivationLatency = Date().timeIntervalSince(sent) * 1000.0
+        let latencyMs = Date().timeIntervalSince(sent) * 1000.0
+        lastActivationLatency = latencyMs
+        latencySamplesMs.append(latencyMs)
+        if latencySamplesMs.count > Self.maxLatencySamples {
+            latencySamplesMs.removeFirst(latencySamplesMs.count - Self.maxLatencySamples)
+        }
+    }
+
+    /// A START_ACK opens the billable session: durations measure ACKed
+    /// sessions only, never unanswered STARTs. Duplicate ACKs for an already
+    /// open session must not restart the clock.
+    private func noteSessionBegan() {
+        if sessionBeganAt == nil { sessionBeganAt = Date() }
+    }
+
+    /// Idempotent: every session-end path (STOP_ACK, stop timeout, teardown)
+    /// funnels through here, and only the first one per session collects.
+    private func noteSessionEnded() {
+        guard let began = sessionBeganAt else { return }
+        sessionBeganAt = nil
+        totalSessionSeconds += Date().timeIntervalSince(began)
     }
 
     /// Surfaces a renderer `open()` failure (missing output device above all) on
@@ -598,6 +688,7 @@ public final class ConnectionCoordinator: ControlClientDelegate {
     /// find out again — see `openConnection()`) and drives it through the normal
     /// `SessionController`/`apply(...)` pipeline.
     private func applyFingerprintMismatch(expected: String, presented: String) {
+        authFailureCount += 1
         // Only when it actually changes: replaying a persisted marker at launch
         // would otherwise rewrite a byte-identical record to the Keychain on
         // every hard-stopped launch.
@@ -696,6 +787,9 @@ public final class ConnectionCoordinator: ControlClientDelegate {
         timer.schedule(deadline: .now() + seconds)
         timer.setEventHandler { [weak self] in
             guard let self else { return }
+            // A timed-out STOP is treated as ended (see the machine's
+            // stopTimeoutMessage), so the duration stops here too.
+            self.noteSessionEnded()
             self.apply(self.controller.handle(.stopTimedOut(requestId: requestId)))
             self.refireIfIdleWithDemand()
             self.publishState()
@@ -736,7 +830,9 @@ public final class ConnectionCoordinator: ControlClientDelegate {
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + delay)
         timer.setEventHandler { [weak self] in
-            self?.openConnection()
+            guard let self else { return }
+            self.reconnectCount += 1
+            self.openConnection()
         }
         timer.resume()
         reconnectTimer = timer
@@ -800,10 +896,12 @@ public final class ConnectionCoordinator: ControlClientDelegate {
             // a reply carrying somebody else's `requestId` disarm the timeout and
             // strand this agent in `.starting`/`.stopping` with no way out.
             case .startAck(let requestId, let sessionId, _):
+                self.noteSessionBegan()
                 self.apply(self.controller.handle(.startAcked(requestId: requestId, sessionId: sessionId)))
             case .startNack(let requestId, let reason):
                 self.apply(self.controller.handle(.startNacked(requestId: requestId, reason: reason)))
             case .stopAck(let requestId, _):
+                self.noteSessionEnded()
                 self.apply(self.controller.handle(.stopAcked(requestId: requestId)))
                 self.refireIfIdleWithDemand()
             case .status(let micPresent, let active, let deviceLabel):

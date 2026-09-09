@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import SwiftUI
 
@@ -22,6 +23,8 @@ public final class AppModel: ObservableObject {
     @Published public private(set) var debounceFireCount: Int = 0
     @Published public private(set) var lastActivationLatencyMs: Double?
     @Published public private(set) var sessionCount: Int = 0
+    @Published public private(set) var diagnostics = DiagnosticsSnapshot()
+    @Published public private(set) var inputLevel: Float = 0
 
     @Published public var hostField: String = ""
     @Published public var portField: String = String(SharedMicProtocol.defaultPort)
@@ -30,6 +33,7 @@ public final class AppModel: ObservableObject {
     private let coordinator: ConnectionCoordinator
     private let readSystemInput: () -> SystemInputInfo?
     private var refreshTimer: Timer?
+    private var wakeObserver: NSObjectProtocol?
 
     public init(store: PairingStore = KeychainPairingStore(),
                 clientId: String = Host.current().localizedName ?? "mac",
@@ -105,9 +109,22 @@ public final class AppModel: ObservableObject {
         refreshTimer = timer
         refreshDemandDerived()
 
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor in self?.handleWake() }
+            }
+
         if autoStart {
             coordinator.startIfPaired()
         }
+    }
+
+    /// System-wake entry point (spec §12): forced demand rescan plus the
+    /// existing reconnect/backoff recovery. Deliberately no sleep-side hook —
+    /// tearing down on sleep would turn every lid-close into a session event,
+    /// and the wake rescan plus transport recovery already converge.
+    public func handleWake() {
+        coordinator.handleWake()
     }
 
     deinit {
@@ -116,6 +133,9 @@ public final class AppModel: ObservableObject {
         // This type is `@MainActor` and is only ever released from the main
         // thread, which is where `invalidate()` has to run.
         refreshTimer?.invalidate()
+        if let wakeObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver)
+        }
     }
 
     private func refreshDemandDerived() {
@@ -124,6 +144,8 @@ public final class AppModel: ObservableObject {
         debounceFireCount = coordinator.debounceFireCount
         lastActivationLatencyMs = coordinator.lastActivationLatencyMs
         sessionCount = coordinator.sessionCountValue
+        diagnostics = coordinator.diagnosticsSnapshot()
+        inputLevel = coordinator.renderedPeak
         if let input = readSystemInput() {
             systemInputName = input.name
             systemInputIsBlackHole = input.isBlackHole

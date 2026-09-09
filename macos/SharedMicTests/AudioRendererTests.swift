@@ -179,6 +179,50 @@ final class AudioRendererTests: XCTestCase {
         renderer.finalizeClose()
     }
 
+    /// Phase 4 Task 3: the menu meter reads rendered PCM peaks — what
+    /// actually reaches BlackHole — with read-and-clear semantics so the
+    /// 1 Hz menu poll sees a per-second peak.
+    func testRenderedPeakTracksLoudestRenderedSample() throws {
+        let (renderer, unit) = makeRenderer(prefillFrames: 0)
+        try renderer.open()
+        renderer.enqueue(pcm: patternedFrame(fill: 16000))
+        _ = fire(unit)
+        XCTAssertEqual(renderer.takeRenderedPeak(), abs(expectedFloat(16000)), accuracy: 1e-6)
+        renderer.finalizeClose()
+    }
+
+    func testRenderedPeakReadsAndClears() throws {
+        let (renderer, unit) = makeRenderer(prefillFrames: 0)
+        try renderer.open()
+        renderer.enqueue(pcm: patternedFrame(fill: 8000))
+        _ = fire(unit)
+        XCTAssertGreaterThan(renderer.takeRenderedPeak(), 0)
+        XCTAssertEqual(renderer.takeRenderedPeak(), 0,
+                       "a second take with no render in between reads zero")
+        renderer.finalizeClose()
+    }
+
+    func testRenderedSilenceLeavesPeakAtZero() throws {
+        let (renderer, unit) = makeRenderer(prefillFrames: 0)
+        try renderer.open()
+        _ = fire(unit)
+        XCTAssertEqual(renderer.takeRenderedPeak(), 0)
+        XCTAssertEqual(renderer.underrunSamples, 960)
+        renderer.finalizeClose()
+    }
+
+    func testReopenResetsRenderedPeak() throws {
+        let (renderer, unit) = makeRenderer(prefillFrames: 0)
+        try renderer.open()
+        renderer.enqueue(pcm: patternedFrame(fill: 16000))
+        _ = fire(unit)
+        renderer.finalizeClose()
+        try renderer.open()
+        XCTAssertEqual(renderer.takeRenderedPeak(), 0,
+                       "a reopened renderer starts with no peak history")
+        renderer.finalizeClose()
+    }
+
     func testOpenClearsStaleAudioFromThePreviousSession() throws {
         let (renderer, unit) = makeRenderer(prefillFrames: 0)
         try renderer.open()
