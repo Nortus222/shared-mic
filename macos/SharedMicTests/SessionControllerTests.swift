@@ -38,7 +38,8 @@ final class SessionControllerTests: XCTestCase {
         let actions = controller.handle(.userRequestedStart(requestId: "req-1"))
         XCTAssertEqual(actions, [
             .sendStart(requestId: "req-1"),
-            .armStartTimeout(requestId: "req-1", seconds: 2.0)
+            .armStartTimeout(requestId: "req-1", seconds: 2.0),
+            .openRenderer
         ])
         XCTAssertEqual(controller.state, .starting(requestId: "req-1"))
     }
@@ -74,7 +75,8 @@ final class SessionControllerTests: XCTestCase {
         let actions = controller.handle(.startNacked(requestId: "req-1", reason: "MIC_UNAVAILABLE"))
         XCTAssertEqual(actions, [
             .cancelStartTimeout(requestId: "req-1"),
-            .notify("Start refused: MIC_UNAVAILABLE")
+            .notify("Start refused: MIC_UNAVAILABLE"),
+            .closeRenderer
         ])
         XCTAssertEqual(controller.state, .idle)
     }
@@ -85,7 +87,7 @@ final class SessionControllerTests: XCTestCase {
         var controller = authenticatedController()
         _ = controller.handle(.userRequestedStart(requestId: "req-1"))
         let actions = controller.handle(.startTimedOut(requestId: "req-1"))
-        XCTAssertEqual(actions, [.closeConnection, .scheduleReconnect])
+        XCTAssertEqual(actions, [.closeConnection, .scheduleReconnect, .closeRenderer])
         XCTAssertEqual(controller.state, .degraded(reason: "The Windows agent did not answer START within 2 s."))
     }
 
@@ -104,7 +106,8 @@ final class SessionControllerTests: XCTestCase {
         let actions = controller.handle(.userRequestedStop(requestId: "req-2"))
         XCTAssertEqual(actions, [
             .sendStop(requestId: "req-2", sessionId: "sess-1"),
-            .armStopTimeout(requestId: "req-2", seconds: 1.0)
+            .armStopTimeout(requestId: "req-2", seconds: 1.0),
+            .closeRendererAfterDrain
         ])
         XCTAssertEqual(controller.state, .stopping(requestId: "req-2", sessionId: "sess-1"))
     }
@@ -116,7 +119,8 @@ final class SessionControllerTests: XCTestCase {
         let actions = controller.handle(.userRequestedStop(requestId: "req-9"))
         XCTAssertEqual(actions, [
             .sendStop(requestId: "req-9", sessionId: ""),
-            .armStopTimeout(requestId: "req-9", seconds: 1.0)
+            .armStopTimeout(requestId: "req-9", seconds: 1.0),
+            .closeRendererAfterDrain
         ])
         XCTAssertEqual(controller.state, .stopping(requestId: "req-9", sessionId: ""))
     }
@@ -127,7 +131,7 @@ final class SessionControllerTests: XCTestCase {
         _ = controller.handle(.startAcked(requestId: "req-1", sessionId: "sess-1"))
         _ = controller.handle(.userRequestedStop(requestId: "req-2"))
         XCTAssertEqual(controller.handle(.stopAcked(requestId: "req-2")),
-                       [.cancelStopTimeout(requestId: "req-2")])
+                       [.cancelStopTimeout(requestId: "req-2"), .closeRenderer])
         XCTAssertEqual(controller.state, .idle)
         XCTAssertNil(controller.activeSessionId)
     }
@@ -151,7 +155,7 @@ final class SessionControllerTests: XCTestCase {
 
         // The armed timeout is still the way out.
         XCTAssertEqual(controller.handle(.startTimedOut(requestId: "req-1")),
-                       [.closeConnection, .scheduleReconnect])
+                       [.closeConnection, .scheduleReconnect, .closeRenderer])
     }
 
     func testMismatchedStartNackLeavesTheStartTimeoutArmed() {
@@ -161,7 +165,7 @@ final class SessionControllerTests: XCTestCase {
         XCTAssertEqual(controller.handle(.startNacked(requestId: "req-2", reason: "MIC_UNAVAILABLE")), [])
         XCTAssertEqual(controller.state, .starting(requestId: "req-1"))
         XCTAssertEqual(controller.handle(.startTimedOut(requestId: "req-1")),
-                       [.closeConnection, .scheduleReconnect])
+                       [.closeConnection, .scheduleReconnect, .closeRenderer])
     }
 
     func testMismatchedStopAckLeavesTheStopTimeoutArmed() {
@@ -173,7 +177,8 @@ final class SessionControllerTests: XCTestCase {
         XCTAssertEqual(controller.handle(.stopAcked(requestId: "req-3")), [])
         XCTAssertEqual(controller.state, .stopping(requestId: "req-2", sessionId: "sess-1"))
         XCTAssertEqual(controller.handle(.stopTimedOut(requestId: "req-2")),
-                       [.notify("STOP went unanswered; the session is treated as ended.")])
+                       [.notify("STOP went unanswered; the session is treated as ended."),
+                        .closeRenderer])
     }
 
     /// protocol-v1 §8: treat the session as ended locally regardless; do not block
@@ -184,7 +189,8 @@ final class SessionControllerTests: XCTestCase {
         _ = controller.handle(.startAcked(requestId: "req-1", sessionId: "sess-1"))
         _ = controller.handle(.userRequestedStop(requestId: "req-2"))
         let actions = controller.handle(.stopTimedOut(requestId: "req-2"))
-        XCTAssertEqual(actions, [.notify("STOP went unanswered; the session is treated as ended.")])
+        XCTAssertEqual(actions, [.notify("STOP went unanswered; the session is treated as ended."),
+                                   .closeRenderer])
         XCTAssertEqual(controller.state, .idle)
         XCTAssertNil(controller.activeSessionId)
     }
@@ -194,7 +200,8 @@ final class SessionControllerTests: XCTestCase {
         _ = controller.handle(.userRequestedStart(requestId: "req-1"))
         _ = controller.handle(.startAcked(requestId: "req-1", sessionId: "sess-1"))
         let actions = controller.handle(.statusReceived(micPresent: false, active: false, deviceLabel: "USB Microphone"))
-        XCTAssertEqual(actions, [.notify("The Windows microphone was disconnected.")])
+        XCTAssertEqual(actions, [.notify("The Windows microphone was disconnected."),
+                                   .closeRenderer])
         XCTAssertEqual(controller.state, .degraded(reason: "The Windows microphone was disconnected."))
         XCTAssertNil(controller.activeSessionId)
     }

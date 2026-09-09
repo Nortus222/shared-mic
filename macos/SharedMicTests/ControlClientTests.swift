@@ -350,3 +350,133 @@ final class ControlClientTests: XCTestCase {
                        "a session restarted after mic loss must not be counted as a gap")
     }
 }
+
+private struct SinkTestLister: AudioDeviceLister {
+    func outputDevices() -> [OutputAudioDevice] {
+        [OutputAudioDevice(id: 99, uid: "BlackHole2ch_UID", name: "BlackHole 2ch")]
+    }
+}
+
+final class AudioSinkWiringTests: XCTestCase {
+
+    private func makeStreamingClient(_ server: MockWindowsServerProcess,
+                                     delegate: RecordingDelegate,
+                                     peerDeadTimeout: TimeInterval = 20.0,
+                                     sink: @escaping (Data) -> Void) throws -> (ControlClient, PinnedTLSTransport, String) {
+        let transport = PinnedTLSTransport()
+        let connected = expectation(description: "tls connected")
+        transport.connect(host: "127.0.0.1", port: server.port,
+                          mode: .pinned(fingerprint: server.fingerprint)) { result in
+            if case .failure(let error) = result { XCTFail("handshake failed: \(error)") }
+            connected.fulfill()
+        }
+        wait(for: [connected], timeout: 15.0)
+
+        let client = ControlClient(transport: transport,
+                                   token: server.token,
+                                   clientId: "mac-tests",
+                                   pingInterval: 0.3,
+                                   peerDeadTimeout: peerDeadTimeout)
+        client.delegate = delegate
+        client.audioSink = sink
+        let authenticated = expectation(description: "authenticated")
+        delegate.onAuthenticate = { authenticated.fulfill() }
+        client.begin()
+        wait(for: [authenticated], timeout: 15.0)
+
+        var sessionId = ""
+        let started = expectation(description: "START_ACK")
+        delegate.onMessage = { message in
+            if case .startAck(_, let id, _) = message {
+                sessionId = id
+                started.fulfill()
+            }
+        }
+        client.send(.start(requestId: "req-1", preferredFormat: .v1))
+        wait(for: [started], timeout: 10.0)
+        return (client, transport, sessionId)
+    }
+
+    private func streamOneSecond() {
+        let streaming = expectation(description: "audio arrived")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { streaming.fulfill() }
+        wait(for: [streaming], timeout: 5.0)
+    }
+
+    /// Plan Task 5: every validated frame's PCM reaches the render handoff as
+    /// exactly 1,920 bytes, byte counts reconcile, and nothing arrives after
+    /// STOP_ACK settles.
+    func testValidatedAudioFramesReachTheAudioSink() throws {
+        let server = try MockWindowsServerProcess()
+        defer { server.terminate() }
+        let delegate = RecordingDelegate()
+        final class Collector {
+            var frames: [Data] = []
+        }
+        let collected = Collector()
+        let (client, transport, sessionId) = try makeStreamingClient(server, delegate: delegate) { pcm in
+            collected.frames.append(pcm)
+        }
+        defer { client.stop(); transport.close() }
+
+        streamOneSecond()
+        XCTAssertGreaterThan(client.audioFramesReceived, 10, "expected ~50 frames/second")
+        XCTAssertEqual(collected.frames.count, client.audioFramesReceived,
+                       "every validated frame must reach the sink exactly once")
+        XCTAssertTrue(collected.frames.allSatisfy { $0.count == SharedMicProtocol.audioPCMBytes })
+        XCTAssertEqual(client.audioBytesReceived,
+                       client.audioFramesReceived * SharedMicProtocol.audioPCMBytes)
+        XCTAssertEqual(client.sequenceGaps, 0)
+
+        let stopped = expectation(description: "STOP_ACK")
+        delegate.onMessage = { message in
+            if case .stopAck = message { stopped.fulfill() }
+        }
+        client.send(.stop(requestId: "req-2", sessionId: sessionId))
+        wait(for: [stopped], timeout: 10.0)
+
+        let settle = expectation(description: "settle")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { settle.fulfill() }
+        wait(for: [settle], timeout: 5.0)
+        XCTAssertEqual(collected.frames.count, client.audioFramesReceived,
+                       "no PCM may arrive after STOP_ACK settles")
+    }
+
+    /// Plan Task 5: the sink hop must not block the control queue — under a
+    /// real 50 fps burst with real renderer work per frame, heartbeats stay
+    /// timely and the session survives.
+    func testHeartbeatStaysTimelyUnderAnAudioBurst() throws {
+        let server = try MockWindowsServerProcess()
+        defer { server.terminate() }
+        let delegate = RecordingDelegate()
+
+        let unit = NullOutputUnit()
+        let renderer = AudioRenderer(lister: SinkTestLister(),
+                                     unitFactory: { unit },
+                                     prefillFrames: 0)
+        try renderer.open()
+        let rendererQueue = DispatchQueue(label: "sink-burst-test.renderer")
+        // A 2 s peer-dead tripwire: anything that parks the control queue
+        // under the burst closes the session and fails this test.
+        let (client, transport, _) = try makeStreamingClient(server, delegate: delegate,
+                                                             peerDeadTimeout: 2.0) { pcm in
+            rendererQueue.async { renderer.enqueue(pcm: pcm) }
+        }
+        defer { client.stop(); transport.close() }
+        defer { renderer.finalizeClose() }
+
+        let burst = expectation(description: "3 s burst")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { burst.fulfill() }
+        wait(for: [burst], timeout: 10.0)
+
+        XCTAssertFalse(delegate.didClose, "the control queue stalled under the burst")
+        XCTAssertTrue(client.isAuthenticated)
+        XCTAssertGreaterThan(client.audioFramesReceived, 100, "expected ~150 frames in 3 s")
+        let drained = expectation(description: "renderer queue drained")
+        rendererQueue.async { drained.fulfill() }
+        wait(for: [drained], timeout: 5.0)
+        XCTAssertEqual(renderer.enqueuedFrames + renderer.droppedNewestFrames,
+                       client.audioFramesReceived,
+                       "no validated frame may vanish uncounted")
+    }
+}

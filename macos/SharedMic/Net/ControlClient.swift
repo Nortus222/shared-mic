@@ -66,6 +66,15 @@ public final class ControlClient {
     private var gapCount = 0
     private var lastSequence: UInt32?
 
+    /// Phase 2 render handoff: invoked on the control queue with the validated
+    /// PCM of every audio frame (exactly 1,920 bytes). The implementation must
+    /// never block — hop to another queue, copy fast, never wait — because
+    /// this queue also services the heartbeat and the handshake deadline, and
+    /// blocking it fabricates a peer-dead timeout. Set once, before `begin()`:
+    /// the `begin()` hop onto `queue` is the happens-before edge that
+    /// publishes it to the control queue.
+    public var audioSink: ((Data) -> Void)?
+
     public init(transport: MessageTransport,
                 token: Data,
                 clientId: String,
@@ -84,8 +93,8 @@ public final class ControlClient {
         queue.sync { phase == .authenticated }
     }
 
-    /// Counters only — the PCM itself is discarded the moment it is validated.
-    /// Phase 1 has no renderer, and audio payload is never logged or persisted.
+    /// Counters, plus the validated PCM handed to `audioSink` — the payload
+    /// itself is never logged or persisted.
     ///
     /// `audioFramesReceived`/`audioBytesReceived` are cumulative for the whole
     /// connection, by design — they are what makes "an idle connection carries
@@ -276,7 +285,10 @@ public final class ControlClient {
         lastSequence = frame.sequence
         frameCount += 1
         byteCount += frame.pcm.count
-        // The PCM goes no further. Phase 2 hands it to PCMRingBuffer here.
+        // Off the control queue: see the `audioSink` contract above. The
+        // coordinator hops to the renderer queue; a nil sink (no renderer
+        // wired, e.g. in Phase 1-era tests) only counts.
+        audioSink?(frame.pcm)
     }
 
     // MARK: - Send path
