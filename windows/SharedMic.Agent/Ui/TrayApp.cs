@@ -35,14 +35,22 @@ public sealed class TrayApp : ApplicationContext
     /// </summary>
     private readonly Control _marshal;
     private readonly AudioContext? _audio;
+    private readonly AutostartManager? _autostart;
+    private readonly Func<IReadOnlyList<string>>? _diagnosticsProvider;
     private readonly System.Windows.Forms.Timer _levelTimer;
     private readonly ToolStripMenuItem _meterItem;
+    private readonly ToolStripMenuItem? _autostartItem;
+    private readonly ToolStripMenuItem? _diagnosticsMenu;
     private readonly Dictionary<ChannelMode, ToolStripMenuItem> _channelItems = new();
+    private bool _applyingAutostart;
 
-    public TrayApp(AgentIdentity identity, AgentOptions options, Func<Task> onQuitAsync, AudioContext? audio = null)
+    public TrayApp(AgentIdentity identity, AgentOptions options, Func<Task> onQuitAsync, AudioContext? audio = null,
+        AutostartManager? autostart = null, Func<IReadOnlyList<string>>? diagnosticsProvider = null)
     {
         _onQuitAsync = onQuitAsync;
         _audio = audio;
+        _autostart = autostart;
+        _diagnosticsProvider = diagnosticsProvider;
 
         _marshal = new Control();
         _ = _marshal.Handle; // Forces handle creation on this (UI) thread.
@@ -93,14 +101,37 @@ public sealed class TrayApp : ApplicationContext
             _menu.Items.Add(new ToolStripSeparator());
             _menu.Items.Add(channelMenu);
             _menu.Items.Add(_meterItem);
-
-            _levelTimer = new System.Windows.Forms.Timer { Interval = 500 };
-            _levelTimer.Tick += (_, _) => RefreshMeter();
-            _levelTimer.Start();
         }
-        else
+
+        if (autostart is not null)
         {
-            _levelTimer = new System.Windows.Forms.Timer { Interval = 500 };
+            _autostartItem = new ToolStripMenuItem("Start at login")
+            {
+                Checked = autostart.IsEnabled,
+                CheckOnClick = true,
+            };
+            _autostartItem.CheckedChanged += (_, _) => ApplyAutostart();
+            _menu.Items.Add(new ToolStripSeparator());
+            _menu.Items.Add(_autostartItem);
+        }
+
+        if (diagnosticsProvider is not null)
+        {
+            _diagnosticsMenu = new ToolStripMenuItem("Diagnostics");
+            _menu.Items.Add(new ToolStripSeparator());
+            _menu.Items.Add(_diagnosticsMenu);
+            RefreshDiagnostics();
+        }
+
+        _levelTimer = new System.Windows.Forms.Timer { Interval = 500 };
+        _levelTimer.Tick += (_, _) =>
+        {
+            RefreshMeter();
+            RefreshDiagnostics();
+        };
+        if (_audio?.Capture is not null || diagnosticsProvider is not null)
+        {
+            _levelTimer.Start();
         }
 
         _menu.Items.Add(new ToolStripSeparator());
@@ -221,6 +252,20 @@ public sealed class TrayApp : ApplicationContext
         }
     }
 
+    internal void RefreshDiagnostics()
+    {
+        if (_diagnosticsMenu is null || _diagnosticsProvider is null)
+        {
+            return;
+        }
+
+        _diagnosticsMenu.DropDownItems.Clear();
+        foreach (var line in _diagnosticsProvider())
+        {
+            _diagnosticsMenu.DropDownItems.Add(new ToolStripMenuItem(line) { Enabled = false });
+        }
+    }
+
     internal void RefreshMeter()
     {
         if (_audio?.Capture is { } capture && capture.IsRunning)
@@ -231,6 +276,38 @@ public sealed class TrayApp : ApplicationContext
         else
         {
             _meterItem.Text = "Input level: -";
+        }
+    }
+
+    private void ApplyAutostart()
+    {
+        if (_autostart is null || _autostartItem is null || _applyingAutostart)
+        {
+            return;
+        }
+
+        _applyingAutostart = true;
+        try
+        {
+            if (_autostartItem.Checked)
+            {
+                _autostart.Enable();
+            }
+            else
+            {
+                _autostart.Disable();
+            }
+
+            AgentLog.Info($"autostart {(_autostartItem.Checked ? "enabled" : "disabled")}");
+        }
+        catch (Exception exception)
+        {
+            AgentLog.Warn($"autostart change failed ({exception.GetType().Name}); reverting the checkbox");
+            _autostartItem.Checked = _autostart.IsEnabled;
+        }
+        finally
+        {
+            _applyingAutostart = false;
         }
     }
 

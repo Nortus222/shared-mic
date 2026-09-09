@@ -1,6 +1,6 @@
 # Phase 4 — Reliability and Polish Implementation Plan
 
-> **Status 2026-09-08:** Mac Tasks 1–4 implemented and green (279-test suite) in `t3code/start-issue-16`. Tasks 5–11 (login item, discovery, all Windows track items, owner-gated acceptance) remain.
+> **Status 2026-09-08:** Mac Tasks 1–6 implemented and green (279-test suite plus new suites) in `t3code/start-issue-16`. Windows Tasks 7/9/10 implemented blind in the same commit series — `dotnet test` on the Windows host must go green before merge. Task 8 verified with no changes. Task 11 (owner-gated acceptance) remains.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -146,6 +146,8 @@ Spec §2.1 + §12, Windows track. Agent starts at login unpaired-but-ready; stor
 - [ ] **Step 3: Write the minimal implementation.**
 - [ ] **Step 4: Run and confirm it passes** (`dotnet test` full suite green).
 - [ ] **Step 5: Commit.** `feat(windows): login autostart toggle (Phase 4 Task 7)`
+
+> **Status 2026-09-08:** verified against the existing suite — `EffectiveMicPresent()` re-verifies the endpoint ID on every START, `HandleMicLost` ends the session and sends STATUS on capture loss, presence-change sends STATUS, and `ControlConnectionAudioTests` + `SessionStateMachineTests` cover mid-session unplug, idle replug, and recovery. No code changes required.
 
 ### Task 8 (Windows): USB replug — endpoint-ID re-verify beyond STATUS
 

@@ -91,6 +91,7 @@ public static class Program
 
         var metrics = new AgentMetrics();
         var rateLimiter = new AuthRateLimiter();
+        var ledger = new SessionLedger();
 
         PrintBanner(Console.Out, identity, options, store.WasNewlyCreated);
 
@@ -159,7 +160,8 @@ public static class Program
 
                 tray?.SetStatus(status, shown);
             },
-            audio);
+            audio,
+            ledger);
 
         // Constructed BEFORE Start(). The other order loses a status: a Mac that
         // reconnects the instant the listener binds publishes Idle into a null
@@ -167,6 +169,11 @@ public static class Program
         // because nothing re-publishes. Assigning before Start also means the
         // callback's cross-thread read of this variable is ordered by the
         // thread starts inside Start, not by luck.
+        var autostart = new AutostartManager(
+            new RegistryAutostartStore(),
+            Environment.ProcessPath ?? Application.ExecutablePath);
+        MdnsAdvertiser? advertiser = null;
+
         if (!options.Headless)
         {
             ApplicationConfiguration.Initialize();
@@ -175,9 +182,11 @@ public static class Program
             {
                 // Dispose FIRST, snapshot second - see the headless path below
                 // for why the order is load-bearing.
+                advertiser?.Dispose();
                 await listener.DisposeAsync();
                 AgentLog.Info($"final counters: {metrics.Snapshot()}");
-            }, audio);
+            }, audio, autostart,
+            () => WindowsDiagnosticsSnapshot.From(metrics.Snapshot(), ledger.Snapshot()).ToMenuLines());
             tray.SetStatus(AgentStatus.Disconnected, $"port {options.Port}");
         }
 
@@ -195,10 +204,24 @@ public static class Program
             return 1;
         }
 
+        // Best-effort: discovery only fills the Mac pairing form, so a
+        // failure here warns and serving continues without it.
+        try
+        {
+            advertiser = new MdnsAdvertiser(new DnsApiMdnsBackend(), Environment.MachineName);
+            advertiser.Start((ushort)options.Port, identity.Fingerprint);
+        }
+        catch (Exception exception)
+        {
+            AgentLog.Warn($"mDNS advertising is unavailable ({exception.GetType().Name}); pair by address instead");
+            advertiser = null;
+        }
+
         if (tray is not null)
         {
             AgentLog.Info("running with a tray icon. Use the tray menu to quit.");
             Application.Run(tray);
+            advertiser?.Dispose();
             audio?.Dispose();
             return 0;
         }
@@ -219,6 +242,7 @@ public static class Program
         // listener has drained makes it "counters as of shortly before the end",
         // which is exactly the misreading it is there to prevent.
         listener.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        advertiser?.Dispose();
         audio?.Dispose();
         AgentLog.Info($"final counters: {metrics.Snapshot()}");
         return 0;

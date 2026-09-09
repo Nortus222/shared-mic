@@ -184,6 +184,71 @@ public class TrayAppTests
         });
     }
 
+    [Fact]
+    public void AutostartItemReflectsAndTogglesTheManager()
+    {
+        RunOnStaThread(() =>
+        {
+            var store = new FakeAutostartStore();
+            var manager = new AutostartManager(store, @"C:\Apps\SharedMic\SharedMic.Agent.exe");
+            using var tray = new TrayApp(TestIdentity(), new AgentOptions(), () => Task.CompletedTask,
+                autostart: manager);
+
+            var item = tray.Menu.Items.OfType<ToolStripMenuItem>().Single(i => i.Text == "Start at login");
+            Assert.False(item.Checked);
+
+            item.PerformClick();
+            Assert.True(manager.IsEnabled);
+
+            item.PerformClick();
+            Assert.False(manager.IsEnabled);
+        });
+    }
+
+    [Fact]
+    public void NoAutostartItemAppearsWithoutAManager()
+    {
+        RunOnStaThread(() =>
+        {
+            using var tray = new TrayApp(TestIdentity(), new AgentOptions(), () => Task.CompletedTask);
+
+            Assert.DoesNotContain(
+                tray.Menu.Items.OfType<ToolStripItem>().Select(i => i.Text),
+                text => text == "Start at login");
+        });
+    }
+
+    [Fact]
+    public void DiagnosticsMenuShowsProviderLinesAndRefreshes()
+    {
+        RunOnStaThread(() =>
+        {
+            var lines = new List<string> { "Sessions: 1 (30s total)", "Auth failures: 0" };
+            using var tray = new TrayApp(TestIdentity(), new AgentOptions(), () => Task.CompletedTask,
+                diagnosticsProvider: () => lines);
+
+            var menu = tray.Menu.Items.OfType<ToolStripMenuItem>().Single(i => i.Text == "Diagnostics");
+            Assert.Equal(2, menu.DropDownItems.Count);
+            Assert.Equal("Sessions: 1 (30s total)", menu.DropDownItems[0].Text);
+
+            lines[0] = "Sessions: 2 (90s total)";
+            tray.RefreshDiagnostics();
+            Assert.Equal("Sessions: 2 (90s total)", menu.DropDownItems[0].Text);
+        });
+    }
+
+    private sealed class FakeAutostartStore : IAutostartStore
+    {
+        private readonly Dictionary<string, string> _values = new();
+
+        public string? GetValue(string name) =>
+            _values.TryGetValue(name, out var value) ? value : null;
+
+        public void SetValue(string name, string command) => _values[name] = command;
+
+        public void DeleteValue(string name) => _values.Remove(name);
+    }
+
     /// <summary>
     /// WinForms and the clipboard both require a single-threaded apartment, and
     /// xunit runs tests on MTA pool threads. This gives each UI test its own STA

@@ -44,6 +44,7 @@ public sealed class TlsListener : IAsyncDisposable
     private SessionState _currentSession;
     private bool _currentMicPresent = true;
     private readonly AudioContext? _audio;
+    private readonly SessionLedger? _ledger;
     private bool _started;
     private bool _disposed;
 
@@ -53,7 +54,8 @@ public sealed class TlsListener : IAsyncDisposable
         AuthRateLimiter rateLimiter,
         AgentMetrics metrics,
         Action<AgentStatus, string?> onStatus,
-        AudioContext? audio = null)
+        AudioContext? audio = null,
+        SessionLedger? ledger = null)
     {
         _identity = identity;
         _options = options;
@@ -61,6 +63,7 @@ public sealed class TlsListener : IAsyncDisposable
         _metrics = metrics;
         _onStatus = onStatus;
         _audio = audio;
+        _ledger = ledger;
     }
 
     public IReadOnlyList<IPEndPoint> Endpoints { get; private set; } = Array.Empty<IPEndPoint>();
@@ -432,6 +435,12 @@ public sealed class TlsListener : IAsyncDisposable
             _currentSession = state;
             _currentMicPresent = micPresent;
             PublishStatusLocked();
+            // Outside the status publish but inside the same critical section:
+            // the ledger takes only its own short lock and never waits, so it
+            // cannot close a lock cycle with _gate.
+            _ledger?.NoteSessionState(
+                state == SessionState.Active,
+                connection.SendQueue.AudioFramesEvicted + connection.SendQueue.AudioFramesDiscarded);
         }
     }
 
