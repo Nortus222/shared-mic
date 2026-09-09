@@ -1,3 +1,4 @@
+using SharedMic.Agent.Audio;
 using SharedMic.Agent.Diagnostics;
 using SharedMic.Agent.Protocol;
 using SharedMic.Agent.Security;
@@ -11,12 +12,15 @@ namespace SharedMic.Agent.Net;
 /// tests). Owns the section 6 handshake, the section 7 session lifecycle, the
 /// section 8 dead-peer rule, and the section 9 writer loop.
 ///
-/// Phase 1 has no capture path, so nothing ever calls SendQueue.EnqueueAudio on
-/// a live connection and an active session carries zero audio bytes.
+/// With an AudioContext attached, an active session streams real microphone
+/// audio: capture frames arrive on the WASAPI event thread through
+/// ICaptureSink and are enqueued behind control traffic per section 9.
+/// Without one the agent keeps its Phase 1 behavior and streams nothing.
 ///
-/// Threading: every control message is handled on the single read loop, which
-/// is why SessionStateMachine does not need to be thread-safe. The writer runs
-/// on its own task and touches only the queue and the stream.
+/// Threading: control messages are dispatched on the single read loop, but
+/// device notifications and capture loss arrive on arbitrary threads, so every
+/// session-state and capture transition holds _sessionGate. The writer runs on
+/// its own task and touches only the queue and the stream.
 ///
 /// Boundary typing: ControlCodec.Validate proves a field is PRESENT, never that
 /// it holds the right JSON type. {"type":"PING","v":1,"seq":"abc"} decodes
@@ -25,7 +29,7 @@ namespace SharedMic.Agent.Net;
 /// would raise InvalidCastException and replace the protocol's defined
 /// behaviour with an unhandled exception.
 /// </summary>
-public sealed class ControlConnection : IAsyncDisposable
+public sealed class ControlConnection : IAsyncDisposable, ICaptureSink
 {
     /// <summary>How long teardown waits for the writer and liveness loops before abandoning them.</summary>
     private static readonly TimeSpan LoopDrainTimeout = TimeSpan.FromSeconds(5);
@@ -36,6 +40,8 @@ public sealed class ControlConnection : IAsyncDisposable
     private readonly AuthRateLimiter _rateLimiter;
     private readonly AgentMetrics _metrics;
     private readonly SessionStateMachine _session = new();
+    private readonly AudioContext? _audio;
+    private readonly object _sessionGate = new();
     private readonly PrioritySendQueue _queue = new();
     private readonly CancellationTokenSource _closing = new();
     private readonly byte[] _nonce = AuthProof.GenerateNonce();
@@ -57,13 +63,20 @@ public sealed class ControlConnection : IAsyncDisposable
         AgentIdentity identity,
         AgentOptions options,
         AuthRateLimiter rateLimiter,
-        AgentMetrics metrics)
+        AgentMetrics metrics,
+        AudioContext? audio = null)
     {
         _stream = stream;
         _identity = identity;
         _options = options;
         _rateLimiter = rateLimiter;
         _metrics = metrics;
+        _audio = audio;
+        if (_audio is not null)
+        {
+            _audio.PresenceChanged += OnDevicePresenceChanged;
+            _audio.CaptureLost += OnServiceCaptureLost;
+        }
     }
 
     /// <summary>Raised once HELLO_ACK has been queued, so the listener can supersede an older connection.</summary>
@@ -95,7 +108,13 @@ public sealed class ControlConnection : IAsyncDisposable
         finally
         {
             Close();
-            _session.Reset();
+            UnsubscribeAudio();
+            lock (_sessionGate)
+            {
+                StopCaptureLocked();
+                _session.Reset();
+            }
+
             _queue.DiscardAudio();
 
             // The stream is disposed BEFORE the loops are awaited, and the
@@ -166,6 +185,7 @@ public sealed class ControlConnection : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         Close();
+        UnsubscribeAudio();
 
         try
         {
@@ -351,7 +371,7 @@ public sealed class ControlConnection : IAsyncDisposable
 
         // Queue HELLO_ACK before flipping any observable state, so nothing can
         // slip ahead of it on the control queue.
-        SendControl(ControlMessages.HelloAck(_identity.ServerId, _options.MicPresent, _options.DeviceLabel));
+        SendControl(ControlMessages.HelloAck(_identity.ServerId, CachedMicPresent(), EffectiveDeviceLabel()));
         AgentLog.Info(
             $"authenticated client '{AgentLog.Sanitize(message.GetValueOrDefault("clientId"))}' from {RemoteDescription}");
         Authenticated?.Invoke(this);
@@ -438,7 +458,22 @@ public sealed class ControlConnection : IAsyncDisposable
                     break;
                 }
 
-                var outcome = _session.HandleStart(_options.MicPresent);
+                StartOutcome outcome;
+                lock (_sessionGate)
+                {
+                    outcome = _session.HandleStart(EffectiveMicPresent());
+                    if (outcome.Accepted && outcome.StartedNewSession && _audio?.Capture is not null)
+                    {
+                        _audio.Router.SetTarget(this);
+                        if (!_audio.Capture.TryStart(this, out _))
+                        {
+                            _audio.Router.ClearTarget(this);
+                            _session.HandleStop(outcome.SessionId);
+                            outcome = new StartOutcome(false, string.Empty, "MIC_UNAVAILABLE", false);
+                        }
+                    }
+                }
+
                 if (!outcome.Accepted)
                 {
                     AgentLog.Info($"START {AgentLog.Sanitize(requestId)} rejected: {outcome.Reason}");
@@ -449,7 +484,7 @@ public sealed class ControlConnection : IAsyncDisposable
                 if (outcome.StartedNewSession)
                 {
                     _metrics.IncrementSessionsStarted();
-                    AgentLog.Info($"session {outcome.SessionId} started (Phase 1: no capture, no audio will be sent)");
+                    AgentLog.Info($"session {outcome.SessionId} started");
                 }
                 else
                 {
@@ -458,6 +493,7 @@ public sealed class ControlConnection : IAsyncDisposable
                 }
 
                 SendControl(ControlMessages.StartAck(requestId, outcome.SessionId));
+                RaiseSessionStateChanged();
                 break;
             }
 
@@ -471,14 +507,21 @@ public sealed class ControlConnection : IAsyncDisposable
                 }
 
                 var requested = message["sessionId"] as string ?? string.Empty;
-                var outcome = _session.HandleStop(requested);
+                StopOutcome outcome;
+                lock (_sessionGate)
+                {
+                    outcome = _session.HandleStop(requested);
+                    StopCaptureLocked();
+                }
+
                 var discarded = _queue.DiscardAudio();
                 if (outcome.EndedSession)
                 {
-                    AgentLog.Info($"session {outcome.SessionId} ended; discarded {discarded} queued audio frames");
+                    AgentLog.Info($"session {outcome.SessionId} ended; discarded {discarded} queued audio frames{CapturePeaks()}");
                 }
 
                 SendControl(ControlMessages.StopAck(requestId, outcome.SessionId));
+                RaiseSessionStateChanged();
                 break;
             }
 
@@ -555,8 +598,126 @@ public sealed class ControlConnection : IAsyncDisposable
         }
     }
 
+    public void OnCaptureFrame(byte[] pcm, uint sequence, ulong timestampUs) =>
+        _queue.EnqueueAudio(FrameCodec.EncodeFrame(FrameType.Audio, AudioPayloadCodec.EncodeAudioPayload(sequence, timestampUs, pcm)));
+
+    public event Action<ControlConnection, SessionState, bool>? SessionStateChanged;
+
+    public void OnDevicePresenceChanged(bool present)
+    {
+        if (present)
+        {
+            SendStatus();
+            RaiseSessionStateChanged();
+            return;
+        }
+
+        HandleMicLost();
+    }
+
+    public void OnServiceCaptureLost() => HandleMicLost();
+
+    private void HandleMicLost()
+    {
+        bool hadSession;
+        lock (_sessionGate)
+        {
+            hadSession = _session.State == SessionState.Active;
+            if (hadSession)
+            {
+                var ended = _session.HandleStop(_session.SessionId ?? string.Empty);
+                StopCaptureLocked();
+                AgentLog.Warn($"session {ended.SessionId} ended by microphone loss; no STOP was asked for");
+            }
+        }
+
+        if (hadSession)
+        {
+            _queue.DiscardAudio();
+        }
+
+        SendStatus();
+        RaiseSessionStateChanged();
+    }
+
+    private void SendStatus()
+    {
+        SessionState state;
+        bool micPresent;
+        string label;
+        lock (_sessionGate)
+        {
+            state = _session.State;
+            micPresent = CachedMicPresent();
+            label = EffectiveDeviceLabel();
+        }
+
+        SendControl(ControlMessages.Status(micPresent, state == SessionState.Active, label));
+    }
+
+    private void RaiseSessionStateChanged()
+    {
+        SessionState state;
+        bool micPresent;
+        lock (_sessionGate)
+        {
+            state = _session.State;
+            micPresent = CachedMicPresent();
+        }
+
+        SessionStateChanged?.Invoke(this, state, micPresent);
+    }
+
+    private bool EffectiveMicPresent() => _options.MicPresent && (_audio?.RefreshPresence() ?? true);
+
+    private bool CachedMicPresent() => _options.MicPresent && (_audio?.CachedPresence ?? true);
+
+    private string EffectiveDeviceLabel() => _audio?.Devices?.DeviceLabel ?? _options.DeviceLabel;
+
+    private string CapturePeaks()
+    {
+        var capture = _audio?.Capture;
+        if (capture is null)
+        {
+            return string.Empty;
+        }
+
+        return $" (channel peaks L={capture.SessionPeakLeft:F3} R={capture.SessionPeakRight:F3})";
+    }
+
+    private void StopCaptureLocked()
+    {
+        var audio = _audio;
+        if (audio?.Capture is null)
+        {
+            return;
+        }
+
+        audio.Router.ClearTarget(this);
+        audio.Capture.Stop(this);
+    }
+
+    private void UnsubscribeAudio()
+    {
+        var audio = _audio;
+        if (audio is null)
+        {
+            return;
+        }
+
+        audio.PresenceChanged -= OnDevicePresenceChanged;
+        audio.CaptureLost -= OnServiceCaptureLost;
+    }
+
     private void SendControl(IReadOnlyDictionary<string, object?> message) =>
         _queue.EnqueueControl(FrameCodec.EncodeFrame(FrameType.Control, ControlCodec.Encode(message)));
 
     private void Touch() => Interlocked.Exchange(ref _lastPeerActivityMs, Environment.TickCount64);
 }
+
+
+
+
+
+
+
