@@ -50,6 +50,12 @@ struct MenuBarView: View {
                 Divider()
             }
 
+            Toggle("Launch at login", isOn: Binding(
+                get: { model.loginItemEnabled },
+                set: { model.setLoginItemEnabled($0) }
+            ))
+            .toggleStyle(.checkbox)
+
             HStack {
                 if model.pairedHost != nil {
                     Button("Unpair…") { model.unpair() }
@@ -179,6 +185,16 @@ struct MenuBarView: View {
         VStack(alignment: .leading, spacing: 6) {
             Text("Pair with the Windows agent")
                 .font(.subheadline)
+            if !model.discoveredHosts.isEmpty {
+                Text("Found on this network:")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                ForEach(model.discoveredHosts) { host in
+                    Button("\(host.name) (\(host.host):\(host.port))") {
+                        model.selectDiscoveredHost(host)
+                    }
+                }
+            }
             TextField("Host or IP address", text: $model.hostField)
             TextField("Port", text: $model.portField)
             // SecureField, not TextField: this is a 32-byte bearer secret, and

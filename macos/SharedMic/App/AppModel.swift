@@ -25,6 +25,8 @@ public final class AppModel: ObservableObject {
     @Published public private(set) var sessionCount: Int = 0
     @Published public private(set) var diagnostics = DiagnosticsSnapshot()
     @Published public private(set) var inputLevel: Float = 0
+    @Published public private(set) var loginItemEnabled: Bool = false
+    @Published public private(set) var discoveredHosts: [DiscoveredHost] = []
 
     @Published public var hostField: String = ""
     @Published public var portField: String = String(SharedMicProtocol.defaultPort)
@@ -32,6 +34,9 @@ public final class AppModel: ObservableObject {
 
     private let coordinator: ConnectionCoordinator
     private let readSystemInput: () -> SystemInputInfo?
+    private let loginItem: any LoginItemControl
+    private var browser: (any HostBrowser)?
+    private var browsing = false
     private var refreshTimer: Timer?
     private var wakeObserver: NSObjectProtocol?
 
@@ -41,7 +46,9 @@ public final class AppModel: ObservableObject {
                 makeRenderer: (() -> RendererControl)? = nil,
                 demandSettings: DemandSettingsStore = UserDefaultsDemandSettingsStore(),
                 makeObserver: ((@escaping (DemandSnapshot) -> Void) -> AudioDemandObserver)? = nil,
-                readSystemInput: (() -> SystemInputInfo?)? = nil) {
+                readSystemInput: (() -> SystemInputInfo?)? = nil,
+                makeLoginItem: (() -> any LoginItemControl)? = nil,
+                makeBrowser: (() -> any HostBrowser)? = nil) {
         // Production default is the live Core Audio observer; tests inject a
         // fake (or an empty one for hermetic non-demand tests) so unit tests
         // never depend on what the host machine happens to be recording.
@@ -53,6 +60,12 @@ public final class AppModel: ObservableObject {
                                             demandSettings: demandSettings,
                                             makeObserver: observerFactory)
         self.readSystemInput = readSystemInput ?? SystemInputDevice.current
+        loginItem = makeLoginItem?() ?? LoginItemManager()
+        loginItemEnabled = loginItem.isEnabled
+        if let makeBrowser {
+            browser = makeBrowser()
+            browser?.delegate = self
+        }
         pairedHost = coordinator.pairedHost
         hostField = coordinator.pairedHost ?? ""
         state = coordinator.state
@@ -109,6 +122,13 @@ public final class AppModel: ObservableObject {
         refreshTimer = timer
         refreshDemandDerived()
 
+        // Browse for Windows agents only while unpaired: no background
+        // browsing while streaming, and a paired launch goes straight to
+        // the silent resume.
+        if pairedHost == nil {
+            startDiscovery()
+        }
+
         wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
                 Task { @MainActor in self?.handleWake() }
@@ -117,6 +137,38 @@ public final class AppModel: ObservableObject {
         if autoStart {
             coordinator.startIfPaired()
         }
+    }
+
+    /// Launch-at-login toggle (spec §2.1). A failure leaves the published
+    /// state exactly where the service is and explains itself in a notice —
+    /// the toggle must never read enabled while the service disagrees.
+    public func setLoginItemEnabled(_ enabled: Bool) {
+        do {
+            try loginItem.setEnabled(enabled)
+        } catch {
+            lastNotice = "Could not \(enabled ? "enable" : "disable") launch at login: \(error.localizedDescription)"
+        }
+        loginItemEnabled = loginItem.isEnabled
+    }
+
+    /// A discovered host fills the pairing form; the user still presses
+    /// Pair. Wrong-host pairing fails exactly as with a typed host.
+    public func selectDiscoveredHost(_ host: DiscoveredHost) {
+        hostField = host.host
+        portField = String(host.port)
+    }
+
+    private func startDiscovery() {
+        guard let browser, !browsing else { return }
+        browsing = true
+        browser.start()
+    }
+
+    private func stopDiscovery() {
+        guard browsing else { return }
+        browsing = false
+        browser?.stop()
+        discoveredHosts = []
     }
 
     /// System-wake entry point (spec §12): forced demand rescan plus the
@@ -135,6 +187,10 @@ public final class AppModel: ObservableObject {
         refreshTimer?.invalidate()
         if let wakeObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver)
+        }
+        if browsing {
+            browsing = false
+            browser?.stop()
         }
     }
 
@@ -208,6 +264,7 @@ public final class AppModel: ObservableObject {
                 case .success(let record):
                     self.pairedHost = record.host
                     self.lastNotice = "Paired with \(record.host)."
+                    self.stopDiscovery()
                 case .failure(let error):
                     self.lastNotice = String(describing: error)
                 }
@@ -218,6 +275,7 @@ public final class AppModel: ObservableObject {
     public func unpair() {
         coordinator.unpair()
         pairedHost = nil
+        startDiscovery()
         fingerprintWarning = nil
         lastNotice = "Unpaired."
         // A pair() racing this unpair() may have its completion dropped by the
@@ -230,11 +288,27 @@ public final class AppModel: ObservableObject {
     public func quit() {
         refreshTimer?.invalidate()
         refreshTimer = nil
+        stopDiscovery()
         // Terminate only once the coordinator has actually torn down, rather
         // than racing its `queue.async`. Phase 2 wants to send a STOP on the way
         // out; a terminate that beats the teardown would silently skip it.
         coordinator.shutdown {
             NSApplication.shared.terminate(nil)
         }
+    }
+}
+
+extension AppModel: HostBrowserDelegate {
+    public func hostBrowser(_ browser: HostBrowser, didFind host: DiscoveredHost) {
+        if let index = discoveredHosts.firstIndex(where: { $0.name == host.name }) {
+            discoveredHosts[index] = host
+        } else {
+            discoveredHosts.append(host)
+            discoveredHosts.sort { $0.name < $1.name }
+        }
+    }
+
+    public func hostBrowser(_ browser: HostBrowser, didLoseHostNamed name: String) {
+        discoveredHosts.removeAll { $0.name == name }
     }
 }

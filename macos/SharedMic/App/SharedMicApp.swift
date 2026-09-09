@@ -2,7 +2,8 @@ import SwiftUI
 
 @main
 struct SharedMicApp: App {
-    @StateObject private var model = AppModel(store: SharedMicApp.pairingStore())
+    @StateObject private var model = AppModel(store: SharedMicApp.pairingStore(),
+                                                  makeBrowser: { BonjourHostBrowser() })
 
     /// Under `xcodebuild test` the test host IS this app binary, so a plain
     /// `AppModel()` would read the real login keychain on every test launch.
