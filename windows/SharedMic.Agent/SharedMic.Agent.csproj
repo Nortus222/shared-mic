@@ -10,6 +10,7 @@
     <LangVersion>latest</LangVersion>
     <AssemblyName>SharedMic.Agent</AssemblyName>
     <RootNamespace>SharedMic.Agent</RootNamespace>
+    <ApplicationIcon>SharedMic.ico</ApplicationIcon>
   </PropertyGroup>
 
   <ItemGroup>

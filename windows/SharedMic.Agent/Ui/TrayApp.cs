@@ -108,7 +108,7 @@ public sealed class TrayApp : ApplicationContext
 
         _icon = new NotifyIcon
         {
-            Icon = SystemIcons.Application,
+            Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath) ?? SystemIcons.Application,
             Text = FormatStatus(AgentStatus.Disconnected, null),
             ContextMenuStrip = _menu,
             Visible = true,
