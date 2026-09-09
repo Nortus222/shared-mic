@@ -79,6 +79,25 @@ final class ConnectionCoordinatorTests: XCTestCase {
         wait(for: [reached], timeout: timeout)
     }
 
+    /// Renderer actions execute async on the renderer's serial queue while
+    /// state publishes on the main queue, with no ordering between them: after
+    /// `waitForState` returns, the renderer effect may still be queued. Poll
+    /// the recording instead of asserting immediately.
+    private func waitForRecording(_ description: String,
+                                  timeout: TimeInterval = 5.0,
+                                  _ check: @escaping () -> Bool) {
+        let met = expectation(description: description)
+        func poll() {
+            if check() {
+                met.fulfill()
+            } else {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { poll() }
+            }
+        }
+        poll()
+        wait(for: [met], timeout: timeout)
+    }
+
     private func pair(_ coordinator: ConnectionCoordinator,
                       with server: MockWindowsServerProcess) throws -> PairingRecord {
         let paired = expectation(description: "paired")
@@ -244,8 +263,8 @@ final class ConnectionCoordinatorTests: XCTestCase {
         let finalizedBefore = recording.finalized
         coordinator.requestStop()
         waitForState(coordinator, description: "idle again") { $0 == .idle }
-        XCTAssertEqual(recording.drained, drainedBefore + 1, "STOP drains before close")
-        XCTAssertEqual(recording.finalized, finalizedBefore + 1, "STOP_ACK closes the renderer")
+        waitForRecording("STOP drains before close") { recording.drained == drainedBefore + 1 }
+        waitForRecording("STOP_ACK closes the renderer") { recording.finalized == finalizedBefore + 1 }
     }
 
     /// Mic loss mid-session takes the abnormal exit: no drain window, the
@@ -276,7 +295,7 @@ final class ConnectionCoordinatorTests: XCTestCase {
             if case .degraded = state { return true }
             return false
         }
-        XCTAssertEqual(recording.finalized, finalizedBefore + 1)
+        waitForRecording("mic loss closes the renderer") { recording.finalized == finalizedBefore + 1 }
     }
 
     /// A renderer that cannot open (BlackHole missing) must surface guidance,
