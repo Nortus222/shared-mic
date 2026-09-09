@@ -675,4 +675,116 @@ final class ConnectionCoordinatorTests: XCTestCase {
         waitForState(coordinator, description: "unpaired") { $0 == .unpaired }
         XCTAssertNil(try store.load())
     }
+
+    // MARK: - Phase 4 sleep/wake
+
+    /// The wake forces a full demand rescan (BlackHole UID re-resolve plus
+    /// watcher rebuild) even when nothing else happened.
+    func testWakeForcesADemandRescan() {
+        let fake = demandFake()
+        let coordinator = demandCoordinator(fake: fake)
+        defer { coordinator.shutdown() }
+
+        waitForObserverReady(fake)
+        let before = fake.fullEnumerations
+        coordinator.handleWake()
+        let rescanned = expectation(description: "rescan after wake")
+        func poll() {
+            if fake.fullEnumerations > before {
+                rescanned.fulfill()
+            } else {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { poll() }
+            }
+        }
+        poll()
+        wait(for: [rescanned], timeout: 10.0)
+    }
+
+    /// Stale AudioObjectIDs must never survive a sleep cycle: if the
+    /// BlackHole ID changed across the wake, the old ID stops counting and
+    /// the new one counts after a single rescan.
+    func testWakeDropsAStaleBlackHoleID() {
+        let fake = demandFake()
+        let coordinator = demandCoordinator(fake: fake)
+        defer { coordinator.shutdown() }
+
+        waitForObserverReady(fake)
+        setDemand(fake, true)
+        waitForPoll(description: "demand on old ID") { coordinator.demandSnapshot.hasDemand }
+
+        // The ID changes while asleep; no listener fires, so the coordinator
+        // still believes the stale snapshot until the wake rescan.
+        fake.blackHoleID = 104
+        XCTAssertTrue(coordinator.demandSnapshot.hasDemand)
+        coordinator.handleWake()
+        waitForPoll(description: "stale ID dropped") { !coordinator.demandSnapshot.hasDemand }
+
+        // The new ID counts again once a holder appears on it.
+        guard let object = fake.procs.first(where: { $0.value.pid == 501 })?.key else {
+            return XCTFail("demand fixture process missing")
+        }
+        fake.procs[object]?.devices = [104]
+        fake.fireDevice(object)
+        waitForPoll(description: "demand on new ID") { coordinator.demandSnapshot.hasDemand }
+    }
+
+    /// A wake while connected schedules nothing: the live connection (or its
+    /// already-pending reconnect) owns transport recovery.
+    func testWakeWhileConnectedSchedulesNoReconnect() throws {
+        let server = try MockWindowsServerProcess()
+        defer { server.terminate() }
+        let coordinator = ConnectionCoordinator(store: InMemoryPairingStore(), clientId: "mac-tests")
+        defer { coordinator.shutdown() }
+
+        _ = try pair(coordinator, with: server)
+        waitForState(coordinator, description: "idle") { $0 == .idle }
+        coordinator.handleWake()
+        Thread.sleep(forTimeInterval: 1.0)
+        XCTAssertEqual(coordinator.reconnectCountValue, 0)
+    }
+
+    /// Wake with demand held across a dead peer: the rescan runs, the
+    /// existing backoff reconnects, and the Phase 3 re-auth refire restarts
+    /// the session — no new state-machine edges.
+    func testWakeWithDemandHeldRecoversTheSession() throws {
+        let server = try MockWindowsServerProcess()
+        defer { server.terminate() }
+        let fake = demandFake()
+        let coordinator = demandCoordinator(fake: fake, makeRenderer: { RecordingRenderer() })
+        defer { coordinator.shutdown() }
+
+        _ = try pair(coordinator, with: server)
+        waitForState(coordinator, description: "idle") { $0 == .idle }
+        setDemand(fake, true)
+        waitForStreaming(coordinator)
+
+        coordinator.handleWake()
+        server.dropConnections()
+        // The drop must land first: without this the wait below matches the
+        // still-streaming state and proves nothing.
+        waitForState(coordinator, timeout: 30.0, description: "drop noticed") {
+            if case .streaming = $0 { return false }
+            return true
+        }
+        waitForState(coordinator, timeout: 30.0, description: "streaming again after wake") {
+            if case .streaming = $0 { return true }
+            return false
+        }
+        XCTAssertEqual(coordinator.sessionCountValue, 2)
+    }
+
+    private func waitForPoll(description: String,
+                             timeout: TimeInterval = 10.0,
+                             _ met: @escaping () -> Bool) {
+        let done = expectation(description: description)
+        func poll() {
+            if met() {
+                done.fulfill()
+            } else {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { poll() }
+            }
+        }
+        poll()
+        wait(for: [done], timeout: timeout)
+    }
 }

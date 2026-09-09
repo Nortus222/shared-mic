@@ -2,7 +2,7 @@
 # Deterministic generator for macos/SharedMic.xcodeproj.
 #
 # The .xcodeproj is a build artifact that happens to be committed; THIS file is
-# the source of truth. Re-run it after adding or removing any .swift file:
+# the source of truth. Re-run it after adding or removing any .swift file or resource:
 #
 #   ruby macos/project.rb
 #
@@ -44,6 +44,9 @@ end
 add_swift_sources(app_group, app, File.join(ROOT, 'SharedMic'))
 add_swift_sources(test_group, tests, File.join(ROOT, 'SharedMicTests'))
 
+assets = app_group.new_reference('Assets.xcassets')
+app.add_resources([assets])
+
 app.build_configurations.each do |config|
   settings = config.build_settings
   settings['PRODUCT_NAME'] = 'SharedMic'
@@ -54,6 +57,7 @@ app.build_configurations.each do |config|
   settings['CODE_SIGN_IDENTITY'] = '-'
   settings['ENABLE_HARDENED_RUNTIME'] = 'YES'
   settings['COMBINE_HIDPI_IMAGES'] = 'YES'
+  settings['ASSETCATALOG_COMPILER_APPICON_NAME'] = 'AppIcon'
   settings['SWIFT_VERSION'] = SWIFT_VERSION
   settings['MACOSX_DEPLOYMENT_TARGET'] = DEPLOYMENT_TARGET
 end

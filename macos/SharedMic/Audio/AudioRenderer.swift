@@ -19,6 +19,20 @@ public protocol RendererControl: AnyObject {
     func closeAfterDrain()
     func finalizeClose()
     var isOpen: Bool { get }
+    /// Per-session accounting snapshot for the diagnostics view (spec §11).
+    /// Lag-tolerant like every other bridge counter: the coordinator folds
+    /// these into its cumulative totals at teardown and adds the live reading
+    /// at snapshot time.
+    func readCounters() -> RendererCounters
+    /// Read-and-clear rendered-PCM peak (0–1) for the menu level meter. The
+    /// 1 Hz poller takes whatever rendered since the last take, so each
+    /// reading is that second's peak.
+    func takeRenderedPeak() -> Float
+}
+
+extension RendererControl {
+    public func readCounters() -> RendererCounters { RendererCounters() }
+    public func takeRenderedPeak() -> Float { 0 }
 }
 
 /// The output-unit contract behind `AudioRenderer`. The only production
@@ -92,7 +106,7 @@ extension AudioRendererError: CustomStringConvertible {
 ///   data). A stale `tail` read is impossible beyond cache-coherency delay,
 ///   which the publish barrier already orders against.
 /// - `insertRequested` is advisory and lossy: if a set races a clear, drift
-///   re-requests within one dwell. Counters are monotonic; cross-thread
+///   re-requests within one dwell. Counters are per-session (reset by `clear()` in `open()`); cross-thread
 ///   reads may lag, which is fine for metrics and exact in single-threaded
 ///   tests.
 ///
@@ -120,6 +134,11 @@ final class RenderBridge {
     private(set) var underrunSamples = 0
     private(set) var droppedNewestFrames = 0
     private(set) var droppedOldestFrames = 0
+    /// Loudest absolute sample rendered since the last take. Written on the
+    /// render thread, taken from the coordinator's renderer queue: a plain
+    /// Float is single-copy atomic on arm64, and a torn-or-stale read only
+    /// wiggles a meter, so no fence is warranted on the hot path.
+    private(set) var peakSinceRead: Float = 0
 
     /// Set by the consumer (drift verdict), applied and cleared by the
     /// producer on the next enqueue. See the lossiness note above.
@@ -173,6 +192,8 @@ final class RenderBridge {
             head = (head + 1) % Self.capacitySamples
             left[index] = sample
             right[index] = sample
+            let magnitude = abs(sample)
+            if magnitude > peakSinceRead { peakSinceRead = magnitude }
         }
         OSMemoryBarrier()
         count -= have
@@ -185,6 +206,16 @@ final class RenderBridge {
             underrunSamples += underrun
         }
         return underrun
+    }
+
+    /// Consumer-side. Reads and clears the rendered peak (see
+    /// `peakSinceRead`). Single-threaded callers only for the clear half;
+    /// the coordinator is the only taker and it serializes on the renderer
+    /// queue.
+    func takePeak() -> Float {
+        let peak = peakSinceRead
+        peakSinceRead = 0
+        return peak
     }
 
     /// Consumer-side. Drops whole oldest frames down toward the target;
@@ -211,6 +242,10 @@ final class RenderBridge {
         head = 0
         tail = 0
         count = 0
+        underrunSamples = 0
+        droppedNewestFrames = 0
+        droppedOldestFrames = 0
+        peakSinceRead = 0
     }
 }
 
@@ -473,6 +508,21 @@ public final class AudioRenderer: RendererControl {
     public var startedUnit: Bool { unit?.isStarted ?? false }
     public var underrunSamples: Int { bridge.underrunSamples }
     public var droppedOldestFrames: Int { bridge.droppedOldestFrames }
+
+    public func readCounters() -> RendererCounters {
+        RendererCounters(enqueuedFrames: enqueuedFrames,
+                         droppedNewestFrames: droppedNewestFrames,
+                         droppedStragglerFrames: droppedStragglerFrames,
+                         droppedOldestFrames: bridge.droppedOldestFrames,
+                         underrunSamples: bridge.underrunSamples,
+                         driftDropsApplied: driftDropsApplied,
+                         driftInsertsApplied: driftInsertsApplied,
+                         driftInsertsSkipped: driftInsertsSkipped,
+                         unitStartFailures: unitStartFailures,
+                         jitterDepthMs: depthMs)
+    }
+
+    public func takeRenderedPeak() -> Float { bridge.takePeak() }
     public var depthMs: Double {
         Double(bridge.depthSamples) / Double(SharedMicProtocol.sampleRate) * 1_000.0
     }

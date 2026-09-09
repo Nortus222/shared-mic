@@ -30,6 +30,8 @@ struct MenuBarView: View {
                     .font(.caption)
                 demandSection
                 systemInputSection
+                levelSection
+                diagnosticsSection
             } else {
                 pairingForm
             }
@@ -47,6 +49,12 @@ struct MenuBarView: View {
                 sessionControls
                 Divider()
             }
+
+            Toggle("Launch at login", isOn: Binding(
+                get: { model.loginItemEnabled },
+                set: { model.setLoginItemEnabled($0) }
+            ))
+            .toggleStyle(.checkbox)
 
             HStack {
                 if model.pairedHost != nil {
@@ -97,6 +105,50 @@ struct MenuBarView: View {
         }
     }
 
+    private var levelSection: some View {
+        Text("Input level \(Self.levelBar(model.inputLevel))")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+    }
+
+    private static func levelBar(_ peak: Float) -> String {
+        let filled = Int((min(max(peak, 0), 1) * 10).rounded())
+        return "[\(String(repeating: "#", count: filled))\(String(repeating: "-", count: 10 - filled))]"
+    }
+
+    private var diagnosticsSection: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text("Diagnostics")
+                .font(.caption)
+            Text(diagnosticsLatencyText)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Text("Sessions: \(model.diagnostics.sessionCount) • Active time: \(Self.formatDuration(model.diagnostics.totalSessionSeconds)) • Reconnects: \(model.diagnostics.reconnectCount) • Auth failures: \(model.diagnostics.authFailureCount)")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Text("Jitter: \(String(format: "%.0f", model.diagnostics.renderer.jitterDepthMs)) ms • Underruns: \(model.diagnostics.renderer.underrunSamples) samples • Drift fixes: \(model.diagnostics.renderer.totalDriftCorrections)")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Text("Dropped frames: \(model.diagnostics.renderer.totalDroppedFrames)")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var diagnosticsLatencyText: String {
+        guard let latency = model.diagnostics.activationLatency else {
+            return "Activation latency: no sessions yet (budget 300 ms)"
+        }
+        return String(format: "Activation latency: p50 %.0f ms • p95 %.0f ms • max %.0f ms (%d samples)",
+                      latency.p50Ms, latency.p95Ms, latency.maxMs, latency.count)
+    }
+
+    private static func formatDuration(_ seconds: Double) -> String {
+        let total = max(0, Int(seconds.rounded()))
+        if total < 60 { return "\(total) s" }
+        return String(format: "%d:%02d", total / 60, total % 60)
+    }
+
     private var sessionControls: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
@@ -133,6 +185,16 @@ struct MenuBarView: View {
         VStack(alignment: .leading, spacing: 6) {
             Text("Pair with the Windows agent")
                 .font(.subheadline)
+            if !model.discoveredHosts.isEmpty {
+                Text("Found on this network:")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                ForEach(model.discoveredHosts) { host in
+                    Button("\(host.name) (\(host.host):\(host.port))") {
+                        model.selectDiscoveredHost(host)
+                    }
+                }
+            }
             TextField("Host or IP address", text: $model.hostField)
             TextField("Port", text: $model.portField)
             // SecureField, not TextField: this is a 32-byte bearer secret, and

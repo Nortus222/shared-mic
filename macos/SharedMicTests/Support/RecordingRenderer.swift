@@ -19,6 +19,7 @@ final class RecordingRenderer: RendererControl {
     var finalized: Int { synchronized { _finalized } }
     var enqueuedPCM: [Data] { synchronized { _enqueued } }
     var isOpen: Bool { synchronized { _open } }
+    var stubPeak: Float = 0
 
     func open() throws {
         if let error = openError { throw error }
@@ -36,6 +37,8 @@ final class RecordingRenderer: RendererControl {
     func finalizeClose() {
         synchronized { _finalized += 1; _open = false }
     }
+
+    func takeRenderedPeak() -> Float { synchronized { stubPeak } }
 
     private func synchronized<T>(_ body: () -> T) -> T {
         lock.lock()
