@@ -14,23 +14,46 @@ public final class AppModel: ObservableObject {
     @Published public private(set) var fingerprintWarning: String?
     @Published public private(set) var audioBytesReceived: Int = 0
     @Published public private(set) var isPairing: Bool = false
+    @Published public private(set) var demandProcesses: [DemandingProcess] = []
+    @Published public private(set) var holdRemaining: TimeInterval?
+    @Published public private(set) var systemInputName: String?
+    @Published public private(set) var systemInputIsBlackHole: Bool = false
+    @Published public private(set) var stopDebounceMs: Int = DemandSettings.defaultStopDebounceMs
+    @Published public private(set) var debounceFireCount: Int = 0
+    @Published public private(set) var lastActivationLatencyMs: Double?
+    @Published public private(set) var sessionCount: Int = 0
 
     @Published public var hostField: String = ""
     @Published public var portField: String = String(SharedMicProtocol.defaultPort)
     @Published public var pairingField: String = ""
 
     private let coordinator: ConnectionCoordinator
+    private let readSystemInput: () -> SystemInputInfo?
     private var refreshTimer: Timer?
 
     public init(store: PairingStore = KeychainPairingStore(),
                 clientId: String = Host.current().localizedName ?? "mac",
                 autoStart: Bool = true,
-                makeRenderer: (() -> RendererControl)? = nil) {
+                makeRenderer: (() -> RendererControl)? = nil,
+                demandSettings: DemandSettingsStore = UserDefaultsDemandSettingsStore(),
+                makeObserver: ((@escaping (DemandSnapshot) -> Void) -> AudioDemandObserver)? = nil,
+                readSystemInput: (() -> SystemInputInfo?)? = nil) {
+        // Production default is the live Core Audio observer; tests inject a
+        // fake (or an empty one for hermetic non-demand tests) so unit tests
+        // never depend on what the host machine happens to be recording.
+        let observerFactory = makeObserver ?? { onChange in
+            AudioDemandObserver(query: LiveCoreAudioQuery(), onChange: onChange)
+        }
         coordinator = ConnectionCoordinator(store: store, clientId: clientId,
-                                            makeRenderer: makeRenderer)
+                                            makeRenderer: makeRenderer,
+                                            demandSettings: demandSettings,
+                                            makeObserver: observerFactory)
+        self.readSystemInput = readSystemInput ?? SystemInputDevice.current
         pairedHost = coordinator.pairedHost
         hostField = coordinator.pairedHost ?? ""
         state = coordinator.state
+        demandProcesses = coordinator.demandSnapshot.processes
+        stopDebounceMs = coordinator.stopDebounceMs
 
         coordinator.onStateChange = { [weak self] newState in
             guard let self else { return }
@@ -40,6 +63,12 @@ public final class AppModel: ObservableObject {
                 self.micPresent = self.coordinator.micPresent
                 self.pairedHost = self.coordinator.pairedHost
                 self.audioBytesReceived = self.coordinator.audioBytesReceived
+                self.refreshDemandDerived()
+            }
+        }
+        coordinator.onDemandChange = { [weak self] snapshot in
+            Task { @MainActor in
+                self?.demandProcesses = snapshot.processes
             }
         }
         coordinator.onNotice = { [weak self] message in
@@ -61,16 +90,20 @@ public final class AppModel: ObservableObject {
         // change, and "zero bytes while idle" is this project's headline
         // invariant — a readout frozen at whatever it was when streaming began
         // would be worse than none. 1 Hz with generous tolerance is enough for a
-        // human reading a menu and cheap enough to leave running.
+        // human reading a menu and cheap enough to leave running. The hold
+        // countdown, system-input row, and debounce diagnostics ride the same
+        // tick: all slow-moving, all human-read.
         let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self else { return }
                 self.audioBytesReceived = self.coordinator.audioBytesReceived
+                self.refreshDemandDerived()
             }
         }
         timer.tolerance = 0.25
         RunLoop.main.add(timer, forMode: .common)
         refreshTimer = timer
+        refreshDemandDerived()
 
         if autoStart {
             coordinator.startIfPaired()
@@ -85,16 +118,51 @@ public final class AppModel: ObservableObject {
         refreshTimer?.invalidate()
     }
 
-    public var statusText: String { state.displayName }
-
-    public var canStart: Bool {
-        state == .idle && micPresent
+    private func refreshDemandDerived() {
+        holdRemaining = coordinator.holdRemaining
+        stopDebounceMs = coordinator.stopDebounceMs
+        debounceFireCount = coordinator.debounceFireCount
+        lastActivationLatencyMs = coordinator.lastActivationLatencyMs
+        sessionCount = coordinator.sessionCountValue
+        if let input = readSystemInput() {
+            systemInputName = input.name
+            systemInputIsBlackHole = input.isBlackHole
+        } else {
+            systemInputName = nil
+            systemInputIsBlackHole = false
+        }
     }
 
-    public var canStop: Bool {
-        if case .streaming = state { return true }
+    public var statusText: String {
+        if case .disabled = state { return "Disabled — remote microphone off" }
+        if let remaining = holdRemaining, remaining > 0 {
+            return "Held \(Self.formatRemaining(remaining)) remaining"
+        }
+        return state.displayName
+    }
+
+    public var demandCount: Int { demandProcesses.count }
+
+    public var holdDisplay: String? {
+        guard let remaining = holdRemaining, remaining > 0 else { return nil }
+        return "Held \(Self.formatRemaining(remaining)) remaining"
+    }
+
+    public static func formatRemaining(_ seconds: TimeInterval) -> String {
+        let total = max(0, Int(seconds.rounded(.up)))
+        return String(format: "%d:%02d", total / 60, total % 60)
+    }
+
+    public var isDisabled: Bool {
+        if case .disabled = state { return true }
         return false
     }
+
+    public func disable() { coordinator.disable() }
+    public func enable() { coordinator.enable() }
+    public func beginHold() { coordinator.beginHold() }
+    public func cancelHold() { coordinator.cancelHold() }
+    public func setStopDebounceMs(_ ms: Int) { coordinator.setStopDebounceMs(ms) }
 
     public func pair() {
         guard !isPairing else { return }
@@ -136,12 +204,6 @@ public final class AppModel: ObservableObject {
         // here so the pairing form can never be left permanently disabled.
         isPairing = false
     }
-
-    // TEMPORARY PHASE 1 SCAFFOLDING — replaced by AudioDemandObserver in Phase 3.
-    public func startSession() { coordinator.requestStart() }
-
-    // TEMPORARY PHASE 1 SCAFFOLDING — replaced by AudioDemandObserver in Phase 3.
-    public func stopSession() { coordinator.requestStop() }
 
     public func quit() {
         refreshTimer?.invalidate()

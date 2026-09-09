@@ -56,6 +56,19 @@ public final class ConnectionCoordinator: ControlClientDelegate {
     private var startTimeoutRequestId: String?
     private var stopTimeoutTimer: DispatchSourceTimer?
     private var stopTimeoutRequestId: String?
+    private let demandSettings: DemandSettingsStore
+    private var stopDebounceTimer: DispatchSourceTimer?
+    private var stopDebounceSessionId: String?
+    private var holdTimer: DispatchSourceTimer?
+    private var holdEnd: Date?
+    private var demandObserver: AudioDemandObserver?
+    private var lastSnapshot = DemandSnapshot()
+    public var onDemandChange: ((DemandSnapshot) -> Void)?
+    private var startedSessions = 0
+    private var debounceFires = 0
+    private var lastActivationLatency: Double?
+    private var startSentAt: Date?
+    private var awaitingFirstFrame = false
     /// Non-nil for exactly as long as a `pair(...)` ceremony is in flight. It is
     /// both the "already pairing" interlock and the only place that attempt's
     /// completion lives, so every way an attempt can end — success, peer
@@ -81,13 +94,32 @@ public final class ConnectionCoordinator: ControlClientDelegate {
 
     public init(store: PairingStore,
                 clientId: String = Host.current().localizedName ?? "mac",
-                makeRenderer: (() -> RendererControl)? = nil) {
+                makeRenderer: (() -> RendererControl)? = nil,
+                demandSettings: DemandSettingsStore = UserDefaultsDemandSettingsStore(),
+                makeObserver: ((@escaping (DemandSnapshot) -> Void) -> AudioDemandObserver)? = nil) {
         self.store = store
         self.clientId = clientId
         self.renderer = makeRenderer?() ?? AudioRenderer()
+        self.demandSettings = demandSettings
+        let settings = demandSettings.load()
+        let debounceSeconds = Double(settings.stopDebounceMs) / 1000.0
         if let loaded = try? store.load() {
             self.record = loaded
-            self.controller = SessionController(state: .disconnected)
+            self.controller = SessionController(
+                state: settings.disabled ? .disabled : .disconnected,
+                stopDebounceSeconds: debounceSeconds)
+        } else if settings.disabled {
+            self.controller = SessionController(state: .disabled,
+                                                stopDebounceSeconds: debounceSeconds)
+        } else {
+            self.controller = SessionController(stopDebounceSeconds: debounceSeconds)
+        }
+        if let makeObserver {
+            let observer = makeObserver({ [weak self] snapshot in
+                self?.noteSnapshot(snapshot)
+            })
+            self.demandObserver = observer
+            observer.start()
         }
     }
 
@@ -98,6 +130,21 @@ public final class ConnectionCoordinator: ControlClientDelegate {
     public var micPresent: Bool { queue.sync { controller.micPresent } }
     public var pairedHost: String? { queue.sync { record?.host } }
     public var audioBytesReceived: Int { queue.sync { totalAudioBytes + (client?.audioBytesReceived ?? 0) } }
+    public var demandSnapshot: DemandSnapshot { queue.sync { lastSnapshot } }
+    public var holdRemaining: TimeInterval? {
+        queue.sync {
+            guard let end = holdEnd else { return nil }
+            return max(0, end.timeIntervalSinceNow)
+        }
+    }
+    public var stopDebounceMs: Int { queue.sync { demandSettings.load().stopDebounceMs } }
+    public var holdSeconds: TimeInterval { queue.sync { demandSettings.load().holdSeconds } }
+    public var sessionCountValue: Int { queue.sync { startedSessions } }
+    public var debounceFireCount: Int { queue.sync { debounceFires } }
+    public var lastActivationLatencyMs: Double? { queue.sync { lastActivationLatency } }
+    public var isDisabled: Bool {
+        queue.sync { if case .disabled = controller.state { return true }; return false }
+    }
 
     // MARK: - Lifecycle
 
@@ -127,6 +174,9 @@ public final class ConnectionCoordinator: ControlClientDelegate {
             self.shuttingDown = true
             self.cancelReconnect()
             self.cancelSessionTimers()
+            self.cancelHoldTimer()
+            self.demandObserver?.stop()
+            self.demandObserver = nil
             // Nothing below will ever call an in-flight pairing's completion:
             // the transport's connect completion is dropped by the generation
             // guard, and `client.stop()` makes `ControlClient` suppress its own
@@ -247,30 +297,180 @@ public final class ConnectionCoordinator: ControlClientDelegate {
             self.resolvePairing(.failure(PairingError.cancelled))
             try? self.store.clear()
             self.record = nil
+            self.cancelHoldTimer()
             self.apply(self.controller.handle(.unpairedByUser))
+            // Unpair is an explicit reset: clear the kill switch, the hold,
+            // and the demand flags (all silent no-ops in `.unpaired`) so a
+            // later pairing starts from clean state rather than stale flags.
+            var settings = self.demandSettings.load()
+            settings.disabled = false
+            self.demandSettings.save(settings)
+            self.apply(self.controller.handle(.holdExpired(requestId: self.nextRequestId())))
+            self.apply(self.controller.handle(.demandChanged(hasDemand: false, requestId: self.nextRequestId())))
+            self.lastSnapshot = DemandSnapshot()
             self.publishState()
         }
     }
 
-    // MARK: - Manual session control
+    // MARK: - Demand-driven session control (Phase 3)
     //
-    // TEMPORARY PHASE 1 SCAFFOLDING. Phase 3 replaces both of these with
-    // AudioDemandObserver-driven activation; nothing else should ever call them.
+    // Sessions start and stop from `AudioDemandObserver` snapshots arriving
+    // via `noteSnapshot(_:)`. The kill switch and force-on hold are the only
+    // manual session controls; the Phase 1 Start/Stop scaffolding is gone.
 
-    public func requestStart() {
+    /// Kill switch (spec §5.3): sends STOP immediately, persists DISABLED,
+    /// cancels any hold. Only `enable()` leaves it.
+    public func disable() {
         queue.async { [weak self] in
             guard let self else { return }
-            self.apply(self.controller.handle(.userRequestedStart(requestId: self.nextRequestId())))
+            self.cancelHoldTimer()
+            self.apply(self.controller.handle(.userDisabled(requestId: self.nextRequestId())))
+            var settings = self.demandSettings.load()
+            settings.disabled = true
+            self.demandSettings.save(settings)
             self.publishState()
         }
     }
 
-    public func requestStop() {
+    public func enable() {
         queue.async { [weak self] in
             guard let self else { return }
-            self.apply(self.controller.handle(.userRequestedStop(requestId: self.nextRequestId())))
+            self.apply(self.controller.handle(.userEnabled))
+            // Enabling with no pairing must not strand the machine in `.idle`
+            // (which implies a live connection): fall back to `.unpaired`.
+            if self.record == nil {
+                self.apply(self.controller.handle(.unpairedByUser))
+            }
+            var settings = self.demandSettings.load()
+            settings.disabled = false
+            self.demandSettings.save(settings)
+            // The machine records no demand while disabled; re-drive from the
+            // last observer snapshot so enable-with-demand starts promptly.
+            if self.lastSnapshot.hasDemand {
+                self.apply(self.controller.handle(
+                    .demandChanged(hasDemand: true, requestId: self.nextRequestId())))
+            }
             self.publishState()
         }
+    }
+
+    /// Force-on hold (spec §5.4) for apps Core Audio cannot see. Ignored
+    /// while disabled or hard-stopped. Pressing again restarts the hold from
+    /// now — each press is fresh explicit consent, and expiry still applies.
+    public func beginHold() {
+        queue.async { [weak self] in
+            guard let self else { return }
+            if case .disabled = self.controller.state { return }
+            if case .hardStop = self.controller.state { return }
+            let seconds = self.demandSettings.load().holdSeconds
+            self.holdEnd = Date().addingTimeInterval(seconds)
+            self.armHoldTimer()
+            self.apply(self.controller.handle(.holdBegan(requestId: self.nextRequestId())))
+            self.publishState()
+        }
+    }
+
+    public func cancelHold() {
+        queue.async { [weak self] in
+            guard let self, self.holdEnd != nil else { return }
+            self.cancelHoldTimer()
+            self.apply(self.controller.handle(.holdExpired(requestId: self.nextRequestId())))
+            self.publishState()
+        }
+    }
+
+    public func setStopDebounceMs(_ ms: Int) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            var settings = self.demandSettings.load()
+            settings.stopDebounceMs = DemandSettings.clampDebounceMs(ms)
+            self.demandSettings.save(settings)
+            self.controller.setStopDebounceSeconds(Double(settings.stopDebounceMs) / 1000.0)
+        }
+    }
+
+    private func noteSnapshot(_ snapshot: DemandSnapshot) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.lastSnapshot = snapshot
+            self.apply(self.controller.handle(
+                .demandChanged(hasDemand: snapshot.hasDemand, requestId: self.nextRequestId())))
+            self.publishState()
+            DispatchQueue.main.async { [weak self] in
+                self?.onDemandChange?(snapshot)
+            }
+        }
+    }
+
+    /// After landing in `.idle`, a session the observer still wants must be
+    /// (re)started: reconnect recovery, replug recovery, and STOP-race
+    /// recovery (demand returned while stopping) all funnel through here.
+    /// Deliberately NOT called after `startNacked` — a refused START must
+    /// never auto-retry into a START storm — and guarded on mic presence so
+    /// an absent mic can never notify-loop.
+    private func refireIfIdleWithDemand() {
+        guard case .idle = controller.state,
+              controller.micPresent,
+              record != nil,
+              client != nil,
+              controller.hasDemand || controller.holdActive else { return }
+        if controller.hasDemand {
+            apply(controller.handle(.demandChanged(hasDemand: true, requestId: nextRequestId())))
+        } else {
+            apply(controller.handle(.holdBegan(requestId: nextRequestId())))
+        }
+    }
+
+    private func armStopDebounceTimer(sessionId: String, seconds: TimeInterval) {
+        cancelStopDebounceTimer()
+        stopDebounceSessionId = sessionId
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + seconds)
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            let pending = self.stopDebounceSessionId
+            self.stopDebounceTimer = nil
+            self.stopDebounceSessionId = nil
+            guard case .stopPending(let current) = self.controller.state,
+                  current == pending else { return }
+            // The spec's debounce-firing check: this increments only when the
+            // debounce actually fires a STOP, never on arm or cancel.
+            self.debounceFires += 1
+            self.apply(self.controller.handle(
+                .stopDebounceExpired(requestId: self.nextRequestId(), sessionId: pending ?? "")))
+            self.publishState()
+        }
+        timer.resume()
+        stopDebounceTimer = timer
+    }
+
+    private func cancelStopDebounceTimer() {
+        stopDebounceTimer?.cancel()
+        stopDebounceTimer = nil
+        stopDebounceSessionId = nil
+    }
+
+    private func armHoldTimer() {
+        holdTimer?.cancel()
+        holdTimer = nil
+        guard let end = holdEnd else { return }
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + max(0, end.timeIntervalSinceNow))
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            self.holdEnd = nil
+            self.holdTimer = nil
+            self.apply(self.controller.handle(.holdExpired(requestId: self.nextRequestId())))
+            self.publishState()
+        }
+        timer.resume()
+        holdTimer = timer
+    }
+
+    private func cancelHoldTimer() {
+        holdTimer?.cancel()
+        holdTimer = nil
+        holdEnd = nil
     }
 
     // MARK: - Connection
@@ -366,7 +566,16 @@ public final class ConnectionCoordinator: ControlClientDelegate {
             guard let self else { return }
             let renderer = self.renderer
             self.rendererQueue.async { renderer.enqueue(pcm: pcm) }
+            self.queue.async { self.noteFirstFrame() }
         }
+    }
+
+    /// Phase 3 measurement: START sent to first playable frame. Recorded once
+    /// per session; cleared when the session ends before any frame arrives.
+    private func noteFirstFrame() {
+        guard awaitingFirstFrame, let sent = startSentAt else { return }
+        awaitingFirstFrame = false
+        lastActivationLatency = Date().timeIntervalSince(sent) * 1000.0
     }
 
     /// Surfaces a renderer `open()` failure (missing output device above all) on
@@ -412,8 +621,12 @@ public final class ConnectionCoordinator: ControlClientDelegate {
             switch action {
             case .sendStart(let requestId):
                 client?.send(.start(requestId: requestId, preferredFormat: .v1))
+                startedSessions += 1
+                startSentAt = Date()
+                awaitingFirstFrame = true
             case .sendStop(let requestId, let sessionId):
                 client?.send(.stop(requestId: requestId, sessionId: sessionId))
+                awaitingFirstFrame = false
             case .armStartTimeout(let requestId, let seconds):
                 armStartTimeout(requestId: requestId, seconds: seconds)
             case .armStopTimeout(let requestId, let seconds):
@@ -422,6 +635,10 @@ public final class ConnectionCoordinator: ControlClientDelegate {
                 cancelStartTimeout(requestId: requestId)
             case .cancelStopTimeout(let requestId):
                 cancelStopTimeout(requestId: requestId)
+            case .armStopDebounce(let sessionId, let seconds):
+                armStopDebounceTimer(sessionId: sessionId, seconds: seconds)
+            case .cancelStopDebounce:
+                cancelStopDebounceTimer()
             case .scheduleReconnect:
                 scheduleReconnect()
             case .closeConnection:
@@ -480,6 +697,7 @@ public final class ConnectionCoordinator: ControlClientDelegate {
         timer.setEventHandler { [weak self] in
             guard let self else { return }
             self.apply(self.controller.handle(.stopTimedOut(requestId: requestId)))
+            self.refireIfIdleWithDemand()
             self.publishState()
         }
         timer.resume()
@@ -507,6 +725,7 @@ public final class ConnectionCoordinator: ControlClientDelegate {
         startTimeoutRequestId = nil
         stopTimeoutTimer?.cancel(); stopTimeoutTimer = nil
         stopTimeoutRequestId = nil
+        cancelStopDebounceTimer()
     }
 
     private func scheduleReconnect() {
@@ -565,6 +784,7 @@ public final class ConnectionCoordinator: ControlClientDelegate {
             self.backoff.reset()
             self.apply(self.controller.handle(.authenticated(micPresent: micPresent,
                                                              deviceLabel: deviceLabel)))
+            self.refireIfIdleWithDemand()
             self.publishState()
         }
     }
@@ -585,10 +805,12 @@ public final class ConnectionCoordinator: ControlClientDelegate {
                 self.apply(self.controller.handle(.startNacked(requestId: requestId, reason: reason)))
             case .stopAck(let requestId, _):
                 self.apply(self.controller.handle(.stopAcked(requestId: requestId)))
+                self.refireIfIdleWithDemand()
             case .status(let micPresent, let active, let deviceLabel):
                 self.apply(self.controller.handle(.statusReceived(micPresent: micPresent,
                                                                   active: active,
                                                                   deviceLabel: deviceLabel)))
+                self.refireIfIdleWithDemand()
             default:
                 // GREETING/HELLO/HELLO_ACK are consumed by ControlClient; PING/PONG
                 // never reach here. Anything else is a server-side message this

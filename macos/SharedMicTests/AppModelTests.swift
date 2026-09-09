@@ -19,20 +19,66 @@ final class AppModelTests: XCTestCase {
         timer?.invalidate()
     }
 
+    private func makeFake() -> FakeCoreAudioQuery {
+        let fake = FakeCoreAudioQuery()
+        fake.procs = [
+            10: FakeCoreAudioQuery.Proc(pid: 501, bundle: "com.example.voice", devices: []),
+            11: FakeCoreAudioQuery.Proc(pid: 1000, bundle: "com.sharedmic.SharedMic", devices: [99]),
+        ]
+        return fake
+    }
+
+
+    private func quietModel(store: PairingStore = InMemoryPairingStore()) -> AppModel {
+        let fake = FakeCoreAudioQuery()
+        return AppModel(store: store, clientId: "mac-tests", autoStart: false,
+                        demandSettings: InMemoryDemandSettingsStore(),
+                        makeObserver: { onChange in
+                            AudioDemandObserver(query: fake, pollInterval: 0.02, onChange: onChange)
+                        },
+                        readSystemInput: { nil })
+    }
+
+    private func demandModel(fake: FakeCoreAudioQuery,
+                             settings: DemandSettings = DemandSettings(stopDebounceMs: 500)) -> AppModel {
+        AppModel(store: InMemoryPairingStore(), clientId: "mac-tests", autoStart: false,
+                 makeRenderer: { RecordingRenderer() },
+                 demandSettings: InMemoryDemandSettingsStore(settings),
+                 makeObserver: { onChange in
+                     AudioDemandObserver(query: fake, pollInterval: 0.02, onChange: onChange)
+                 },
+                 readSystemInput: { SystemInputInfo(name: "OWC Thunderbolt 3 Audio Device", uid: "hw-owc-1") })
+    }
+
+    private func setDemand(_ fake: FakeCoreAudioQuery, _ hasDemand: Bool) {
+        guard let object = fake.procs.first(where: { $0.value.pid == 501 })?.key else { return }
+        fake.procs[object]?.devices = hasDemand ? [99] : []
+        fake.fireDevice(object)
+    }
+
+    private func pair(_ model: AppModel, with server: MockWindowsServerProcess) {
+        model.hostField = "127.0.0.1"
+        model.portField = String(server.port)
+        model.pairingField = server.pairingString
+        model.pair()
+        waitUntil("idle after pairing") { model.state == .idle }
+    }
+
     func testStartsUnpairedWithSensibleDefaults() {
-        let model = AppModel(store: InMemoryPairingStore(), clientId: "mac-tests", autoStart: false)
+        let model = quietModel()
         XCTAssertEqual(model.state, .unpaired)
         XCTAssertEqual(model.statusText, "Not paired")
         XCTAssertEqual(model.portField, String(SharedMicProtocol.defaultPort))
         XCTAssertNil(model.pairedHost)
-        XCTAssertFalse(model.canStart)
-        XCTAssertFalse(model.canStop)
+        XCTAssertFalse(model.isDisabled)
+        XCTAssertTrue(model.demandProcesses.isEmpty)
+        XCTAssertNil(model.holdRemaining)
     }
 
     func testPairingFromTheFormReachesIdle() throws {
         let server = try MockWindowsServerProcess()
         defer { server.terminate() }
-        let model = AppModel(store: InMemoryPairingStore(), clientId: "mac-tests", autoStart: false)
+        let model = quietModel()
 
         model.hostField = "127.0.0.1"
         model.portField = String(server.port)
@@ -43,15 +89,14 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(model.statusText, "Idle")
         XCTAssertEqual(model.deviceLabel, "Mock USB Mic")
         XCTAssertEqual(model.pairedHost, "127.0.0.1")
-        XCTAssertTrue(model.canStart)
-        XCTAssertFalse(model.canStop)
+        XCTAssertFalse(model.isDisabled)
         XCTAssertFalse(model.isPairing)
         // The pairing string is cleared from the UI once it has been consumed.
         XCTAssertEqual(model.pairingField, "")
     }
 
     func testAMistypedPairingStringSurfacesANotice() {
-        let model = AppModel(store: InMemoryPairingStore(), clientId: "mac-tests", autoStart: false)
+        let model = quietModel()
         model.hostField = "127.0.0.1"
         model.portField = String(SharedMicProtocol.defaultPort)
         model.pairingField = "NOPE"
@@ -62,30 +107,96 @@ final class AppModelTests: XCTestCase {
         XCTAssertFalse(model.isPairing)
     }
 
-    /// Temporary Phase 1 scaffolding, exercised here so the manual path is known
-    /// to work before it is used for hand testing.
-    func testManualStartAndStopFlipTheAffordances() throws {
+    /// Phase 3 replaces the manual path: demand appearing starts a session
+    /// with no button press, and demand clearing stops it after the debounce.
+    func testDemandDrivesSessionsAutomatically() throws {
         let server = try MockWindowsServerProcess()
         defer { server.terminate() }
-        let model = AppModel(store: InMemoryPairingStore(), clientId: "mac-tests", autoStart: false)
-        model.hostField = "127.0.0.1"
-        model.portField = String(server.port)
-        model.pairingField = server.pairingString
-        model.pair()
-        waitUntil("idle") { model.state == .idle }
+        let fake = makeFake()
+        let model = demandModel(fake: fake)
+        pair(model, with: server)
 
-        model.startSession()
-        waitUntil("streaming") {
+        setDemand(fake, true)
+        waitUntil("streaming on demand") {
             if case .streaming = model.state { return true }
             return false
         }
-        XCTAssertEqual(model.statusText, "Streaming")
-        XCTAssertFalse(model.canStart)
-        XCTAssertTrue(model.canStop)
+        XCTAssertEqual(model.demandProcesses, [DemandingProcess(pid: 501, bundleID: "com.example.voice")])
 
-        model.stopSession()
-        waitUntil("idle again") { model.state == .idle }
-        XCTAssertTrue(model.canStart)
+        setDemand(fake, false)
+        waitUntil("idle after debounce") { model.state == .idle }
+        XCTAssertTrue(model.demandProcesses.isEmpty)
+    }
+
+    func testDisableSuppressesDemandAndEnableResumes() throws {
+        let server = try MockWindowsServerProcess()
+        defer { server.terminate() }
+        let fake = makeFake()
+        let model = demandModel(fake: fake)
+        pair(model, with: server)
+
+        model.disable()
+        waitUntil("disabled") { model.state == .disabled }
+        XCTAssertEqual(model.statusText, "Disabled — remote microphone off")
+
+        setDemand(fake, true)
+        Thread.sleep(forTimeInterval: 0.6)
+        XCTAssertEqual(model.state, .disabled, "kill switch must never start on demand")
+
+        model.enable()
+        waitUntil("streaming after enable with demand held") {
+            if case .streaming = model.state { return true }
+            return false
+        }
+    }
+
+    func testHoldStartsASessionWithNoDemandAndCancellingStopsIt() throws {
+        let server = try MockWindowsServerProcess()
+        defer { server.terminate() }
+        let fake = makeFake()
+        let model = demandModel(fake: fake)
+        pair(model, with: server)
+
+        model.beginHold()
+        waitUntil("streaming on hold") {
+            if case .streaming = model.state { return true }
+            return false
+        }
+        XCTAssertNotNil(model.holdRemaining)
+        XCTAssertNotNil(model.holdDisplay)
+
+        model.cancelHold()
+        waitUntil("idle after hold cancelled") { model.state == .idle }
+        XCTAssertNil(model.holdDisplay)
+    }
+
+    func testDebounceSettingClampsTo500Through2000() throws {
+        let server = try MockWindowsServerProcess()
+        defer { server.terminate() }
+        let fake = makeFake()
+        let model = demandModel(fake: fake)
+        pair(model, with: server)
+
+        model.setStopDebounceMs(50)
+        waitUntil("clamped to floor") { model.stopDebounceMs == 500 }
+        model.setStopDebounceMs(5000)
+        waitUntil("clamped to ceiling") { model.stopDebounceMs == 2000 }
+    }
+
+    func testSystemInputFlagSurfacesBlackHoleAsDefault() {
+        let blackHoleDefault = AppModel(store: InMemoryPairingStore(), clientId: "mac-tests",
+                                        autoStart: false,
+                                        demandSettings: InMemoryDemandSettingsStore(),
+                                        readSystemInput: { SystemInputInfo(name: "BlackHole 2ch", uid: "BlackHole2ch_UID") })
+        waitUntil("input read") { blackHoleDefault.systemInputName != nil }
+        XCTAssertTrue(blackHoleDefault.systemInputIsBlackHole)
+
+        let hardwareDefault = AppModel(store: InMemoryPairingStore(), clientId: "mac-tests",
+                                       autoStart: false,
+                                       demandSettings: InMemoryDemandSettingsStore(),
+                                       readSystemInput: { SystemInputInfo(name: "OWC", uid: "hw-owc-1") })
+        waitUntil("input read") { hardwareDefault.systemInputName != nil }
+        XCTAssertFalse(hardwareDefault.systemInputIsBlackHole)
     }
 
     /// `audioBytesReceived` used to be refreshed only from `onStateChange`, and
@@ -97,18 +208,12 @@ final class AppModelTests: XCTestCase {
     func testAudioByteReadoutRefreshesDuringASessionWithoutAStateChange() throws {
         let server = try MockWindowsServerProcess()
         defer { server.terminate() }
-        // Recording renderer: this drives a live session, which must not
-        // open real audio hardware as a test side effect.
-        let model = AppModel(store: InMemoryPairingStore(), clientId: "mac-tests", autoStart: false,
-                             makeRenderer: { RecordingRenderer() })
-        model.hostField = "127.0.0.1"
-        model.portField = String(server.port)
-        model.pairingField = server.pairingString
-        model.pair()
-        waitUntil("idle") { model.state == .idle }
+        let fake = makeFake()
+        let model = demandModel(fake: fake)
+        pair(model, with: server)
         XCTAssertEqual(model.audioBytesReceived, 0, "an idle session carries no audio")
 
-        model.startSession()
+        setDemand(fake, true)
         waitUntil("streaming") {
             if case .streaming = model.state { return true }
             return false
@@ -128,7 +233,7 @@ final class AppModelTests: XCTestCase {
             model.audioBytesReceived > reading
         }
 
-        model.stopSession()
+        setDemand(fake, false)
         waitUntil("idle again") { model.state == .idle }
     }
 
@@ -140,21 +245,29 @@ final class AppModelTests: XCTestCase {
                                      port: server.port,
                                      token: server.token,
                                      certificateFingerprint: String(repeating: "00", count: 32)))
-        let model = AppModel(store: store, clientId: "mac-tests", autoStart: true)
+        let mismatchFake = FakeCoreAudioQuery()
+        let model = AppModel(store: store, clientId: "mac-tests", autoStart: true,
+                             demandSettings: InMemoryDemandSettingsStore(),
+                             makeObserver: { onChange in
+                                 AudioDemandObserver(query: mismatchFake, pollInterval: 0.02, onChange: onChange)
+                             },
+                             readSystemInput: { nil })
 
         waitUntil("warning surfaced") { model.fingerprintWarning != nil }
         let warning = try XCTUnwrap(model.fingerprintWarning)
         XCTAssertTrue(warning.contains(server.fingerprint), "the presented fingerprint must be shown")
         XCTAssertTrue(warning.contains("re-pair") || warning.contains("Re-pair"))
         XCTAssertEqual(model.statusText, "Certificate mismatch")
-        XCTAssertFalse(model.canStart, "a hard stop must not offer to start a session")
+        if case .hardStop = model.state {} else {
+            XCTFail("expected hard stop, got \(model.state)")
+        }
     }
 
     func testUnpairReturnsToTheUnpairedForm() throws {
         let server = try MockWindowsServerProcess()
         defer { server.terminate() }
         let store = InMemoryPairingStore()
-        let model = AppModel(store: store, clientId: "mac-tests", autoStart: false)
+        let model = quietModel(store: store)
         model.hostField = "127.0.0.1"
         model.portField = String(server.port)
         model.pairingField = server.pairingString

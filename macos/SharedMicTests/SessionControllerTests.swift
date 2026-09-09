@@ -195,13 +195,16 @@ final class SessionControllerTests: XCTestCase {
         XCTAssertNil(controller.activeSessionId)
     }
 
-    func testMicUnplugMidSessionEntersDegradedAndNotifies() {
+    /// Phase 3 (spec §5.5): entering DEGRADED notifies only with demand (or
+    /// hold) active. A manually started session carries neither, so mic loss
+    /// goes degraded silently; the demand-driven notify case lives in
+    /// `SessionDemandTests.testMicLossNotifiesWithDemandAndStaysSilentAtIdle`.
+    func testMicUnplugMidSessionEntersDegradedSilentlyWithoutDemand() {
         var controller = authenticatedController()
         _ = controller.handle(.userRequestedStart(requestId: "req-1"))
         _ = controller.handle(.startAcked(requestId: "req-1", sessionId: "sess-1"))
         let actions = controller.handle(.statusReceived(micPresent: false, active: false, deviceLabel: "USB Microphone"))
-        XCTAssertEqual(actions, [.notify("The Windows microphone was disconnected."),
-                                   .closeRenderer])
+        XCTAssertEqual(actions, [.cancelStopDebounce, .closeRenderer])
         XCTAssertEqual(controller.state, .degraded(reason: "The Windows microphone was disconnected."))
         XCTAssertNil(controller.activeSessionId)
     }
@@ -225,14 +228,26 @@ final class SessionControllerTests: XCTestCase {
         XCTAssertTrue(controller.micPresent)
     }
 
-    func testConnectionLossSchedulesAReconnectAndDropsTheSession() {
+    /// Phase 3 (spec §5.2): transport loss from an active session goes to
+    /// DEGRADED, not DISCONNECTED, so reconnect-with-demand restarts; silent
+    /// here because no demand or hold is active (spec §5.5). The
+    /// demand-active notify variant lives in
+    /// `SessionDemandTests.testDegradedNotifiesWithDemandAndStaysSilentAtIdle`.
+    func testConnectionLossMidSessionSchedulesAReconnectFromDegraded() {
         var controller = authenticatedController()
         _ = controller.handle(.userRequestedStart(requestId: "req-1"))
         _ = controller.handle(.startAcked(requestId: "req-1", sessionId: "sess-1"))
         let actions = controller.handle(.connectionLost(reason: "peer dead"))
+        XCTAssertEqual(actions, [.cancelStopDebounce, .scheduleReconnect])
+        XCTAssertEqual(controller.state, .degraded(reason: "peer dead"))
+        XCTAssertNil(controller.activeSessionId)
+    }
+
+    func testConnectionLossAtIdleStaysSilentAndDisconnects() {
+        var controller = authenticatedController()
+        let actions = controller.handle(.connectionLost(reason: "peer dead"))
         XCTAssertEqual(actions, [.scheduleReconnect])
         XCTAssertEqual(controller.state, .disconnected)
-        XCTAssertNil(controller.activeSessionId)
     }
 
     /// The load-bearing test of this whole phase: protocol-v1 §2 and design spec
