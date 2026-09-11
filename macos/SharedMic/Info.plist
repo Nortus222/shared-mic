@@ -7,8 +7,9 @@
   <key>CFBundleIdentifier</key><string>com.sharedmic.SharedMic</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleExecutable</key><string>SharedMic</string>
-  <key>CFBundleShortVersionString</key><string>0.1</string>
-  <key>CFBundleVersion</key><string>1</string>
+  <key>CFBundleShortVersionString</key><string>$(MARKETING_VERSION)</string>
+  <key>CFBundleVersion</key><string>$(CURRENT_PROJECT_VERSION)</string>
+  <key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
   <key>LSMinimumSystemVersion</key><string>14.4</string>
   <key>LSUIElement</key><true/>
   <key>NSHumanReadableCopyright</key><string></string>

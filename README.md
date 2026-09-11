@@ -54,3 +54,15 @@ What Phase 0 delivered, and where to start reading:
 - A Windows host with the USB microphone attached, and a Mac on the same LAN
 - [BlackHole 2ch](https://github.com/ExistentialAudio/BlackHole) installed on the Mac
 - macOS 14.4 or later — the design depends on per-process Core Audio device reporting
+
+## Install (Mac)
+
+1. Unzip the `SharedMic-<version>.zip` artifact, drag `SharedMic.app` to `/Applications`.
+2. Launch it **from /Applications** — not from Downloads, not from Terminal.
+3. In the menu-bar mic icon, enter the Windows host, port, and the pairing string
+   from the Windows tray, then Pair.
+4. Optionally enable "Launch at login" in the menu.
+
+Details — signing choices and Gatekeeper behaviour, notarization, entitlements,
+version stamping, and updating without losing the pairing — live in
+[`macos/DISTRIBUTION.md`](macos/DISTRIBUTION.md).

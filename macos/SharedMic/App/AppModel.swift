@@ -22,6 +22,7 @@ public final class AppModel: ObservableObject {
     @Published public private(set) var debounceFireCount: Int = 0
     @Published public private(set) var lastActivationLatencyMs: Double?
     @Published public private(set) var sessionCount: Int = 0
+    @Published public private(set) var loginLaunchEnabled: Bool = false
 
     @Published public var hostField: String = ""
     @Published public var portField: String = String(SharedMicProtocol.defaultPort)
@@ -29,6 +30,7 @@ public final class AppModel: ObservableObject {
 
     private let coordinator: ConnectionCoordinator
     private let readSystemInput: () -> SystemInputInfo?
+    private let loginItems: LoginItemManager
     private var refreshTimer: Timer?
 
     public init(store: PairingStore = KeychainPairingStore(),
@@ -37,7 +39,8 @@ public final class AppModel: ObservableObject {
                 makeRenderer: (() -> RendererControl)? = nil,
                 demandSettings: DemandSettingsStore = UserDefaultsDemandSettingsStore(),
                 makeObserver: ((@escaping (DemandSnapshot) -> Void) -> AudioDemandObserver)? = nil,
-                readSystemInput: (() -> SystemInputInfo?)? = nil) {
+                readSystemInput: (() -> SystemInputInfo?)? = nil,
+                loginItems: LoginItemManager = LoginItemManager()) {
         // Production default is the live Core Audio observer; tests inject a
         // fake (or an empty one for hermetic non-demand tests) so unit tests
         // never depend on what the host machine happens to be recording.
@@ -48,7 +51,9 @@ public final class AppModel: ObservableObject {
                                             makeRenderer: makeRenderer,
                                             demandSettings: demandSettings,
                                             makeObserver: observerFactory)
+        self.loginItems = loginItems
         self.readSystemInput = readSystemInput ?? SystemInputDevice.current
+        loginLaunchEnabled = loginItems.isEnabled
         pairedHost = coordinator.pairedHost
         hostField = coordinator.pairedHost ?? ""
         state = coordinator.state
@@ -163,6 +168,20 @@ public final class AppModel: ObservableObject {
     public func beginHold() { coordinator.beginHold() }
     public func cancelHold() { coordinator.cancelHold() }
     public func setStopDebounceMs(_ ms: Int) { coordinator.setStopDebounceMs(ms) }
+
+    public func refreshLoginLaunchStatus() {
+        loginLaunchEnabled = loginItems.isEnabled
+    }
+
+    public func setLoginLaunch(_ enabled: Bool) {
+        do {
+            try loginItems.setEnabled(enabled)
+            loginLaunchEnabled = loginItems.isEnabled
+        } catch {
+            loginLaunchEnabled = loginItems.isEnabled
+            lastNotice = "Could not change launch-at-login: \(error.localizedDescription)"
+        }
+    }
 
     public func pair() {
         guard !isPairing else { return }

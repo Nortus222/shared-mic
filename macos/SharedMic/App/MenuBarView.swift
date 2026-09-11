@@ -48,6 +48,10 @@ struct MenuBarView: View {
                 Divider()
             }
 
+            loginSection
+
+            Divider()
+
             HStack {
                 if model.pairedHost != nil {
                     Button("Unpair…") { model.unpair() }
@@ -56,9 +60,26 @@ struct MenuBarView: View {
                 Button("Quit SharedMic") { model.quit() }
                     .keyboardShortcut("q")
             }
+
+            Text("SharedMic \(AppVersion.current())")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
         }
         .padding(14)
         .frame(width: 360)
+    }
+
+    private var loginSection: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Toggle("Launch at login", isOn: Binding(
+                get: { model.loginLaunchEnabled },
+                set: { model.setLoginLaunch($0) }
+            ))
+            .onAppear { model.refreshLoginLaunchStatus() }
+            Text("Starts SharedMic when you log in. Works from /Applications.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
     }
 
     private var demandSection: some View {

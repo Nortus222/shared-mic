@@ -15,6 +15,8 @@ ROOT = File.dirname(File.expand_path(__FILE__))
 PROJECT_PATH = File.join(ROOT, 'SharedMic.xcodeproj')
 DEPLOYMENT_TARGET = '14.4'
 SWIFT_VERSION = '5.0'
+MARKETING_VERSION = '0.1.0'
+CURRENT_PROJECT_VERSION = '1'
 
 FileUtils.rm_rf(PROJECT_PATH)
 project = Xcodeproj::Project.new(PROJECT_PATH)
@@ -50,8 +52,11 @@ app.build_configurations.each do |config|
   settings['PRODUCT_BUNDLE_IDENTIFIER'] = 'com.sharedmic.SharedMic'
   settings['INFOPLIST_FILE'] = 'SharedMic/Info.plist'
   settings['GENERATE_INFOPLIST_FILE'] = 'NO'
+  settings['MARKETING_VERSION'] = MARKETING_VERSION
+  settings['CURRENT_PROJECT_VERSION'] = CURRENT_PROJECT_VERSION
   settings['CODE_SIGN_STYLE'] = 'Automatic'
   settings['CODE_SIGN_IDENTITY'] = '-'
+  settings['CODE_SIGN_ENTITLEMENTS'] = 'SharedMic/SharedMic.entitlements'
   settings['ENABLE_HARDENED_RUNTIME'] = 'YES'
   settings['COMBINE_HIDPI_IMAGES'] = 'YES'
   settings['SWIFT_VERSION'] = SWIFT_VERSION
